@@ -488,6 +488,8 @@ static void rx_loop(int s) {
 
 static void wifi_ev(void *arg, esp_event_base_t base, int32_t id, void *data) {
     if (base == WIFI_EVENT && (id == WIFI_EVENT_STA_START || id == WIFI_EVENT_STA_DISCONNECTED)) {
+        if (id == WIFI_EVENT_STA_DISCONNECTED)
+            ESP_LOGW(TAG, "wifi disconnected, reason %d", ((wifi_event_sta_disconnected_t *)data)->reason);
         esp_wifi_connect();
     } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t *ev = data;
