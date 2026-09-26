@@ -7,8 +7,16 @@ A hub that lets LLM agents perceive and act on the physical world through small 
 ### Physical side
 
 **Device**:
-A physical microcontroller node (e.g. an M5Stack Atom Echo) running tinyaisense firmware and hosting one or more capabilities.
+A microcontroller node (e.g. an M5Stack Atom Echo) running tinyaisense firmware and hosting one or more capabilities. It is physical, or stood in for by the Simulator; the hub treats both the same.
 _Avoid_: Node, sensor (for the whole unit), board
+
+**Simulator**:
+A PC program that stands in for one or more devices, speaking the same protocol and behaving as their firmware would. A device it runs is a **simulated device**.
+_Avoid_: Emulator, fake device, mock
+
+**Board**:
+The hardware model a device is built on (e.g. `m5stack-atom-echo`). It fixes which capabilities the device has and how their hardware behaves. Firmware is built for one board.
+_Avoid_: Model, platform, hardware type; don't call a single device a board
 
 **Capability**:
 A single sensor or actuator on a device.
@@ -48,6 +56,10 @@ _Avoid_: Client, bot, assistant
 One live link between a device and the hub, from hello to drop. All stream and command state belongs to it and dies with it. A device is **online** while it has one.
 _Avoid_: Session (reserved for agents), link, channel
 
+**Session**:
+One agent's claim on the hub, from when it claims the hub until it drops, is taken over, or goes idle. The hub allows one at a time. The agent's streams, LED claim and Reflex settings belong to it and end with it. One agent may reach the hub over several links (e.g. the agent API plus MCP) within the same session.
+_Avoid_: Connection (reserved for devices), client
+
 **Pairing**:
 The owner approving a new device on the hub, which then issues the device its token. An unpaired device is **pending**.
 _Avoid_: Enrollment, registration, adoption
@@ -72,6 +84,10 @@ _Avoid_: Action, call, message
 A reaction the hub arms on a device, which the device then carries out by itself when triggered (e.g. a button press cuts the speaker and opens the mic), without waiting for the hub or an agent.
 _Avoid_: Trigger, binding, shortcut
 
+**Status**:
+What a device shows the human about itself, the hub and the agent (e.g. offline, pending, listening, thinking), on whatever indicator its board has. An agent's LED claim suspends it, except for listening, which always shows.
+_Avoid_: LED state, indicator, mode
+
 **Utterance**:
 One span of human speech captured from a mic and delivered to the agent as a unit.
 _Avoid_: Recording, clip, turn
@@ -79,6 +95,10 @@ _Avoid_: Recording, clip, turn
 **Voice**:
 A named way the hub speaks text aloud in one language, which an agent picks by id. It hides which speech engine, local or cloud, produces the audio.
 _Avoid_: Speaker (that's the actuator), TTS model, engine
+
+**Interrupt**:
+Stopping an agent's running turn because of an Event (e.g. a button press). An adapter running next to the agent does it; the hub only delivers the Event.
+_Avoid_: Barge-in (that's the human cutting off speech), cancel
 
 **Barge-in**:
 The human cutting off the agent's speech. On the MVP this is done by the button, via a Reflex.
