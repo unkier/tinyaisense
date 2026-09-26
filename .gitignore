@@ -1,0 +1,22 @@
+# Secrets
+secrets.h
+
+# Firmware build output (PlatformIO / ESP-IDF)
+.pio/
+build/
+sdkconfig.*
+!sdkconfig.defaults*
+
+# Python
+__pycache__/
+.venv/
+*.egg-info/
+
+# Local run output
+hub/spike_out/
+acceptance/*.wav
+hil.toml
+
+# Claude Code local state
+.claude/worktrees/
+.claude/settings.local.json
