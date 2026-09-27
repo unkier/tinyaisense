@@ -2,6 +2,7 @@
 
 import asyncio
 import os
+import re
 import signal
 import socket
 import stat
@@ -37,7 +38,12 @@ def test_init_writes_a_config_with_a_random_agent_token(
     assert str(path) in capsys.readouterr().out
     config = tomllib.loads(path.read_text())
     assert config["ports"] == {"device": 8420, "http": 8421}
-    assert config["timing"] == {"hello_timeout_ms": 5000}
+    assert config["timing"] == {
+        "hello_timeout_ms": 5000,
+        "ping_interval_ms": 2000,
+        "dead_after_ms": 6000,
+        "clock_window_ms": 20000,
+    }
     assert len(config["agent_token"]) >= 32
     assert stat.S_IMODE(path.stat().st_mode) == 0o600
 
@@ -105,7 +111,7 @@ async def served(xdg: dict[str, str]) -> AsyncIterator[tuple[str, int]]:
     config = Path(xdg["XDG_CONFIG_HOME"]) / "tinyaisense" / "hub.toml"
     config.write_text(config.read_text().replace("device = 8420", f"device = {port}"))
     hub = await asyncio.create_subprocess_exec(
-        sys.executable, "-m", "tinyaisense_hub", "serve", env=os.environ | xdg
+        sys.executable, "-m", "tinyaisense_hub", "serve", "--no-mdns", env=os.environ | xdg
     )
     owner_socket = Path(xdg["XDG_RUNTIME_DIR"]) / "tinyaisense" / "owner.sock"
     while not owner_socket.exists():
@@ -126,9 +132,14 @@ async def test_serve_pairs_a_device_the_owner_approves_from_the_cli(
     await cli(xdg, "approve", device.device_id[:6], "as", "kitchen")
 
     await device.wait_for(lambda: device.name == "kitchen")
-    listing = await cli(xdg, "devices")
-    assert "kitchen" in listing
-    assert "pending" not in listing
+    [header, row] = (await cli(xdg, "devices")).splitlines()
+    assert header.split() == ["DEVICE", "ID", "NAME", "STATE", "LAST", "SEEN", "BOARD", "FIRMWARE"]
+    assert row.split()[1:4] == ["kitchen", "online", "now"]
+
+    await device.close()
+    while (row := (await cli(xdg, "devices")).splitlines()[1]).split()[2] != "offline":
+        pass
+    assert re.fullmatch(r"\d{4}-\d\d-\d\d", row.split()[3])  # then the local time
 
 
 def test_serve_says_when_its_port_is_taken(
@@ -145,3 +156,15 @@ def test_serve_says_when_its_port_is_taken(
         assert main(["serve"]) == 1
 
     assert "address already in use" in capsys.readouterr().err.lower()
+
+
+def test_serve_refuses_a_dead_timeout_within_the_ping_interval(
+    xdg: dict[str, str], capsys: pytest.CaptureFixture[str]
+) -> None:
+    main(["init"])
+    config = Path(xdg["XDG_CONFIG_HOME"]) / "tinyaisense" / "hub.toml"
+    config.write_text(config.read_text().replace("dead_after_ms = 6000", "dead_after_ms = 2000"))
+
+    assert main(["serve"]) == 1
+
+    assert "dead_after_ms" in capsys.readouterr().err

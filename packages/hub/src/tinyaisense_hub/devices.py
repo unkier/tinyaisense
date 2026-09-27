@@ -28,6 +28,7 @@ from tinyaisense_wire import (
 
 from .config import Timing
 from .errors import HubError
+from .keepalive import ClockSync, Dead, Inbound, Keepalive, SendPing, Tick
 from .state import DeviceRecord, StateStore
 
 NAME = re.compile("[a-z0-9-]+")
@@ -46,11 +47,17 @@ class DeviceConnection(asyncio.Protocol):
         self.hello: Hello | None = None
         self.conn_id = 0
         """Set by `welcome`."""
+        self.clock = ClockSync(window=timing.clock_window_ms * 1000)
+        """The device clock, from its pongs."""
         self._registry = registry
         self._timing = timing
         self._decoder = ControlDecoder()
         self._transport: asyncio.Transport | None = None
         self._hello_timer: asyncio.TimerHandle | None = None
+        self._keepalive: Keepalive | None = None
+        """Set by `hello`."""
+        self._keepalive_timer: asyncio.TimerHandle | None = None
+        self._keepalive_timer_at = 0
         self._peer = "?"
 
     def __str__(self) -> str:
@@ -61,19 +68,25 @@ class DeviceConnection(asyncio.Protocol):
         assert self.hello is not None
         return self.hello.manifest
 
+    @property
+    def last_seen(self) -> int:
+        """Epoch ms of the last inbound frame, from the `hello` on."""
+        assert self._keepalive is not None
+        return _now_ms() - (_now_us() - self._keepalive.last_inbound) // 1000
+
     def send(self, message: Message) -> None:
         if self._transport is not None and self.state != "closed":
             self._transport.write(encode_control(message))
 
     def close(self, reason: str) -> None:
         """Close the Connection. What was sent before goes out first."""
-        if self.state == "closed":
-            return
-        _log.info("%s: closing the Connection: %s", self, reason)
-        self.state = "closed"
-        self._stop_hello_timer()
-        if self._transport is not None:
+        if self._teardown(reason) and self._transport is not None:
             self._transport.close()
+
+    def abort(self, reason: str) -> None:
+        """Drop the Connection at once, unsent data and all: the device isn't listening."""
+        if self._teardown(reason) and self._transport is not None:
+            self._transport.abort()
 
     def connection_made(self, transport: asyncio.BaseTransport) -> None:
         self._transport = cast(asyncio.Transport, transport)
@@ -85,11 +98,14 @@ class DeviceConnection(asyncio.Protocol):
         )
 
     def data_received(self, data: bytes) -> None:
+        now = _now_us()
         try:
             for message in self._decoder.feed(data):
                 if self.state == "closed":
                     return
-                self._receive(message)
+                if self._keepalive is not None:
+                    self._keepalive.handle(Inbound(), now)
+                self._receive(message, now)
         except WireError as e:
             if e.code == "protocol_mismatch" and self.state == "hello":
                 self.send(Error("protocol_mismatch", e.detail, PROTOCOL))
@@ -102,18 +118,24 @@ class DeviceConnection(asyncio.Protocol):
             _log.info("%s: %s", self, e)
 
     def connection_lost(self, exc: Exception | None) -> None:
-        self.state = "closed"
-        self._stop_hello_timer()
-        self._registry.detach(self)
+        self._teardown("dropped" if exc is None else f"dropped: {exc}")
 
-    def _receive(self, message: Message) -> None:
+    def _receive(self, message: Message, now: int) -> None:
         match message:
-            case Ping() | Pong():
+            case Pong():
+                self.clock.handle(message, now)
+            case Ping():
                 pass
             case Hello() if self.state == "hello":
-                self._stop_hello_timer()
+                self._stop_timer(self._hello_timer)
                 self.hello = message
+                self._keepalive = Keepalive(
+                    now,
+                    ping_interval=self._timing.ping_interval_ms * 1000,
+                    dead_after=self._timing.dead_after_ms * 1000,
+                )
                 self._registry.hello(self)
+                self._run_keepalive(now)
             case Hello():
                 self.close("a second hello")
             case _ if self.state != "online":
@@ -121,10 +143,47 @@ class DeviceConnection(asyncio.Protocol):
             case _:
                 pass
 
-    def _stop_hello_timer(self) -> None:
-        if self._hello_timer is not None:
-            self._hello_timer.cancel()
-            self._hello_timer = None
+    def _run_keepalive(self, now: int) -> None:
+        """Do what the keepalive has due, and set the timer for its next deadline."""
+        assert self._keepalive is not None
+        for action in self._keepalive.handle(Tick(), now):
+            match action:
+                case SendPing(t):
+                    self.send(Ping(t))
+                case Dead():
+                    self.abort(f"dead: no frame for {self._timing.dead_after_ms} ms")
+        deadline = self._keepalive.next_deadline()
+        if self.state == "closed" or deadline is None:
+            return
+        # Inbound frames only push the deadline later, so a timer that fires early just
+        # finds nothing due and comes back here.
+        if self._keepalive_timer is None or deadline < self._keepalive_timer_at:
+            self._stop_timer(self._keepalive_timer)
+            self._keepalive_timer_at = deadline
+            self._keepalive_timer = asyncio.get_running_loop().call_later(
+                max(0, deadline - now) / 1_000_000, self._keepalive_due
+            )
+
+    def _keepalive_due(self) -> None:
+        self._keepalive_timer = None
+        self._run_keepalive(_now_us())
+
+    def _teardown(self, reason: str) -> bool:
+        """Release everything the Connection holds, once. Returns whether this call did."""
+        if self.state == "closed":
+            return False
+        _log.info("%s: Connection closed: %s", self, reason)
+        self.state = "closed"
+        self._stop_timer(self._hello_timer)
+        self._stop_timer(self._keepalive_timer)
+        self._hello_timer = self._keepalive_timer = None
+        self._registry.detach(self)
+        return True
+
+    @staticmethod
+    def _stop_timer(timer: asyncio.TimerHandle | None) -> None:
+        if timer is not None:
+            timer.cancel()
 
 
 class Registry:
@@ -157,18 +216,24 @@ class Registry:
     # Owner operations.
 
     def devices(self) -> list[JsonObject]:
-        """Paired and pending devices, by device_id."""
+        """Paired and pending devices, by device_id. `last_seen` is in epoch ms."""
         live = {d: c for d, c in self._live.items() if c.state != "closed"}
         entries: list[JsonObject] = []
         for device_id in sorted(self._records.keys() | live.keys()):
             record = self._records.get(device_id)
             conn = live.get(device_id)
-            manifest = conn.manifest if conn is not None else cast(DeviceRecord, record).manifest
+            if conn is not None:
+                manifest, last_seen = conn.manifest, conn.last_seen
+            else:
+                assert record is not None
+                manifest, last_seen = record.manifest, record.last_seen
             entries.append(
                 {
                     "device_id": device_id,
                     "name": None if record is None else record.name,
                     "pending": conn is not None and conn.state in ("pending", "pairing"),
+                    "online": conn is not None,
+                    "last_seen": last_seen,
                     "board": manifest.board,
                     "firmware": manifest.firmware,
                 }
@@ -243,7 +308,7 @@ class Registry:
         if self._live.get(device_id) is conn:
             del self._live[device_id]
         if conn.conn_id and (record := self._records.get(device_id)) is not None:
-            record.last_seen = _now_ms()
+            record.last_seen = conn.last_seen
             self._spawn(self._save())
 
     # Internals.
@@ -336,3 +401,8 @@ def _sha256(token: str) -> str:
 
 def _now_ms() -> int:
     return time.time_ns() // 1_000_000
+
+
+def _now_us() -> int:
+    """The hub's monotonic clock, as `ping.t` carries it."""
+    return time.monotonic_ns() // 1000

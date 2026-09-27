@@ -3,6 +3,7 @@
 import hashlib
 from collections.abc import Awaitable, Callable
 from pathlib import Path
+from unittest.mock import ANY
 
 import pytest
 from tinyaisense_hub import Hub, HubError, OwnerClient
@@ -24,6 +25,8 @@ async def test_an_unknown_device_shows_up_pending(sim: Simulator, owner: OwnerCl
             "device_id": device.device_id,
             "name": None,
             "pending": True,
+            "online": True,
+            "last_seen": ANY,
             "board": ECHO,
             "firmware": device.manifest.firmware,
         }

@@ -10,29 +10,34 @@ import logging
 import os
 import random
 import socket
+import time
 from collections.abc import Callable
 from importlib.metadata import version
 from pathlib import Path
 from typing import Literal, cast
 
 from tinyaisense_wire import (
+    MDNS_SERVICE,
     ControlDecoder,
     Error,
     Hello,
     Manifest,
     Message,
     Pending,
+    Ping,
+    Pong,
     Welcome,
     WireError,
-    encode_control,
 )
 
+from .backoff import Backoff
+from .discovery import Mdns, Resolve
+from .faults import ConnectionSocket, Faults
 from .profiles import PROFILES
 
 FIRMWARE = f"sim-{version('tinyaisense-sim')}"
-BACKOFF_S = (0.5, 1.0, 2.0, 5.0)
-"""The reconnect backoff: one step per failure in a row, capped at the last."""
-BACKOFF_JITTER = 0.2
+DEAD_AFTER_MS = 6000
+"""A Connection with no inbound frame for this long is dead."""
 
 DeviceState = Literal["connecting", "pending", "online", "closed"]
 
@@ -48,15 +53,32 @@ class Simulator:
     """Runs simulated devices in this process against one hub."""
 
     def __init__(
-        self, hub: str | tuple[str, int], state_dir: Path | None = None, *, seed: int = 0
+        self,
+        hub: str | tuple[str, int] | None = None,
+        state_dir: Path | None = None,
+        *,
+        seed: int = 0,
+        dead_after_ms: int = DEAD_AFTER_MS,
+        mdns_service: str = MDNS_SERVICE,
     ) -> None:
         """`hub` is the hub's device address, `host:port`.
 
-        Tokens live in `state_dir` if given, and only in memory otherwise.
+        Without one, devices find the hub over mDNS as `mdns_service`, as firmware does.
+        Tokens live in `state_dir` if given, and only in memory otherwise. A device drops a
+        Connection that brings no frame for `dead_after_ms`.
         """
-        self._address = _address(hub)
+        self._mdns: Mdns | None = None
+        if hub is None:
+            self._mdns = Mdns(mdns_service)
+            self._resolve: Resolve = self._mdns.resolve
+            self._udp_host = "0.0.0.0"
+        else:
+            address = _address(hub)
+            self._resolve = lambda: _static(address)
+            self._udp_host = "::" if ":" in address[0] else "0.0.0.0"
         self._tokens = _Tokens(state_dir)
-        self._rng = random.Random(seed)
+        self._seed = seed
+        self._dead_after = dead_after_ms / 1000
         self._devices: list[SimDevice] = []
 
     @property
@@ -73,7 +95,15 @@ class Simulator:
             raise ValueError(f"unknown board {board!r}; known: {', '.join(PROFILES)}")
         manifest = PROFILES[board](device_id_for(name), FIRMWARE)
         device = SimDevice(
-            name, manifest, self._address, self._tokens, self._rng, self._devices.remove
+            name,
+            manifest,
+            self._resolve,
+            self._udp_host,
+            self._tokens,
+            # Its own stream, so that one device's randomness doesn't shift another's.
+            random.Random(f"{self._seed}:{name}"),
+            self._dead_after,
+            self._devices.remove,
         )
         self._devices.append(device)
         await device.start()
@@ -83,6 +113,8 @@ class Simulator:
     async def close(self) -> None:
         for device in list(self._devices):
             await device.close()
+        if self._mdns is not None:
+            await self._mdns.close()
 
 
 class SimDevice:
@@ -92,9 +124,11 @@ class SimDevice:
         self,
         instance: str,
         manifest: Manifest,
-        hub: tuple[str, int],
+        resolve: Resolve,
+        udp_host: str,
         tokens: _Tokens,
         rng: random.Random,
+        dead_after: float,
         on_close: Callable[[SimDevice], None],
     ) -> None:
         self.instance = instance
@@ -104,14 +138,25 @@ class SimDevice:
         """The hub-owned name from the last `welcome`."""
         self.last_error: str | None = None
         """The `code` of the last `error` from the hub."""
-        self._hub = hub
+        self.conn_id: int | None = None
+        """From `welcome`, while the Connection lasts."""
+        self.reconnects = 0
+        """Connections the hub answered, after the first."""
+        self.faults = Faults()
+        self._resolve = resolve
+        self._udp_host = udp_host
         self._tokens = tokens
-        self._rng = rng
+        self._backoff = Backoff(rng)
+        self._dead_after = dead_after
         self._on_close = on_close
-        self._failures = 0
+        self._boot_ns = time.monotonic_ns()
         self._changed = asyncio.Event()
         self._udp: asyncio.DatagramTransport | None = None
         self._task: asyncio.Task[None] | None = None
+        self._answered_before = False
+        """Whether the hub has answered any Connection yet."""
+        self._vanished: list[ConnectionSocket] = []
+        """Given up on, but left open: closing one would tell the hub."""
 
     @property
     def device_id(self) -> str:
@@ -128,10 +173,9 @@ class SimDevice:
 
     async def start(self) -> None:
         # The UDP socket is bound before the first `hello`, which announces its port.
-        host = self._hub[0]
         loop = asyncio.get_running_loop()
         transport, _ = await loop.create_datagram_endpoint(
-            asyncio.DatagramProtocol, local_addr=("::" if ":" in host else "0.0.0.0", 0)
+            asyncio.DatagramProtocol, local_addr=(self._udp_host, 0)
         )
         self._udp = transport
         self._task = asyncio.create_task(self._run(), name=f"sim device {self.instance}")
@@ -146,6 +190,7 @@ class SimDevice:
                 await self._task
         if self._udp is not None:
             self._udp.close()
+        self._close_vanished()
         self._set_state("closed")
         self._on_close(self)
 
@@ -157,43 +202,86 @@ class SimDevice:
         self.state = state
         self._changed_now()
 
+    def _close_vanished(self) -> None:
+        for connection in self._vanished:
+            connection.close()
+        self._vanished.clear()
+
     async def _run(self) -> None:
+        hub: tuple[str, int] | None = None
         while True:
             try:
-                await self._connection()
+                if hub is None:
+                    hub = await self._resolve()
+                await self._connection(hub)
             except (OSError, WireError) as e:
                 _log.info("%s: connection failed: %s", self.instance, e)
+            self.faults.connection = None
+            self.conn_id = None
             self._set_state("connecting")
-            step = BACKOFF_S[min(self._failures, len(BACKOFF_S) - 1)]
-            self._failures += 1
-            await asyncio.sleep(step * (1 + self._rng.uniform(0, BACKOFF_JITTER)))
+            retry = self._backoff.failed()
+            await asyncio.sleep(retry.delay)
+            if retry.resolve:
+                hub = None
 
-    async def _connection(self) -> None:
+    async def _connection(self, hub: tuple[str, int]) -> None:
         """One Connection, from connect to drop."""
         assert self._udp is not None
         udp_port = cast(tuple[str, int], self._udp.get_extra_info("sockname"))[1]
-        reader, writer = await asyncio.open_connection(*self._hub)
+        connection = ConnectionSocket(*await asyncio.open_connection(*hub))
+        self.faults.connection = connection
         try:
-            sock = cast(socket.socket, writer.get_extra_info("socket"))
-            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-            writer.write(encode_control(Hello(self.token, udp_port, self.manifest)))
+            connection.raw.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            connection.send(Hello(self.token, udp_port, self.manifest))
             decoder = ControlDecoder()
-            while data := await reader.read(65536):
+            answered = False
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + self._dead_after
+            while True:
+                try:
+                    async with asyncio.timeout_at(deadline):
+                        data = await connection.reader.read(65536)
+                        # A fault that struck while the read was pending holds what it got.
+                        await self.faults.readable(connection)
+                except TimeoutError:
+                    _log.info("%s: the hub went silent", self.instance)
+                    return
+                if not data:
+                    break
                 for message in decoder.feed(data):
-                    self._receive(message)
+                    deadline = loop.time() + self._dead_after
+                    if isinstance(message, (Pending, Welcome)) and not answered:
+                        answered = True
+                        self._answered(connection)
+                    self._receive(message, connection)
             decoder.close()
         finally:
-            writer.close()
+            if connection.vanished:
+                self._vanished.append(connection)
+            else:
+                connection.close()
 
-    def _receive(self, message: Message) -> None:
+    def _answered(self, connection: ConnectionSocket) -> None:
+        """The hub answered this Connection's `hello`, with `pending` or `welcome`."""
+        if self._answered_before:
+            self.reconnects += 1
+        self._answered_before = True
+        # This hello superseded any Connection the device gave up on, so the hub has closed
+        # those by now, and closing them tells it nothing.
+        self._close_vanished()
+
+    def _receive(self, message: Message, connection: ConnectionSocket) -> None:
         match message:
+            case Ping():
+                connection.send(Pong(message.t, self._clock()))
             case Pending():
                 self._set_state("pending")
             case Welcome():
                 if message.token is not None:
                     self._tokens.set(self.device_id, message.token)
                 self.name = message.name
-                self._failures = 0
+                self.conn_id = message.conn_id
+                self._backoff.welcomed()
                 self._set_state("online")
             case Error():
                 self.last_error = message.code
@@ -203,6 +291,14 @@ class SimDevice:
                 self._changed_now()
             case _:
                 pass
+
+    def _clock(self) -> int:
+        """The device clock: µs since boot."""
+        return (time.monotonic_ns() - self._boot_ns) // 1000
+
+
+async def _static(address: tuple[str, int]) -> tuple[str, int]:
+    return address
 
 
 def _address(hub: str | tuple[str, int]) -> tuple[str, int]:

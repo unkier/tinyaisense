@@ -12,7 +12,7 @@ Each device keeps one TCP connection to the hub, the **Connection**. It carries 
 | 8420 | UDP | device streams and event mirrors |
 | 8421 | TCP | HTTP: `/agent` and `/mcp` |
 
-- The hub advertises the mDNS service `_tinyaisense._tcp`. The SRV record carries the TCP port, and TXT carries `proto=1`, the protocol major.
+- The hub advertises the mDNS service `_tinyaisense._tcp`. The SRV record carries the TCP port, and TXT carries `proto=1`, the protocol major. It advertises one IPv4 address: that of the interface its mDNS goes out on.
 - The device uses the first hub it finds whose `proto` matches its own major.
 - A static `hub_host:port`, set over the serial console, overrides mDNS.
 
@@ -136,7 +136,7 @@ The Atom Echo Manifest:
 
 ## Keepalive and clock
 
-- The hub sends `ping{t}` every 2 s, from the `hello` on, pending Connections included. `t` is the hub's monotonic clock in µs; the device treats it as opaque.
+- The hub sends `ping{t}` every 2 s, the first as soon as the `hello` is in, pending Connections included. `t` is the hub's monotonic clock in µs; the device treats it as opaque.
 - The device answers at once with `pong{t, ts}`: `t` echoed, `ts` its own clock when it sends the pong.
 - The hub keeps a min-RTT filter over the pongs to get the device-clock offset, and maps device `ts` values to hub time with it.
 - Any inbound TCP frame counts as liveness. **After 6 s with no inbound frame, the Connection is dead** on either side, which closes it. The device never sends `ping`.
@@ -204,7 +204,7 @@ A datagram of an unknown `kind` is ignored. **UDP junk never closes a Connection
 There is no resume: the Connection is the unit of state.
 
 - **Hub side:** on drop, in-flight commands fail with `disconnected`, the Connection's streams close, and the device goes offline.
-- **Device side:** on drop, every capability goes idle and the Reflex is disarmed. The device reconnects with backoff 0.5 → 1 → 2 → 5 s (the cap), each plus up to 20% random jitter, and resets the backoff after a `welcome`. After 3 failures in a row it re-resolves mDNS.
+- **Device side:** on drop, every capability goes idle and the Reflex is disarmed. The device reconnects with backoff 0.5 → 1 → 2 → 5 s (the cap), each plus up to 20% random jitter, and resets the backoff after a `welcome`. Every Connection that ends, or fails to open, since the last `welcome` counts as one failure in a row, and waits the next step. After 3 failures in a row, and after every 3 more, it re-resolves mDNS before its next attempt.
 - **Protocol errors close the Connection**, on either side: `frame_too_large`, `bad_json`, `bad_message`, a second `hello`, or a message before `welcome` that isn't allowed.
 
 ## Versioning

@@ -3,7 +3,10 @@ name = "tinyaisense-hub"
 version = "0.1.0"
 description = "tinyaisense hub and owner CLI"
 requires-python = ">=3.14"
-dependencies = ["tinyaisense-wire"]
+dependencies = [
+    "tinyaisense-wire",
+    "zeroconf>=0.151",
+]
 
 [project.scripts]
 tinyaisense-hub = "tinyaisense_hub.cli:main"

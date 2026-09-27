@@ -7,7 +7,9 @@ way and the fixture doesn't exist.
 from collections.abc import AsyncIterator
 from pathlib import Path
 
-from .simulator import Simulator
+from tinyaisense_wire import MDNS_SERVICE
+
+from .simulator import DEAD_AFTER_MS, Simulator
 
 
 class SimulatorFactory:
@@ -17,9 +19,17 @@ class SimulatorFactory:
         self._sims: list[Simulator] = []
 
     def __call__(
-        self, hub: str | tuple[str, int], state_dir: Path | None = None, *, seed: int = 0
+        self,
+        hub: str | tuple[str, int] | None = None,
+        state_dir: Path | None = None,
+        *,
+        seed: int = 0,
+        dead_after_ms: int = DEAD_AFTER_MS,
+        mdns_service: str = MDNS_SERVICE,
     ) -> Simulator:
-        sim = Simulator(hub, state_dir, seed=seed)
+        sim = Simulator(
+            hub, state_dir, seed=seed, dead_after_ms=dead_after_ms, mdns_service=mdns_service
+        )
         self._sims.append(sim)
         return sim
 
@@ -36,7 +46,7 @@ else:
 
     @pytest_asyncio.fixture
     async def simulator() -> AsyncIterator[SimulatorFactory]:
-        """`simulator(hub, state_dir=None, *, seed=0)` makes a Simulator against `hub`."""
+        """`simulator(hub=None, state_dir=None, **options)` makes a Simulator: see `Simulator`."""
         factory = SimulatorFactory()
         yield factory
         await factory.close()

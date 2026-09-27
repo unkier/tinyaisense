@@ -5,8 +5,11 @@ from pathlib import Path
 from types import TracebackType
 from typing import Self, cast
 
+from tinyaisense_wire import MDNS_SERVICE
+
 from .config import Config
 from .devices import Registry
+from .discovery import Advertiser
 from .owner import OwnerServer
 from .state import StateStore
 
@@ -22,17 +25,23 @@ class Hub:
         runtime_dir: Path,
         auto_approve: bool = False,
         host: str | None = None,
+        mdns: str | None = MDNS_SERVICE,
     ) -> None:
-        """`host` is the address to serve devices on; all interfaces if None."""
+        """`host` is the address to serve devices on; all interfaces if None.
+
+        `mdns` is the service type to advertise the device port as; None not to advertise.
+        """
         self.config = config
         self._state_dir = state_dir
         self._runtime_dir = runtime_dir
         self._auto_approve = auto_approve
         self._host = host
+        self._mdns = mdns
         self._udp: asyncio.DatagramTransport | None = None
         self._tcp: asyncio.Server | None = None
         self._registry: Registry | None = None
         self._owner: OwnerServer | None = None
+        self._advertiser: Advertiser | None = None
 
     async def __aenter__(self) -> Self:
         await self.start()
@@ -86,10 +95,16 @@ class Hub:
         self._tcp = await loop.create_server(self._registry.connection, self._host, port)
         self._owner = OwnerServer(self._registry, self._runtime_dir)
         await self._owner.start()
+        if self._mdns is not None:
+            self._advertiser = Advertiser(self._mdns, self._host, self.device_address[1])
+            self._advertiser.start()
 
     async def close(self) -> None:
-        owner, tcp, udp, registry = self._owner, self._tcp, self._udp, self._registry
-        self._owner = self._tcp = self._udp = self._registry = None
+        advertiser, owner, tcp = self._advertiser, self._owner, self._tcp
+        udp, registry = self._udp, self._registry
+        self._advertiser = self._owner = self._tcp = self._udp = self._registry = None
+        if advertiser is not None:
+            await advertiser.close()
         if owner is not None:
             await owner.close()
         if tcp is not None:

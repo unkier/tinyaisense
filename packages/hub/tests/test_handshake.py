@@ -1,11 +1,11 @@
-"""The handshake, driven by a hand-rolled device that can break the protocol."""
+"""The handshake and keepalive, driven by a hand-rolled device that can break the protocol."""
 
 import asyncio
 import json
 from collections.abc import Awaitable, Callable
 from typing import Self
 
-from tinyaisense_hub import Hub, OwnerClient
+from tinyaisense_hub import Hub, OwnerClient, Timing
 from tinyaisense_sim import PROFILES
 from tinyaisense_wire import (
     ControlDecoder,
@@ -17,6 +17,7 @@ from tinyaisense_wire import (
     Manifest,
     Message,
     Pending,
+    Ping,
     Pong,
     Welcome,
     encode_control,
@@ -33,7 +34,7 @@ def echo_manifest(device_id: str = DEVICE_ID) -> Manifest:
 
 
 class RawDevice:
-    """A device's TCP side, one message at a time."""
+    """A device's TCP side, one message at a time. It never answers pings by itself."""
 
     def __init__(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         self._reader = reader
@@ -52,18 +53,35 @@ class RawDevice:
         self._writer.write(data)
 
     async def receive(self) -> Message:
-        while not self._inbox:
-            data = await self._reader.read(65536)
-            assert data, "the hub closed the Connection"
-            self._inbox.extend(self._decoder.feed(data))
-        return self._inbox.pop(0)
+        """The next message that isn't a ping."""
+        while (message := self._pop(ping=False)) is None:
+            assert await self._read(), "the hub closed the Connection"
+        return message
+
+    async def receive_ping(self) -> Ping:
+        while (ping := self._pop(ping=True)) is None:
+            assert await self._read(), "the hub closed the Connection"
+        assert isinstance(ping, Ping)
+        return ping
 
     async def until_closed(self) -> list[Message]:
-        """Everything the hub sends until it closes the Connection."""
-        while data := await self._reader.read(65536):
-            self._inbox.extend(self._decoder.feed(data))
-        messages, self._inbox = self._inbox, []
+        """Everything but pings that the hub sends until it closes the Connection."""
+        while await self._read():
+            pass
+        messages: list[Message] = [m for m in self._inbox if not isinstance(m, Ping)]
+        self._inbox = []
         return messages
+
+    async def _read(self) -> bool:
+        data = await self._reader.read(65536)
+        self._inbox.extend(self._decoder.feed(data))
+        return bool(data)
+
+    def _pop(self, *, ping: bool) -> Message | None:
+        for i, message in enumerate(self._inbox):
+            if isinstance(message, Ping) == ping:
+                return self._inbox.pop(i)
+        return None
 
 
 async def test_welcome_carries_the_name_conn_id_udp_port_and_token(
@@ -215,3 +233,36 @@ async def test_a_new_hello_from_a_connected_device_supersedes_its_old_connection
 
     assert await new.receive() == Pending()
     assert await old.until_closed() == []
+
+
+async def test_the_hub_pings_a_device_from_its_hello_on(hub: Hub) -> None:
+    device = await RawDevice.connect(hub)
+    device.send(Hello(None, 5000, echo_manifest()))
+
+    first = await device.receive_ping()
+    device.send(Pong(first.t, 1))
+    second = await device.receive_ping()
+
+    assert second.t > first.t
+
+
+async def test_a_device_that_answers_pings_stays_connected(start_hub: StartHub) -> None:
+    hub = await start_hub(
+        timing=Timing(hello_timeout_ms=300, ping_interval_ms=50, dead_after_ms=400)
+    )
+    device = await RawDevice.connect(hub)
+    device.send(Hello(None, 5000, echo_manifest()))
+
+    # Twenty pings, 50 ms apart, outlast the dead timeout more than twice over.
+    for ts in range(20):
+        ping = await device.receive_ping()
+        device.send(Pong(ping.t, ts))
+
+    assert await device.receive() == Pending()
+
+
+async def test_a_silent_device_is_dropped(hub: Hub) -> None:
+    device = await RawDevice.connect(hub)
+    device.send(Hello(None, 5000, echo_manifest()))
+
+    assert await device.until_closed() == [Pending()]

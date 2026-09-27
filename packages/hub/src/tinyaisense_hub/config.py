@@ -23,6 +23,12 @@ class Timing:
 
     hello_timeout_ms: int = 5000
     """A device must send `hello` this soon after it connects."""
+    ping_interval_ms: int = 2000
+    """The hub pings each device this often, from its `hello` on."""
+    dead_after_ms: int = 6000
+    """A Connection with no inbound frame for this long is dead. More than the ping interval."""
+    clock_window_ms: int = 20000
+    """The device-clock offset comes from the shortest round trip among the pongs this recent."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -77,6 +83,8 @@ def parse_config(text: str) -> Config:
     )
     for table in (top, ports, timing):
         table.check_unknown()
+    if config.timing.dead_after_ms <= config.timing.ping_interval_ms:
+        raise ConfigError("timing.dead_after_ms must be more than timing.ping_interval_ms")
     return config
 
 

@@ -6,6 +6,9 @@ import logging
 import signal
 import sys
 from collections.abc import Awaitable, Callable, Sequence
+from datetime import datetime
+
+from tinyaisense_wire import MDNS_SERVICE
 
 from .config import (
     ConfigError,
@@ -45,6 +48,11 @@ def _parser() -> argparse.ArgumentParser:
     serve = commands.add_parser("serve", help="run the hub")
     serve.add_argument(
         "--auto-approve", action="store_true", help="pair new devices without asking (dev only)"
+    )
+    serve.add_argument(
+        "--no-mdns",
+        action="store_true",
+        help="don't advertise over mDNS; devices then need the hub's address set",
     )
     serve.set_defaults(run=_serve)
 
@@ -87,7 +95,11 @@ def _serve(args: argparse.Namespace) -> int:
 
     async def serve() -> None:
         hub = Hub(
-            config, state_dir=state_dir(), runtime_dir=runtime_dir(), auto_approve=args.auto_approve
+            config,
+            state_dir=state_dir(),
+            runtime_dir=runtime_dir(),
+            auto_approve=args.auto_approve,
+            mdns=None if args.no_mdns else MDNS_SERVICE,
         )
         async with hub:
             _log.info(
@@ -109,12 +121,13 @@ def _serve(args: argparse.Namespace) -> int:
 
 def _devices(args: argparse.Namespace) -> int:
     devices = _owner(lambda owner: owner.devices())
-    rows = [("DEVICE ID", "NAME", "STATE", "BOARD", "FIRMWARE")]
+    rows = [("DEVICE ID", "NAME", "STATE", "LAST SEEN", "BOARD", "FIRMWARE")]
     rows += [
         (
             d["device_id"],
             d["name"] or "-",
-            "pending" if d["pending"] else "paired",
+            "pending" if d["pending"] else "online" if d["online"] else "offline",
+            "now" if d["online"] else _local_time(d["last_seen"]),
             d["board"],
             d["firmware"],
         )
@@ -126,6 +139,10 @@ def _devices(args: argparse.Namespace) -> int:
             "  ".join(cell.ljust(width) for cell, width in zip(row, widths, strict=True)).rstrip()
         )
     return 0
+
+
+def _local_time(epoch_ms: int) -> str:
+    return datetime.fromtimestamp(epoch_ms / 1000).strftime("%Y-%m-%d %H:%M:%S")
 
 
 def _approve(args: argparse.Namespace) -> int:
