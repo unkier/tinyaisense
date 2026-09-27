@@ -1,0 +1,73 @@
+{
+  "kind": "led",
+  "stream": null,
+  "params": {
+    "type": "object",
+    "required": [
+      "count"
+    ],
+    "properties": {
+      "count": {
+        "type": "integer",
+        "minimum": 1
+      }
+    }
+  },
+  "events": {},
+  "commands": {
+    "set": {
+      "hub_only": false,
+      "timeout_ms": 1000,
+      "args": {
+        "type": "object",
+        "required": [
+          "color"
+        ],
+        "properties": {
+          "color": {
+            "type": "string",
+            "pattern": "^#[0-9a-fA-F]{6}$"
+          },
+          "brightness": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 100,
+            "default": 100
+          },
+          "pattern": {
+            "type": "string",
+            "enum": [
+              "solid",
+              "blink",
+              "pulse"
+            ],
+            "default": "solid"
+          },
+          "period_ms": {
+            "type": "integer",
+            "minimum": 200,
+            "maximum": 5000,
+            "default": 1000
+          },
+          "index": {
+            "type": "integer",
+            "minimum": 0
+          }
+        }
+      },
+      "result": {
+        "type": "object"
+      }
+    },
+    "off": {
+      "hub_only": false,
+      "timeout_ms": 1000,
+      "args": {
+        "type": "object"
+      },
+      "result": {
+        "type": "object"
+      }
+    }
+  }
+}

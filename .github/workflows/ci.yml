@@ -25,8 +25,11 @@ jobs:
       - run: uv run --no-sync ruff check --output-format=github
       - run: uv run --no-sync ruff format --check
       - run: uv run --no-sync pyright
-      # wire and the SDK must also type-check against the 3.11 stdlib.
-      - run: uv run --no-sync pyright --pythonversion 3.11 packages/wire packages/sdk
+      # wire, the SDK and the vector generator (loaded by wire's tests) must also
+      # type-check against the 3.11 stdlib.
+      - run: >-
+          uv run --no-sync pyright --pythonversion 3.11
+          packages/wire packages/sdk docs/protocol/vectors
 
   test:
     name: pytest (3.14, all packages)

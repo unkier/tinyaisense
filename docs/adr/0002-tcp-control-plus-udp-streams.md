@@ -3,7 +3,7 @@
 Each device keeps one raw TCP connection to the hub. It carries JSON control messages (hello, commands, replies, events, ping) and bulk command payloads, framed by a 4-byte header. Stream frames (mic and speaker audio, later video) travel as UDP datagrams, and button events are mirrored over UDP as well. We chose this because lowest latency is the top priority.
 - **TCP vs UDP on a clean LAN:** they measured the same in the loopback spike.
 - **Under WiFi loss:** a lost TCP segment stalls everything queued behind it until retransmit. lwIP's retransmit timer is coarse, so this can take hundreds of ms. A lost UDP frame is only a 20 ms gap.
-- **Stream boundaries:** start, stop and flush stay authoritative on TCP, so a lost datagram never loses a boundary.
+- **Stream boundaries:** start, stop and drain stay authoritative on TCP, so a lost datagram never loses a boundary.
 
 ## Considered Options
 

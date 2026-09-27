@@ -85,7 +85,7 @@ A reaction the hub arms on a device, which the device then carries out by itself
 _Avoid_: Trigger, binding, shortcut
 
 **Status**:
-What a device shows the human about itself, the hub and the agent (e.g. offline, pending, listening, thinking), on whatever indicator its board has. An agent's LED claim suspends it, except for listening, which always shows.
+What a device shows the human about itself, the hub and the agent (e.g. offline, pending, listening, thinking), on whatever indicator its board has. An agent's LED claim suspends it, except for listening and identify, which always show.
 _Avoid_: LED state, indicator, mode
 
 **Utterance**:

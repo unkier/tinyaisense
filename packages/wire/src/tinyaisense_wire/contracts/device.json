@@ -1,0 +1,95 @@
+{
+  "commands": {
+    "status": {
+      "hub_only": true,
+      "timeout_ms": 1000,
+      "args": {
+        "type": "object",
+        "required": [
+          "state"
+        ],
+        "properties": {
+          "state": {
+            "type": "string",
+            "enum": [
+              "no_agent",
+              "agent",
+              "thinking"
+            ]
+          }
+        }
+      },
+      "result": {
+        "type": "object"
+      }
+    },
+    "identify": {
+      "hub_only": true,
+      "timeout_ms": 1000,
+      "args": {
+        "type": "object",
+        "properties": {
+          "s": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 300,
+            "default": 5
+          }
+        }
+      },
+      "result": {
+        "type": "object"
+      }
+    },
+    "diag": {
+      "hub_only": true,
+      "timeout_ms": 1000,
+      "args": {
+        "type": "object"
+      },
+      "result": {
+        "type": "object",
+        "required": [
+          "uptime_s",
+          "reset_reason",
+          "heap_free",
+          "heap_min",
+          "rssi",
+          "reconnects",
+          "stack_hwm"
+        ],
+        "properties": {
+          "uptime_s": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "reset_reason": {
+            "type": "string"
+          },
+          "heap_free": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "heap_min": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "rssi": {
+            "type": "integer"
+          },
+          "reconnects": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "stack_hwm": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "integer",
+              "minimum": 0
+            }
+          }
+        }
+      }
+    }
+  }
+}

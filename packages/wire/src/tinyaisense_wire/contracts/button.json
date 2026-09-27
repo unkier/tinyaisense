@@ -1,0 +1,83 @@
+{
+  "kind": "button",
+  "stream": null,
+  "params": {
+    "type": "object"
+  },
+  "events": {
+    "down": {
+      "data": {
+        "type": "object"
+      }
+    },
+    "up": {
+      "data": {
+        "type": "object"
+      }
+    }
+  },
+  "commands": {
+    "set_reflex": {
+      "hub_only": true,
+      "timeout_ms": 1000,
+      "args": {
+        "type": "object",
+        "required": [
+          "armed"
+        ],
+        "properties": {
+          "armed": {
+            "type": "boolean"
+          },
+          "stop": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "start": {
+            "type": "object",
+            "required": [
+              "cap",
+              "format"
+            ],
+            "properties": {
+              "cap": {
+                "type": "string"
+              },
+              "format": {
+                "type": "object",
+                "required": [
+                  "codec",
+                  "rate",
+                  "channels",
+                  "frame_ms"
+                ],
+                "properties": {
+                  "codec": {
+                    "type": "string"
+                  },
+                  "rate": {
+                    "type": "integer",
+                    "minimum": 1
+                  },
+                  "channels": {
+                    "type": "integer",
+                    "minimum": 1
+                  },
+                  "frame_ms": {
+                    "type": "integer",
+                    "minimum": 1
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      "result": {
+        "type": "object"
+      }
+    }
+  }
+}
