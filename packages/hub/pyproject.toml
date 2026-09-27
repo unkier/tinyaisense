@@ -5,6 +5,9 @@ description = "tinyaisense hub and owner CLI"
 requires-python = ">=3.14"
 dependencies = ["tinyaisense-wire"]
 
+[project.scripts]
+tinyaisense-hub = "tinyaisense_hub.cli:main"
+
 [project.optional-dependencies]
 # Local speech engines: sherpa-onnx, piper-tts, torch (Silero RU only).
 local = []

@@ -8,6 +8,11 @@ dependencies = ["tinyaisense-wire"]
 [project.optional-dependencies]
 # PC mic and speaker as audio source and sink.
 audio = []
+# The `simulator` pytest fixture.
+pytest = ["pytest>=9.0", "pytest-asyncio>=1.4"]
+
+[project.entry-points.pytest11]
+tinyaisense_sim = "tinyaisense_sim.pytest_plugin"
 
 [tool.uv.sources]
 tinyaisense-wire = { workspace = true }

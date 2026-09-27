@@ -1,0 +1,167 @@
+"""`tinyaisense-hub`: run the hub, and the owner's commands."""
+
+import argparse
+import asyncio
+import logging
+import signal
+import sys
+from collections.abc import Awaitable, Callable, Sequence
+
+from .config import (
+    ConfigError,
+    config_path,
+    load_config,
+    new_config,
+    runtime_dir,
+    state_dir,
+    write_config,
+)
+from .errors import HubError
+from .hub import Hub
+from .owner import SOCKET_NAME, OwnerClient
+from .state import StateError
+
+PROG = "tinyaisense-hub"
+
+_log = logging.getLogger("tinyaisense_hub")
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    parser = _parser()
+    args = parser.parse_args(argv)
+    try:
+        return args.run(args)
+    except (ConfigError, StateError, HubError, OSError) as e:
+        return _fail(str(e))
+
+
+def _parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog=PROG, description="The tinyaisense hub.")
+    commands = parser.add_subparsers(required=True, metavar="command")
+
+    init = commands.add_parser("init", help="write a new config with a random agent token")
+    init.set_defaults(run=_init)
+
+    serve = commands.add_parser("serve", help="run the hub")
+    serve.add_argument(
+        "--auto-approve", action="store_true", help="pair new devices without asking (dev only)"
+    )
+    serve.set_defaults(run=_serve)
+
+    devices = commands.add_parser("devices", help="list paired and pending devices")
+    devices.set_defaults(run=_devices)
+
+    approve = commands.add_parser(
+        "approve", help="pair a pending device", usage=f"{PROG} approve <device> [as <name>]"
+    )
+    approve.add_argument("device", help="a device_id, or a unique prefix of one")
+    approve.add_argument("as_name", nargs="*", metavar="as <name>")
+    approve.set_defaults(run=_approve, parser=approve)
+
+    rename = commands.add_parser("rename", help="rename a device; it reconnects")
+    rename.add_argument("device", help="its name or device_id")
+    rename.add_argument("name")
+    rename.set_defaults(run=_rename)
+
+    forget = commands.add_parser("forget", help="unpair a device; it must pair again")
+    forget.add_argument("device", help="its name or device_id")
+    forget.set_defaults(run=_forget)
+    return parser
+
+
+def _init(args: argparse.Namespace) -> int:
+    path = config_path()
+    try:
+        write_config(path, new_config())
+    except FileExistsError:
+        return _fail(f"{path} already exists; delete it first to start over")
+    print(f"wrote {path}")
+    return 0
+
+
+def _serve(args: argparse.Namespace) -> int:
+    config = load_config(config_path())
+    logging.basicConfig(
+        level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
+    )
+
+    async def serve() -> None:
+        hub = Hub(
+            config, state_dir=state_dir(), runtime_dir=runtime_dir(), auto_approve=args.auto_approve
+        )
+        async with hub:
+            _log.info(
+                "serving devices on port %d (TCP), %d (UDP); owner socket %s",
+                hub.device_address[1],
+                hub.udp_port,
+                hub.owner_socket,
+            )
+            stop = asyncio.Event()
+            loop = asyncio.get_running_loop()
+            for sig in (signal.SIGINT, signal.SIGTERM):
+                loop.add_signal_handler(sig, stop.set)
+            await stop.wait()
+            _log.info("shutting down")
+
+    asyncio.run(serve())
+    return 0
+
+
+def _devices(args: argparse.Namespace) -> int:
+    devices = _owner(lambda owner: owner.devices())
+    rows = [("DEVICE ID", "NAME", "STATE", "BOARD", "FIRMWARE")]
+    rows += [
+        (
+            d["device_id"],
+            d["name"] or "-",
+            "pending" if d["pending"] else "paired",
+            d["board"],
+            d["firmware"],
+        )
+        for d in devices
+    ]
+    widths = [max(len(row[i]) for row in rows) for i in range(len(rows[0]))]
+    for row in rows:
+        print(
+            "  ".join(cell.ljust(width) for cell, width in zip(row, widths, strict=True)).rstrip()
+        )
+    return 0
+
+
+def _approve(args: argparse.Namespace) -> int:
+    rest: list[str] = args.as_name
+    if rest and (len(rest) != 2 or rest[0] != "as"):
+        parser: argparse.ArgumentParser = args.parser
+        parser.error("expected `approve <device> [as <name>]`")
+    name = rest[1] if rest else None
+    approved = _owner(lambda owner: owner.approve(args.device, name))
+    print(f"approved {approved['device_id']} as {approved['name']}")
+    return 0
+
+
+def _rename(args: argparse.Namespace) -> int:
+    renamed = _owner(lambda owner: owner.rename(args.device, args.name))
+    print(f"renamed {renamed['device_id']} to {renamed['name']}")
+    return 0
+
+
+def _forget(args: argparse.Namespace) -> int:
+    _owner(lambda owner: owner.forget(args.device))
+    print(f"forgot {args.device}")
+    return 0
+
+
+def _owner[T](call: Callable[[OwnerClient], Awaitable[T]]) -> T:
+    async def run() -> T:
+        try:
+            async with OwnerClient(runtime_dir() / SOCKET_NAME) as owner:
+                return await call(owner)
+        except FileNotFoundError, ConnectionRefusedError:
+            raise HubError("no_hub", f"no hub is running; start one with `{PROG} serve`") from None
+
+    return asyncio.run(run())
+
+
+def _fail(message: str) -> int:
+    print(f"{PROG}: {message}", file=sys.stderr)
+    return 1
