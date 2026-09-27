@@ -1,0 +1,17 @@
+[project]
+name = "tinyaisense-sim"
+version = "0.1.0"
+description = "tinyaisense Simulator: simulated devices, CLI and pytest plugin"
+requires-python = ">=3.14"
+dependencies = ["tinyaisense-wire"]
+
+[project.optional-dependencies]
+# PC mic and speaker as audio source and sink.
+audio = []
+
+[tool.uv.sources]
+tinyaisense-wire = { workspace = true }
+
+[build-system]
+requires = ["uv_build>=0.10.0,<0.11"]
+build-backend = "uv_build"

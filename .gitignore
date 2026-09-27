@@ -9,6 +9,7 @@ sdkconfig.*
 
 # Python
 __pycache__/
+.coverage
 .venv/
 *.egg-info/
 

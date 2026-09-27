@@ -1,0 +1,60 @@
+# Fast tier: functional checks only, on every push. No timing asserts here.
+name: CI
+
+on:
+  push:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  lint:
+    name: ruff + pyright
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@v10.2.0
+      # pyright needs the test deps too: it type-checks the tests.
+      - run: uv sync --locked --all-packages
+      - run: uv run --no-sync ruff check --output-format=github
+      - run: uv run --no-sync ruff format --check
+      - run: uv run --no-sync pyright
+      # wire and the SDK must also type-check against the 3.11 stdlib.
+      - run: uv run --no-sync pyright --pythonversion 3.11 packages/wire packages/sdk
+
+  test:
+    name: pytest (3.14, all packages)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@v10.2.0
+      - run: uv sync --locked --all-packages --no-default-groups --group test
+      - run: >-
+          uv run --no-sync pytest --cov-report=term-missing
+          --cov=tinyaisense_wire --cov=tinyaisense_hub --cov=tinyaisense_sim --cov=tinyaisense
+      - name: Coverage summary
+        run: uv run --no-sync coverage report --format=markdown >> "$GITHUB_STEP_SUMMARY"
+
+  test-py311:
+    name: pytest (3.11, wire + sdk)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@v10.2.0
+      # hub and sim pin the workspace lock to >=3.14, so wire and the SDK get
+      # their own unlocked 3.11 environment.
+      - run: uv venv --python 3.11
+      - run: uv pip install -e packages/wire -e packages/sdk --group test
+      - run: >-
+          .venv/bin/pytest packages/wire packages/sdk --cov-report=term-missing
+          --cov=tinyaisense_wire --cov=tinyaisense

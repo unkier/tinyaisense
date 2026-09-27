@@ -1,0 +1,19 @@
+[project]
+name = "tinyaisense-hub"
+version = "0.1.0"
+description = "tinyaisense hub and owner CLI"
+requires-python = ">=3.14"
+dependencies = ["tinyaisense-wire"]
+
+[project.optional-dependencies]
+# Local speech engines: sherpa-onnx, piper-tts, torch (Silero RU only).
+local = []
+# polza.ai cloud speech plugin.
+polza = []
+
+[tool.uv.sources]
+tinyaisense-wire = { workspace = true }
+
+[build-system]
+requires = ["uv_build>=0.10.0,<0.11"]
+build-backend = "uv_build"

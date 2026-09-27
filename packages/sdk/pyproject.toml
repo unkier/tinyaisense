@@ -1,0 +1,13 @@
+[project]
+name = "tinyaisense"
+version = "0.1.0"
+description = "tinyaisense agent SDK: asyncio client, OpenAI Agents SDK adapter and MCP stdio shim"
+requires-python = ">=3.11"
+dependencies = ["tinyaisense-wire"]
+
+[tool.uv.sources]
+tinyaisense-wire = { workspace = true }
+
+[build-system]
+requires = ["uv_build>=0.10.0,<0.11"]
+build-backend = "uv_build"
