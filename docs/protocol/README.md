@@ -7,7 +7,7 @@ These docs, together with the Kind contract data they link (`packages/wire/src/t
 - Kind contracts, one per Kind: [`mic`](kinds/mic.md), [`speaker`](kinds/speaker.md), [`button`](kinds/button.md), [`led`](kinds/led.md). Device-level commands and the Status table: [`device`](kinds/device.md).
 - [`vectors/`](vectors/README.md): golden vectors. Both the Python and the C codec must pass every one.
 
-The agent API is documented separately.
+The agent API, the WebSocket that agents use, has its own doc: [`agent.md`](agent.md). It is the source of truth for the `/agent` endpoint and the SDK.
 
 ## Conventions
 

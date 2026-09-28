@@ -8,7 +8,7 @@ import secrets
 import socket
 import time
 from collections.abc import Coroutine
-from typing import Any, Literal, cast
+from typing import Any, Literal, Protocol, cast
 
 from tinyaisense_wire import (
     PROTOCOL,
@@ -39,6 +39,14 @@ _log = logging.getLogger("tinyaisense_hub.devices")
 ConnectionState = Literal["hello", "pending", "pairing", "online", "closed"]
 
 
+class Presence(Protocol):
+    """Told when a paired device comes online or drops."""
+
+    def device_online(self, name: str, manifest: Manifest) -> None: ...
+
+    def device_offline(self, name: str) -> None: ...
+
+
 class DeviceConnection(asyncio.Protocol):
     """One device's Connection, from TCP accept to drop. Every handler is synchronous."""
 
@@ -47,6 +55,8 @@ class DeviceConnection(asyncio.Protocol):
         self.hello: Hello | None = None
         self.conn_id = 0
         """Set by `welcome`."""
+        self.name = ""
+        """The device name `welcome` gave it."""
         self.clock = ClockSync(window=timing.clock_window_ms * 1000)
         """The device clock, from its pongs."""
         self._registry = registry
@@ -194,23 +204,36 @@ class Registry:
     """
 
     def __init__(
-        self, store: StateStore, *, udp_port: int, timing: Timing, auto_approve: bool
+        self,
+        store: StateStore,
+        *,
+        udp_port: int,
+        timing: Timing,
+        auto_approve: bool,
+        presence: Presence,
     ) -> None:
         self._store = store
         self._records = store.load()
         self._live: dict[str, DeviceConnection] = {}
         """device_id → its pending or online Connection."""
+        self._connections: set[DeviceConnection] = set()
+        """Every open Connection, from accept on."""
         self._udp_port = udp_port
         self._timing = timing
         self._auto_approve = auto_approve
+        self._presence = presence
         self._tasks: set[asyncio.Task[Any]] = set()
 
     def connection(self) -> DeviceConnection:
         """The protocol factory for the device TCP server."""
-        return DeviceConnection(self, self._timing)
+        conn = DeviceConnection(self, self._timing)
+        self._connections.add(conn)
+        return conn
 
     async def close(self) -> None:
-        """Wait for background saves. Close the Connections first."""
+        """Close every Connection, then wait for background saves."""
+        for conn in list(self._connections):
+            conn.close("the hub is shutting down")
         await asyncio.gather(*self._tasks, return_exceptions=True)
 
     # Owner operations.
@@ -239,6 +262,18 @@ class Registry:
                 }
             )
         return entries
+
+    def paired(self) -> list[JsonObject]:
+        """Paired devices as agents see them, by name: pending ones are hidden."""
+        return [
+            {
+                "name": record.name,
+                "online": (conn := self._live.get(record.device_id)) is not None
+                and conn.state == "online",
+                "manifest": record.manifest.to_json(),
+            }
+            for record in sorted(self._records.values(), key=lambda r: r.name)
+        ]
 
     async def approve(self, device: str, name: str | None = None) -> JsonObject:
         """Pair a pending device and welcome it with its new token."""
@@ -302,14 +337,19 @@ class Registry:
             _log.info("%s: pending, board %s", conn, conn.manifest.board)
 
     def detach(self, conn: DeviceConnection) -> None:
+        self._connections.discard(conn)
         if conn.hello is None:
             return
         device_id = conn.manifest.device_id
         if self._live.get(device_id) is conn:
             del self._live[device_id]
-        if conn.conn_id and (record := self._records.get(device_id)) is not None:
+        if not conn.conn_id:
+            return  # never welcomed
+        if (record := self._records.get(device_id)) is not None:
             record.last_seen = conn.last_seen
             self._spawn(self._save())
+        # By its welcome name: a rename or forget has changed the record already.
+        self._presence.device_offline(conn.name)
 
     # Internals.
 
@@ -345,12 +385,14 @@ class Registry:
         while (conn_id := secrets.randbits(32)) == 0 or conn_id in used:
             pass
         conn.conn_id = conn_id
+        conn.name = record.name
         conn.state = "online"
         conn.send(Welcome(record.name, conn_id, self._udp_port, token))
         record.manifest = conn.manifest
         record.last_seen = _now_ms()
         self._spawn(self._save())
         _log.info("%s: online as %s", conn, record.name)
+        self._presence.device_online(record.name, conn.manifest)
 
     def _default_name(self, manifest: Manifest) -> str:
         """`<board-short>-<last 4 hex of the MAC>`, e.g. `echo-c3d4`, made unique."""

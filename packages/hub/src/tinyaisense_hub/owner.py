@@ -36,6 +36,7 @@ class OwnerServer:
         self.path = runtime_dir / SOCKET_NAME
         self._registry = registry
         self._server: asyncio.Server | None = None
+        self._clients: set[asyncio.StreamWriter] = set()
         self._methods: dict[str, Callable[[_Params], Awaitable[Any]]] = {
             "devices": self._devices,
             "approve": self._approve,
@@ -66,18 +67,24 @@ class OwnerServer:
         if self._server is None:
             return
         self._server.close()
-        self._server.close_clients()
+        # uvloop's Server has no close_clients, so the clients are closed here.
+        for writer in self._clients:
+            writer.close()
         await self._server.wait_closed()
         self._server = None
         self.path.unlink(missing_ok=True)
 
     async def _client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
-        with contextlib.suppress(ConnectionError):
-            while line := await reader.readline():
-                response = await self._handle(line)
-                writer.write(json.dumps(response).encode() + b"\n")
-                await writer.drain()
-        writer.close()
+        self._clients.add(writer)
+        try:
+            with contextlib.suppress(ConnectionError):
+                while line := await reader.readline():
+                    response = await self._handle(line)
+                    writer.write(json.dumps(response).encode() + b"\n")
+                    await writer.drain()
+        finally:
+            self._clients.discard(writer)
+            writer.close()
 
     async def _handle(self, line: bytes) -> JsonObject:
         try:

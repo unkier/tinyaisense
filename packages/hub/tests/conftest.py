@@ -1,14 +1,32 @@
-from collections.abc import AsyncIterator, Awaitable, Iterator
+import asyncio
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Mapping
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Protocol
 
 import pytest
+import uvloop
 from tinyaisense_hub import Config, Hub, OwnerClient, Timing
 from tinyaisense_sim import Simulator
 from tinyaisense_sim.pytest_plugin import SimulatorFactory
 
-FAST_TIMING = Timing(hello_timeout_ms=300, ping_interval_ms=100, dead_after_ms=800)
+FAST_TIMING = Timing(
+    hello_timeout_ms=300,
+    ping_interval_ms=100,
+    dead_after_ms=800,
+    agent_ping_interval_ms=100,
+    agent_dead_after_ms=800,
+)
+
+
+def pytest_asyncio_loop_factories(
+    config: pytest.Config, item: pytest.Item
+) -> Mapping[str, Callable[[], asyncio.AbstractEventLoop]]:
+    """Hub tests run on uvloop, the hub's loop. test_web.py runs on asyncio's own too, since
+    it guards what the hub relies on in the loop's transports."""
+    if item.path.name == "test_web.py":
+        return {"asyncio": asyncio.new_event_loop, "uvloop": uvloop.new_event_loop}
+    return {"uvloop": uvloop.new_event_loop}
 
 
 class StartHub(Protocol):

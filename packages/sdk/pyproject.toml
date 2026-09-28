@@ -3,7 +3,10 @@ name = "tinyaisense"
 version = "0.1.0"
 description = "tinyaisense agent SDK: asyncio client, OpenAI Agents SDK adapter and MCP stdio shim"
 requires-python = ">=3.11"
-dependencies = ["tinyaisense-wire"]
+dependencies = [
+    "tinyaisense-wire",
+    "websockets>=17.1",
+]
 
 [tool.uv.sources]
 tinyaisense-wire = { workspace = true }

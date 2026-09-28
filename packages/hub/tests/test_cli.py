@@ -9,10 +9,13 @@ import stat
 import sys
 import tomllib
 from collections.abc import AsyncIterator
+from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
-from tinyaisense_hub.cli import main
+import tinyaisense
+import uvloop
+from tinyaisense_hub.cli import main, run_hub
 from tinyaisense_sim.pytest_plugin import SimulatorFactory
 
 
@@ -43,6 +46,8 @@ def test_init_writes_a_config_with_a_random_agent_token(
         "ping_interval_ms": 2000,
         "dead_after_ms": 6000,
         "clock_window_ms": 20000,
+        "agent_ping_interval_ms": 2000,
+        "agent_dead_after_ms": 6000,
     }
     assert len(config["agent_token"]) >= 32
     assert stat.S_IMODE(path.stat().st_mode) == 0o600
@@ -101,15 +106,24 @@ async def cli(env: dict[str, str], *args: str) -> str:
     return out.decode()
 
 
+@dataclass(frozen=True)
+class Served:
+    device: tuple[str, int]
+    agent_url: str
+    agent_token: str
+
+
 @pytest.fixture
-async def served(xdg: dict[str, str]) -> AsyncIterator[tuple[str, int]]:
-    """`tinyaisense-hub serve` in a child process. Yields its device address."""
+async def served(xdg: dict[str, str]) -> AsyncIterator[Served]:
+    """`tinyaisense-hub serve` in a child process, on free ports."""
     main(["init"])
-    with socket.socket() as probe:
-        probe.bind(("127.0.0.1", 0))
-        port = probe.getsockname()[1]
+    with socket.socket() as device_probe, socket.socket() as http_probe:
+        device_probe.bind(("127.0.0.1", 0))
+        http_probe.bind(("127.0.0.1", 0))
+        port, http = device_probe.getsockname()[1], http_probe.getsockname()[1]
     config = Path(xdg["XDG_CONFIG_HOME"]) / "tinyaisense" / "hub.toml"
-    config.write_text(config.read_text().replace("device = 8420", f"device = {port}"))
+    text = config.read_text().replace("device = 8420", f"device = {port}")
+    config.write_text(text.replace("http = 8421", f"http = {http}"))
     hub = await asyncio.create_subprocess_exec(
         sys.executable, "-m", "tinyaisense_hub", "serve", "--no-mdns", env=os.environ | xdg
     )
@@ -117,16 +131,17 @@ async def served(xdg: dict[str, str]) -> AsyncIterator[tuple[str, int]]:
     while not owner_socket.exists():
         assert hub.returncode is None
         await asyncio.sleep(0.02)
-    yield "127.0.0.1", port
+    token = tomllib.loads(text)["agent_token"]
+    yield Served(("127.0.0.1", port), f"ws://127.0.0.1:{http}/agent", token)
     if hub.returncode is None:
         hub.send_signal(signal.SIGTERM)
     assert await hub.wait() == 0
 
 
 async def test_serve_pairs_a_device_the_owner_approves_from_the_cli(
-    served: tuple[str, int], xdg: dict[str, str], simulator: SimulatorFactory
+    served: Served, xdg: dict[str, str], simulator: SimulatorFactory
 ) -> None:
-    device = await simulator(served).add("m5stack-atom-echo", "kitchen")
+    device = await simulator(served.device).add("m5stack-atom-echo", "kitchen")
     assert device.device_id in await cli(xdg, "devices")
 
     await cli(xdg, "approve", device.device_id[:6], "as", "kitchen")
@@ -140,6 +155,11 @@ async def test_serve_pairs_a_device_the_owner_approves_from_the_cli(
     while (row := (await cli(xdg, "devices")).splitlines()[1]).split()[2] != "offline":
         pass
     assert re.fullmatch(r"\d{4}-\d\d-\d\d", row.split()[3])  # then the local time
+
+
+async def test_serve_serves_the_agent_api(served: Served) -> None:
+    async with tinyaisense.connect(served.agent_url, served.agent_token) as agent:
+        assert await agent.devices() == []
 
 
 def test_serve_says_when_its_port_is_taken(
@@ -158,13 +178,24 @@ def test_serve_says_when_its_port_is_taken(
     assert "address already in use" in capsys.readouterr().err.lower()
 
 
+@pytest.mark.parametrize("key", ["dead_after_ms", "agent_dead_after_ms"])
 def test_serve_refuses_a_dead_timeout_within_the_ping_interval(
-    xdg: dict[str, str], capsys: pytest.CaptureFixture[str]
+    key: str, xdg: dict[str, str], capsys: pytest.CaptureFixture[str]
 ) -> None:
     main(["init"])
     config = Path(xdg["XDG_CONFIG_HOME"]) / "tinyaisense" / "hub.toml"
-    config.write_text(config.read_text().replace("dead_after_ms = 6000", "dead_after_ms = 2000"))
+    config.write_text(re.sub(rf"^{key} = 6000$", f"{key} = 2000", config.read_text(), flags=re.M))
 
     assert main(["serve"]) == 1
 
-    assert "dead_after_ms" in capsys.readouterr().err
+    assert f"timing.{key} must be more than" in capsys.readouterr().err
+
+
+def test_the_hub_runs_on_uvloop_with_a_1_ms_switch_interval() -> None:
+    async def probe() -> tuple[bool, float]:
+        return isinstance(asyncio.get_running_loop(), uvloop.Loop), sys.getswitchinterval()
+
+    before = sys.getswitchinterval()
+
+    assert run_hub(probe()) == (True, 0.001)
+    assert sys.getswitchinterval() == before

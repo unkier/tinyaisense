@@ -36,6 +36,10 @@ addopts = ["--import-mode=importlib"]
 strict = true
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
+filterwarnings = [
+    # uvloop's run_in_executor, under asyncio.to_thread.
+    "ignore:'asyncio.iscoroutinefunction' is deprecated:DeprecationWarning",
+]
 # A hung asyncio test fails instead of stalling CI.
 timeout = "60"
 

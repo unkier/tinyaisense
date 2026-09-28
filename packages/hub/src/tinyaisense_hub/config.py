@@ -22,13 +22,17 @@ class Timing:
     """Every hub timeout, in ms: the `[timing]` section."""
 
     hello_timeout_ms: int = 5000
-    """A device must send `hello` this soon after it connects."""
+    """A device or an agent link must send `hello` this soon after it connects."""
     ping_interval_ms: int = 2000
     """The hub pings each device this often, from its `hello` on."""
     dead_after_ms: int = 6000
     """A Connection with no inbound frame for this long is dead. More than the ping interval."""
     clock_window_ms: int = 20000
     """The device-clock offset comes from the shortest round trip among the pongs this recent."""
+    agent_ping_interval_ms: int = 2000
+    """The hub pings each agent link this often."""
+    agent_dead_after_ms: int = 6000
+    """An agent link with no inbound frame for this long is dead, and its Session ends."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -85,6 +89,10 @@ def parse_config(text: str) -> Config:
         table.check_unknown()
     if config.timing.dead_after_ms <= config.timing.ping_interval_ms:
         raise ConfigError("timing.dead_after_ms must be more than timing.ping_interval_ms")
+    if config.timing.agent_dead_after_ms <= config.timing.agent_ping_interval_ms:
+        raise ConfigError(
+            "timing.agent_dead_after_ms must be more than timing.agent_ping_interval_ms"
+        )
     return config
 
 

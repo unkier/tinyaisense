@@ -5,9 +5,11 @@ import asyncio
 import logging
 import signal
 import sys
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import Awaitable, Callable, Coroutine, Sequence
 from datetime import datetime
+from typing import Any
 
+import uvloop
 from tinyaisense_wire import MDNS_SERVICE
 
 from .config import (
@@ -115,8 +117,19 @@ def _serve(args: argparse.Namespace) -> int:
             await stop.wait()
             _log.info("shutting down")
 
-    asyncio.run(serve())
+    run_hub(serve())
     return 0
+
+
+def run_hub[T](main: Coroutine[Any, Any, T]) -> T:
+    """Run the hub's loop: uvloop, with a 1 ms GIL switch interval instead of 5 ms, so that
+    a thread holding the GIL delays the loop by 1 ms at most."""
+    previous = sys.getswitchinterval()
+    sys.setswitchinterval(0.001)
+    try:
+        return uvloop.run(main)
+    finally:
+        sys.setswitchinterval(previous)
 
 
 def _devices(args: argparse.Namespace) -> int:
