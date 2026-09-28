@@ -20,7 +20,7 @@ ECHO_MANIFEST = {
 
 
 def test_the_echo_profile_sends_the_exact_echo_manifest() -> None:
-    manifest = PROFILES["m5stack-atom-echo"]("023171d89ad0", "sim-x")
+    manifest = PROFILES["m5stack-atom-echo"].manifest("023171d89ad0", "sim-x")
 
     assert manifest.to_json() == ECHO_MANIFEST
     assert manifest == Manifest.from_json(ECHO_MANIFEST)

@@ -8,15 +8,19 @@ import secrets
 
 from tinyaisense_wire import JsonObject
 
+from .control import Control
 from .devices import Registry
 from .errors import HubError
 from .session import Holder, Session, Sessions, SessionSink, UtteranceOptIn
 
 
 class Core:
-    def __init__(self, registry: Registry, sessions: Sessions, agent_token: str) -> None:
+    def __init__(
+        self, registry: Registry, sessions: Sessions, control: Control, agent_token: str
+    ) -> None:
         self._registry = registry
         self._sessions = sessions
+        self._control = control
         self._agent_token = agent_token.encode()
 
     async def open_session(
@@ -43,3 +47,14 @@ class Core:
 
     def devices(self) -> list[JsonObject]:
         return self._registry.paired()
+
+    async def command(
+        self, session: Session, address: str, name: str, args: JsonObject
+    ) -> JsonObject:
+        """Send a Kind command to the capability at `address`. Raises `HubError`."""
+        device, capability = self._registry.resolve(address)
+        return await self._control.command(session, device, capability, name, args)
+
+    async def led_release(self, session: Session, device: str) -> None:
+        """Hand a device's LEDs back to its Status. Raises `HubError`."""
+        await self._control.led_release(session, self._registry.named(device))

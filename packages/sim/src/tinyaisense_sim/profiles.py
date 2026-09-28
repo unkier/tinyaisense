@@ -1,8 +1,17 @@
-"""Board profiles: the Manifest each simulated Board sends."""
+"""Board profiles: the Manifest each simulated Board sends, and how its hardware behaves."""
 
 from collections.abc import Callable
+from dataclasses import dataclass
 
 from tinyaisense_wire import PROTOCOL, Capability, JsonObject, Manifest
+
+
+@dataclass(frozen=True, slots=True)
+class Board:
+    manifest: Callable[[str, str], Manifest]
+    """A function of `(device_id, firmware)` that builds the Board's Manifest."""
+    led_brightness_cap: int
+    """What LED brightness 100 maps to, 0 to 255."""
 
 
 def _pcm16() -> JsonObject:
@@ -26,5 +35,8 @@ def atom_echo(device_id: str, firmware: str) -> Manifest:
     )
 
 
-PROFILES: dict[str, Callable[[str, str], Manifest]] = {"m5stack-atom-echo": atom_echo}
-"""Board → a function of `(device_id, firmware)` that builds its Manifest."""
+PROFILES: dict[str, Board] = {
+    # The firmware's Board file caps the Echo's LED the same way.
+    "m5stack-atom-echo": Board(atom_echo, led_brightness_cap=64),
+}
+"""Every simulated Board, by name."""

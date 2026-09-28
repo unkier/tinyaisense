@@ -22,7 +22,7 @@ class ConnectionSocket:
         return cast(socket.socket, self.writer.get_extra_info("socket"))
 
     def send(self, message: Message) -> None:
-        if not self.vanished:
+        if not self.vanished and not self.writer.is_closing():
             self.writer.write(encode_control(message))
 
     def reset(self) -> None:
@@ -51,6 +51,9 @@ class Faults:
         self._stall_reads = False
         self._reads_resumed = asyncio.Event()
         self._reads_resumed.set()
+        self.delay_replies_ms = 0
+        """The device holds each command's reply this long. It does the command at once."""
+        self._failures: list[str] = []
 
     @property
     def connection(self) -> ConnectionSocket | None:
@@ -99,6 +102,14 @@ class Faults:
             self._reads_resumed.set()
             if self._connection is not None:
                 self._connection.resume_reading()
+
+    def fail_next(self, code: str = "failed") -> None:
+        """Fail the next command with error `code`, without doing it. Each call fails one more."""
+        self._failures.append(code)
+
+    def next_failure(self) -> str | None:
+        """The error code to fail the command at hand with, if `fail_next` asked for one."""
+        return self._failures.pop(0) if self._failures else None
 
     async def readable(self, connection: ConnectionSocket) -> None:
         """Return once the device may take in what it read: never, if it vanished."""

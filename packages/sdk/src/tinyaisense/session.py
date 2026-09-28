@@ -100,6 +100,15 @@ class Session:
         """Every paired device: `{name, online, manifest}`."""
         return cast(list[JsonObject], (await self.call("devices"))["devices"])
 
+    async def command(self, address: str, name: str, args: JsonObject | None = None) -> JsonObject:
+        """Send a Kind command to the capability at `address`, e.g. `kitchen/led`, and return
+        its result. An `led` command claims the device's LED from its Status."""
+        return await self.call("command", address=address, name=name, args=args or {})
+
+    async def led_release(self, device: str) -> None:
+        """Hand `device`'s LED back to its Status."""
+        await self.call("led.release", device=device)
+
     async def notifications(self) -> AsyncIterator[Notification]:
         """The Session's notifications, in order, until it ends. `session.ended`, if the hub
         sends it, comes last. Only one consumer gets each notification."""

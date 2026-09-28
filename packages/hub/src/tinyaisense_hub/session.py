@@ -7,7 +7,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Literal, Protocol
 
-from tinyaisense_wire import JsonObject, Manifest
+from tinyaisense_wire import JsonObject
 
 from .errors import HubError
 
@@ -49,12 +49,27 @@ class Session:
     since: int = field(default_factory=lambda: _now_ms())
     """Epoch ms."""
 
+    def notify(self, method: str, params: JsonObject) -> None:
+        """Send a notification, stamped with `t`: now."""
+        self.sink.notify(method, params | {"t": _now_ms()})
+
+
+class DeviceControl(Protocol):
+    """The per-device controllers, told when a Session starts and ends."""
+
+    def session_started(self, session: Session) -> None: ...
+
+    async def session_ended(self, session: Session) -> None:
+        """Undo on the devices what the Session did there."""
+        ...
+
 
 class Sessions:
-    """The Session manager. It also turns device presence into notifications."""
+    """The Session manager."""
 
-    def __init__(self) -> None:
+    def __init__(self, control: DeviceControl) -> None:
         self.current: Session | None = None
+        self._control = control
         self._lock = asyncio.Lock()
         """Held while a Session starts or ends, so that a takeover ends the old one first."""
         self._shut_down = False
@@ -78,6 +93,7 @@ class Sessions:
                 await self._end(old, "taken_over")
             session = self.current = Session(holder, sink, utterances)
             _log.info("Session %s started (%s)", session.id, holder)
+            self._control.session_started(session)
             return session
 
     async def end(self, session: Session, reason: EndReason) -> None:
@@ -96,22 +112,10 @@ class Sessions:
     async def _end(self, session: Session, reason: EndReason) -> None:
         self.current = None
         _log.info("Session %s ended: %s", session.id, reason)
+        await self._control.session_ended(session)
         if reason != "closed":  # else its link is gone
-            session.sink.notify("session.ended", {"reason": reason, "t": _now_ms()})
+            session.notify("session.ended", {"reason": reason})
         session.sink.ended(reason)
-
-    def notify(self, method: str, params: JsonObject) -> None:
-        """Send a notification to the Session, if there is one, stamped with `t`: now."""
-        if self.current is not None:
-            self.current.sink.notify(method, params | {"t": _now_ms()})
-
-    # Device presence, from the registry.
-
-    def device_online(self, name: str, manifest: Manifest) -> None:
-        self.notify("device.online", {"device": name, "manifest": manifest.to_json()})
-
-    def device_offline(self, name: str) -> None:
-        self.notify("device.offline", {"device": name})
 
 
 def _now_ms() -> int:

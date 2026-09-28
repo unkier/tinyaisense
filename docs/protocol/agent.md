@@ -34,7 +34,7 @@ A failed request gets a JSON-RPC error. Branch on `data.code`, a string; `messag
 |---|---|
 | `unauthorized` | a bad agent token, or a request before `hello` |
 | `unsupported` | an unknown method, a command the capability doesn't have, or a feature the hub isn't configured for (e.g. `say` with no TTS engine) |
-| `invalid_args` | params that break the method's schema, an unknown param, invalid JSON, or an ambiguous bare Address (the message lists the candidates) |
+| `invalid_args` | params that break the method's schema, an unknown param, invalid JSON, or an ambiguous bare Address (the message and `data.candidates` list the candidates) |
 | `unknown_address` | no paired device or capability by that name |
 | `busy` | the hub is held by another Session, or the capability is in use and the request can't take it over |
 | `failed` | the device or the hub tried and failed |
@@ -110,7 +110,7 @@ Ending a Session runs in a fixed order: stop its speaker streams, end its listen
 | `led.release` | `device` | `{}` |
 | `cancel` | `id` | `{}` |
 
-An **Address** is `<device name>/<capability id>`, e.g. `kitchen/speaker`. A bare capability id (`speaker`) works when exactly one paired device has it; otherwise the request gets `invalid_args` listing the candidates. `device` params take a device name.
+An **Address** is `<device name>/<capability id>`, e.g. `kitchen/speaker`. A bare capability id (`speaker`) works when exactly one paired device has it, going by each device's last Manifest; if several have it, the request gets `invalid_args` with the candidate Addresses in `data.candidates`. An Address nothing has gets `unknown_address`. `device` params take a device name.
 
 ### `devices`
 
@@ -127,11 +127,13 @@ A capability's Kind fixes its commands, events and streams: see the Kind contrac
 ### `command`
 
 `command{address, name, args}` sends a Kind command to a capability and replies with its result.
-- `args` is checked against the Kind contract first: `invalid_args`.
-- Hub-only commands and unknown ones get `unsupported`.
+- `args` defaults to `{}`, and is checked against the Kind contract first: `invalid_args`.
+- Hub-only commands and unknown ones get `unsupported`, as does a capability of a Kind the hub doesn't know.
+- A device that is offline gets `disconnected`.
 - The device's own errors pass through: `unsupported`, `invalid_args`, `busy`, `failed`. The hub adds `timeout` and `disconnected`.
+- Commands to one device run one at a time, in the order they came in: each waits for the reply to the one before. Devices never wait for each other.
 
-**The LED claim.** The first agent `led` command on a device claims its LED: the device's Status display is suspended, except `listening` and `identify`. `led.release{device}` hands it back, as does the end of the Session. The hub re-applies the last agent LED command after the device reconnects.
+**The LED claim.** The first agent `led` command on a device claims its LED: the device's Status display is suspended, except `listening` and `identify`. `led.release{device}` hands it back, as does the end of the Session; the hub sends the device the hub-only [`release`](kinds/led.md#release-hub-only). Releasing an LED the agent hasn't claimed does nothing. After the device reconnects, the hub re-applies the claim before `device.online`: per capability, the last command without an `index`, then the latest `set` of each `index` since. Only commands the device carried out count.
 
 ### `reflex.set`
 

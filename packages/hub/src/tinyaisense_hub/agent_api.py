@@ -54,6 +54,22 @@ _HELLO: Schema = {
     },
 }
 _NO_PARAMS: Schema = {"type": "object", "additionalProperties": False}
+_COMMAND: Schema = {
+    "type": "object",
+    "required": ["address", "name"],
+    "additionalProperties": False,
+    "properties": {
+        "address": {"type": "string"},
+        "name": {"type": "string"},
+        "args": {"type": "object"},
+    },
+}
+_DEVICE: Schema = {
+    "type": "object",
+    "required": ["device"],
+    "additionalProperties": False,
+    "properties": {"device": {"type": "string"}},
+}
 
 _log = logging.getLogger("tinyaisense_hub.agent_api")
 
@@ -91,6 +107,8 @@ class AgentLink:
         self._requests: set[asyncio.Task[None]] = set()
         self._methods: dict[str, tuple[Schema, _Method]] = {
             "devices": (_NO_PARAMS, self._devices),
+            "command": (_COMMAND, self._command),
+            "led.release": (_DEVICE, self._led_release),
         }
 
     async def run(self) -> None:
@@ -232,6 +250,17 @@ class AgentLink:
 
     async def _devices(self, params: JsonObject) -> JsonObject:
         return {"devices": self._core.devices()}
+
+    async def _command(self, params: JsonObject) -> JsonObject:
+        assert self._session is not None
+        return await self._core.command(
+            self._session, params["address"], params["name"], params.get("args", {})
+        )
+
+    async def _led_release(self, params: JsonObject) -> JsonObject:
+        assert self._session is not None
+        await self._core.led_release(self._session, params["device"])
+        return {}
 
     # Writing.
 

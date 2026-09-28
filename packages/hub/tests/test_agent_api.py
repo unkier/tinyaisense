@@ -9,6 +9,7 @@ import pytest
 import tinyaisense
 import websockets
 from tinyaisense_hub import Hub, OwnerClient, Timing
+from tinyaisense_hub.control import Control
 from tinyaisense_hub.core import Core
 from tinyaisense_hub.devices import Registry
 from tinyaisense_hub.errors import HubError
@@ -93,11 +94,12 @@ class NullSink:
 
 async def test_no_session_starts_once_the_hub_is_shutting_down(tmp_path: Path) -> None:
     # The Session ends before the links close, so a hello can land in between.
-    sessions = Sessions()
+    control = Control()
+    sessions = Sessions(control)
     registry = Registry(
-        StateStore(tmp_path), udp_port=0, timing=Timing(), auto_approve=False, presence=sessions
+        StateStore(tmp_path), udp_port=0, timing=Timing(), auto_approve=False, presence=control
     )
-    core = Core(registry, sessions, TOKEN)
+    core = Core(registry, sessions, control, TOKEN)
 
     await core.shutdown()
 

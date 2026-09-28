@@ -68,6 +68,16 @@
       "result": {
         "type": "object"
       }
+    },
+    "release": {
+      "hub_only": true,
+      "timeout_ms": 1000,
+      "args": {
+        "type": "object"
+      },
+      "result": {
+        "type": "object"
+      }
     }
   }
 }

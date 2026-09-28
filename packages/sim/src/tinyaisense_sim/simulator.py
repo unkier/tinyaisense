@@ -17,23 +17,33 @@ from pathlib import Path
 from typing import Literal, cast
 
 from tinyaisense_wire import (
+    DEVICE_COMMANDS,
+    KINDS,
     MDNS_SERVICE,
+    Command,
     ControlDecoder,
     Error,
+    FailedReply,
     Hello,
+    JsonObject,
     Manifest,
     Message,
     Pending,
     Ping,
     Pong,
+    Reply,
+    SchemaError,
     Welcome,
     WireError,
+    validate,
 )
 
 from .backoff import Backoff
 from .discovery import Mdns, Resolve
 from .faults import ConnectionSocket, Faults
-from .profiles import PROFILES
+from .led import Light, SimLed
+from .profiles import PROFILES, Board
+from .status import Status, StatusLayers
 
 FIRMWARE = f"sim-{version('tinyaisense-sim')}"
 DEAD_AFTER_MS = 6000
@@ -93,10 +103,11 @@ class Simulator:
         """
         if board not in PROFILES:
             raise ValueError(f"unknown board {board!r}; known: {', '.join(PROFILES)}")
-        manifest = PROFILES[board](device_id_for(name), FIRMWARE)
+        profile = PROFILES[board]
         device = SimDevice(
             name,
-            manifest,
+            profile,
+            profile.manifest(device_id_for(name), FIRMWARE),
             self._resolve,
             self._udp_host,
             self._tokens,
@@ -123,6 +134,7 @@ class SimDevice:
     def __init__(
         self,
         instance: str,
+        board: Board,
         manifest: Manifest,
         resolve: Resolve,
         udp_host: str,
@@ -157,6 +169,14 @@ class SimDevice:
         """Whether the hub has answered any Connection yet."""
         self._vanished: list[ConnectionSocket] = []
         """Given up on, but left open: closing one would tell the hub."""
+        self._layers = StatusLayers(connecting=True)
+        self._leds = {
+            cap.id: SimLed(cap.params["count"], board.led_brightness_cap)
+            for cap in manifest.capabilities
+            if cap.kind == "led"
+        }
+        self._status_led = next(iter(self._leds.values()), None)
+        """The LED the Status shows on: the first one."""
 
     @property
     def device_id(self) -> str:
@@ -165,6 +185,16 @@ class SimDevice:
     @property
     def token(self) -> str | None:
         return self._tokens.get(self.device_id)
+
+    @property
+    def status(self) -> Status:
+        """The Status the device shows now."""
+        return self._layers.shown
+
+    def lights(self, cap: str = "led") -> tuple[Light, ...]:
+        """What each LED of the led capability `cap` shows now, the Status included."""
+        led = self._leds[cap]
+        return led.lights(self.status if led is self._status_led else None)
 
     async def wait_for(self, predicate: Callable[[], bool]) -> None:
         """Wait until `predicate()` holds. It is checked on every change of this device."""
@@ -200,6 +230,8 @@ class SimDevice:
 
     def _set_state(self, state: DeviceState) -> None:
         self.state = state
+        self._layers.connecting = state == "connecting"
+        self._layers.pending = state == "pending"
         self._changed_now()
 
     def _close_vanished(self) -> None:
@@ -218,6 +250,7 @@ class SimDevice:
                 _log.info("%s: connection failed: %s", self.instance, e)
             self.faults.connection = None
             self.conn_id = None
+            self._idle()
             self._set_state("connecting")
             retry = self._backoff.failed()
             await asyncio.sleep(retry.delay)
@@ -282,7 +315,15 @@ class SimDevice:
                 self.name = message.name
                 self.conn_id = message.conn_id
                 self._backoff.welcomed()
+                self._layers.hub = "no_agent"
                 self._set_state("online")
+            case Command() if self.state == "online":
+                reply = self._command(message)
+                if delay := self.faults.delay_replies_ms:
+                    asyncio.get_running_loop().call_later(delay / 1000, connection.send, reply)
+                else:
+                    connection.send(reply)
+                self._changed_now()
             case Error():
                 self.last_error = message.code
                 if message.code == "unauthorized":
@@ -292,9 +333,72 @@ class SimDevice:
             case _:
                 pass
 
+    def _idle(self) -> None:
+        """The Connection is over: every capability goes idle."""
+        for led in self._leds.values():
+            led.release()
+        self._layers.claimed = False
+
+    def _command(self, command: Command) -> Reply | FailedReply:
+        if (code := self.faults.next_failure()) is not None:
+            return FailedReply(command.id, code, "the fail_next fault")
+        try:
+            result = self._apply(command)
+        except SchemaError as e:
+            return FailedReply(command.id, "invalid_args", str(e))
+        except _Refused as e:
+            return FailedReply(command.id, e.code, e.message)
+        return Reply(command.id, result)
+
+    def _apply(self, command: Command) -> JsonObject:
+        """Raises `SchemaError` or `_Refused`."""
+        name, args = command.name, command.args
+        if command.cap is None:
+            contract = DEVICE_COMMANDS.get(name)
+            kind = "device"
+        else:
+            cap = next((c for c in self.manifest.capabilities if c.id == command.cap), None)
+            if cap is None:
+                raise _Refused("unsupported", f"no capability {command.cap!r}")
+            if cap.kind not in KINDS:
+                raise _Refused("unsupported", f"{cap.id!r} is of an unknown Kind, {cap.kind!r}")
+            contract = KINDS[cap.kind].commands.get(name)
+            kind = cap.kind
+        if contract is None:
+            raise _Refused("unsupported", f"{kind} has no command {name!r}")
+        validate(contract.args, args, "args")
+        match kind, name:
+            case "device", "status":
+                self._layers.hub = args["state"]
+            case "led", "set":
+                assert command.cap is not None
+                try:
+                    self._leds[command.cap].set(args)
+                except ValueError as e:
+                    raise _Refused("invalid_args", str(e)) from None
+            case "led", "off":
+                assert command.cap is not None
+                self._leds[command.cap].off()
+            case "led", "release":
+                assert command.cap is not None
+                self._leds[command.cap].release()
+            case _:
+                raise _Refused("unsupported", f"the Simulator doesn't do {kind} {name!r} yet")
+        self._layers.claimed = self._status_led is not None and self._status_led.claim is not None
+        return {}
+
     def _clock(self) -> int:
         """The device clock: µs since boot."""
         return (time.monotonic_ns() - self._boot_ns) // 1000
+
+
+class _Refused(Exception):
+    """The device refuses a command with an error `reply`."""
+
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(f"{code}: {message}")
+        self.code = code
+        self.message = message
 
 
 async def _static(address: tuple[str, int]) -> tuple[str, int]:

@@ -146,7 +146,7 @@ The Atom Echo Manifest:
 A Command is `cmd{id, cap, name, args}`. The device answers every one with exactly one `reply` of the same `id`.
 
 - `cap` is the capability id. It is omitted for device-level commands (`status`, `identify`, `diag`).
-- The hub assigns `id` per Connection, starting at 1 and incrementing.
+- The hub assigns `id` per Connection, starting at 1 and incrementing. After 2^32 − 1 it wraps to 1.
 - Commands may be pipelined. The hub matches replies by `id` only; replies may arrive out of order across capabilities.
 - `args` and `result` are objects whose shape the Kind contract defines. A command with nothing to say has `args: {}`, and a success with nothing to return has `result: {}`.
 - **Timeouts are enforced on the hub only.** The timeout runs from sending the `cmd` to receiving its `reply`: 1000 ms, or the command's `timeout_ms` in its contract. When it expires the command fails with `timeout`, and a late reply is dropped. A reply with an unknown `id` is ignored.

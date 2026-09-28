@@ -9,6 +9,7 @@ from tinyaisense_wire import MDNS_SERVICE
 
 from .agent_api import agent_app
 from .config import Config
+from .control import Control
 from .core import Core
 from .devices import Registry
 from .discovery import Advertiser
@@ -44,6 +45,7 @@ class Hub:
         self._udp: asyncio.DatagramTransport | None = None
         self._tcp: asyncio.Server | None = None
         self._registry: Registry | None = None
+        self._control: Control | None = None
         self._core: Core | None = None
         self._http: HttpServer | None = None
         self._owner: OwnerServer | None = None
@@ -98,15 +100,16 @@ class Hub:
         self._udp, _ = await loop.create_datagram_endpoint(
             asyncio.DatagramProtocol, local_addr=(self._host or "0.0.0.0", port)
         )
-        sessions = Sessions()
+        self._control = Control()
+        sessions = Sessions(self._control)
         self._registry = Registry(
             StateStore(self._state_dir),
             udp_port=self.udp_port,
             timing=self.config.timing,
             auto_approve=self._auto_approve,
-            presence=sessions,
+            presence=self._control,
         )
-        self._core = Core(self._registry, sessions, self.config.agent_token)
+        self._core = Core(self._registry, sessions, self._control, self.config.agent_token)
         self._tcp = await loop.create_server(self._registry.connection, self._host, port)
         self._http = HttpServer(
             agent_app(self._core, self.config.timing),
@@ -124,8 +127,9 @@ class Hub:
     async def close(self) -> None:
         advertiser, owner, tcp = self._advertiser, self._owner, self._tcp
         udp, registry, core, http = self._udp, self._registry, self._core, self._http
+        control = self._control
         self._advertiser = self._owner = self._tcp = self._udp = self._registry = None
-        self._core = self._http = None
+        self._control = self._core = self._http = None
         if advertiser is not None:
             await advertiser.close()
         if owner is not None:
@@ -142,5 +146,7 @@ class Hub:
         # The registry closes the Connections: uvloop's Server has no close_clients.
         if registry is not None:
             await registry.close()
+        if control is not None:
+            await control.close()
         if tcp is not None:
             await tcp.wait_closed()

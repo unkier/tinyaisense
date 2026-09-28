@@ -7,13 +7,18 @@ import re
 import secrets
 import socket
 import time
-from collections.abc import Coroutine
+from collections.abc import Callable, Coroutine
 from typing import Any, Literal, Protocol, cast
 
 from tinyaisense_wire import (
+    DEVICE_COMMANDS,
+    KINDS,
     PROTOCOL,
+    Capability,
+    Command,
     ControlDecoder,
     Error,
+    FailedReply,
     Hello,
     JsonObject,
     Manifest,
@@ -21,13 +26,15 @@ from tinyaisense_wire import (
     Pending,
     Ping,
     Pong,
+    Reply,
     Welcome,
     WireError,
     encode_control,
 )
 
+from .commands import Answered, CommandTimeouts, Replied, Sent, TimedOut
 from .config import Timing
-from .errors import HubError
+from .errors import HubError, HubErrorCode
 from .keepalive import ClockSync, Dead, Inbound, Keepalive, SendPing, Tick
 from .state import DeviceRecord, StateStore
 
@@ -38,13 +45,49 @@ _log = logging.getLogger("tinyaisense_hub.devices")
 
 ConnectionState = Literal["hello", "pending", "pairing", "online", "closed"]
 
+DEFAULT_TIMEOUT_MS = 1000
+"""For a command whose contract declares no timeout."""
+_DEVICE_ERRORS: set[HubErrorCode] = {"unsupported", "invalid_args", "busy", "failed"}
+"""The error codes a device may reply with. Anything else counts as `failed`."""
+_U32_MAX = 2**32 - 1
+
 
 class Presence(Protocol):
-    """Told when a paired device comes online or drops."""
+    """Told when a paired device's Connection is welcomed, and when it drops."""
 
-    def device_online(self, name: str, manifest: Manifest) -> None: ...
+    def device_online(self, conn: DeviceConnection) -> None: ...
 
-    def device_offline(self, name: str) -> None: ...
+    def device_offline(self, conn: DeviceConnection) -> None: ...
+
+
+class _Alarm:
+    """One loop timer, set for the earliest deadline asked of it.
+
+    Times are µs on the hub's monotonic clock. A deadline that moves later leaves the timer
+    early: it finds nothing due and asks for the next one.
+    """
+
+    def __init__(self, due: Callable[[int], None]) -> None:
+        self._due = due
+        self._timer: asyncio.TimerHandle | None = None
+        self._at = 0
+
+    def set(self, deadline: int | None, now: int) -> None:
+        if deadline is not None and (self._timer is None or deadline < self._at):
+            self.cancel()
+            self._at = deadline
+            self._timer = asyncio.get_running_loop().call_later(
+                max(0, deadline - now) / 1_000_000, self._fire
+            )
+
+    def cancel(self) -> None:
+        if self._timer is not None:
+            self._timer.cancel()
+            self._timer = None
+
+    def _fire(self) -> None:
+        self._timer = None
+        self._due(_now_us())
 
 
 class DeviceConnection(asyncio.Protocol):
@@ -66,8 +109,11 @@ class DeviceConnection(asyncio.Protocol):
         self._hello_timer: asyncio.TimerHandle | None = None
         self._keepalive: Keepalive | None = None
         """Set by `hello`."""
-        self._keepalive_timer: asyncio.TimerHandle | None = None
-        self._keepalive_timer_at = 0
+        self._keepalive_alarm = _Alarm(self._run_keepalive)
+        self._timeouts = CommandTimeouts()
+        self._timeouts_alarm = _Alarm(self._run_timeouts)
+        self._in_flight: dict[int, asyncio.Future[JsonObject]] = {}
+        self._next_command_id = 1
         self._peer = "?"
 
     def __str__(self) -> str:
@@ -87,6 +133,25 @@ class DeviceConnection(asyncio.Protocol):
     def send(self, message: Message) -> None:
         if self._transport is not None and self.state != "closed":
             self._transport.write(encode_control(message))
+
+    def command(self, cap: str | None, name: str, args: JsonObject) -> asyncio.Future[JsonObject]:
+        """Send a command to capability `cap`, or to the device itself if None, at once.
+
+        The future holds the reply's result, or fails with `HubError`: the device's own error,
+        `timeout`, or `disconnected`. The timeout is the command's own, from its contract.
+        """
+        future: asyncio.Future[JsonObject] = asyncio.get_running_loop().create_future()
+        if self.state != "online":
+            future.set_exception(HubError("disconnected", f"{self.name or self} is offline"))
+            return future
+        command_id = self._next_command_id
+        self._next_command_id = command_id % _U32_MAX + 1
+        self._in_flight[command_id] = future
+        self.send(Command(command_id, cap, name, args))
+        now = _now_us()
+        self._timeouts.handle(Sent(command_id, self._timeout_ms(cap, name) * 1000), now)
+        self._timeouts_alarm.set(self._timeouts.next_deadline(), now)
+        return future
 
     def close(self, reason: str) -> None:
         """Close the Connection. What was sent before goes out first."""
@@ -150,8 +215,40 @@ class DeviceConnection(asyncio.Protocol):
                 self.close("a second hello")
             case _ if self.state != "online":
                 self.close(f"{type(message).__name__} before welcome")
+            case Reply() | FailedReply():
+                self._reply(message, now)
             case _:
                 pass
+
+    def _reply(self, reply: Reply | FailedReply, now: int) -> None:
+        for action in self._timeouts.handle(Replied(reply.id), now):
+            future = self._in_flight.pop(action.id)
+            match action, reply:
+                case Answered(), Reply():
+                    _resolve(future, reply.result)
+                case Answered(), FailedReply():
+                    code = reply.code if reply.code in _DEVICE_ERRORS else "failed"
+                    _fail(future, HubError(code, reply.message))
+                case TimedOut(), _:
+                    self._timed_out(future)
+
+    def _run_timeouts(self, now: int) -> None:
+        for action in self._timeouts.handle(Tick(), now):
+            self._timed_out(self._in_flight.pop(action.id))
+        if self.state != "closed":
+            self._timeouts_alarm.set(self._timeouts.next_deadline(), now)
+
+    def _timed_out(self, future: asyncio.Future[JsonObject]) -> None:
+        _fail(future, HubError("timeout", f"{self.name} didn't reply in time"))
+
+    def _timeout_ms(self, cap: str | None, name: str) -> int:
+        if cap is None:
+            contract = DEVICE_COMMANDS.get(name)
+        else:
+            capability = next((c for c in self.manifest.capabilities if c.id == cap), None)
+            kind = KINDS.get(capability.kind) if capability is not None else None
+            contract = kind.commands.get(name) if kind is not None else None
+        return DEFAULT_TIMEOUT_MS if contract is None else contract.timeout_ms
 
     def _run_keepalive(self, now: int) -> None:
         """Do what the keepalive has due, and set the timer for its next deadline."""
@@ -162,21 +259,8 @@ class DeviceConnection(asyncio.Protocol):
                     self.send(Ping(t))
                 case Dead():
                     self.abort(f"dead: no frame for {self._timing.dead_after_ms} ms")
-        deadline = self._keepalive.next_deadline()
-        if self.state == "closed" or deadline is None:
-            return
-        # Inbound frames only push the deadline later, so a timer that fires early just
-        # finds nothing due and comes back here.
-        if self._keepalive_timer is None or deadline < self._keepalive_timer_at:
-            self._stop_timer(self._keepalive_timer)
-            self._keepalive_timer_at = deadline
-            self._keepalive_timer = asyncio.get_running_loop().call_later(
-                max(0, deadline - now) / 1_000_000, self._keepalive_due
-            )
-
-    def _keepalive_due(self) -> None:
-        self._keepalive_timer = None
-        self._run_keepalive(_now_us())
+        if self.state != "closed":
+            self._keepalive_alarm.set(self._keepalive.next_deadline(), now)
 
     def _teardown(self, reason: str) -> bool:
         """Release everything the Connection holds, once. Returns whether this call did."""
@@ -185,8 +269,12 @@ class DeviceConnection(asyncio.Protocol):
         _log.info("%s: Connection closed: %s", self, reason)
         self.state = "closed"
         self._stop_timer(self._hello_timer)
-        self._stop_timer(self._keepalive_timer)
-        self._hello_timer = self._keepalive_timer = None
+        self._hello_timer = None
+        self._keepalive_alarm.cancel()
+        self._timeouts_alarm.cancel()
+        in_flight, self._in_flight = self._in_flight, {}
+        for future in in_flight.values():
+            _fail(future, HubError("disconnected", f"{self.name} dropped: {reason}"))
         self._registry.detach(self)
         return True
 
@@ -311,6 +399,39 @@ class Registry:
             self._records.setdefault(device_id, record)
             raise
 
+    # Agent Addresses.
+
+    def named(self, name: str) -> DeviceRecord:
+        """The paired device of that name. Raises `HubError`: `unknown_address`."""
+        record = next((r for r in self._records.values() if r.name == name), None)
+        if record is None:
+            raise HubError("unknown_address", f"no paired device {name!r}")
+        return record
+
+    def resolve(self, address: str) -> tuple[DeviceRecord, Capability]:
+        """The capability at an Address: `<device>/<capability id>`, or a bare capability id
+        that only one paired device has. It goes by each device's last Manifest.
+
+        Raises `HubError`: `unknown_address`, or `invalid_args` for a bare id that several
+        devices have, with the candidates in `candidates`.
+        """
+        device, slash, cap_id = address.rpartition("/")
+        if slash:
+            records = [self.named(device)]
+        else:
+            records = sorted(self._records.values(), key=lambda r: r.name)
+        matches = [(r, c) for r in records for c in r.manifest.capabilities if c.id == cap_id]
+        if not matches:
+            raise HubError("unknown_address", f"no capability at {address!r}")
+        if len(matches) > 1:
+            candidates = [f"{r.name}/{c.id}" for r, c in matches]
+            raise HubError(
+                "invalid_args",
+                f"{address!r} is ambiguous: {', '.join(candidates)}",
+                candidates=candidates,
+            )
+        return matches[0]
+
     # The handshake, called by DeviceConnection.
 
     def hello(self, conn: DeviceConnection) -> None:
@@ -348,8 +469,7 @@ class Registry:
         if (record := self._records.get(device_id)) is not None:
             record.last_seen = conn.last_seen
             self._spawn(self._save())
-        # By its welcome name: a rename or forget has changed the record already.
-        self._presence.device_offline(conn.name)
+        self._presence.device_offline(conn)
 
     # Internals.
 
@@ -392,7 +512,7 @@ class Registry:
         record.last_seen = _now_ms()
         self._spawn(self._save())
         _log.info("%s: online as %s", conn, record.name)
-        self._presence.device_online(record.name, conn.manifest)
+        self._presence.device_online(conn)
 
     def _default_name(self, manifest: Manifest) -> str:
         """`<board-short>-<last 4 hex of the MAC>`, e.g. `echo-c3d4`, made unique."""
@@ -435,6 +555,16 @@ class Registry:
         self._tasks.discard(task)
         if not task.cancelled() and (e := task.exception()) is not None:
             _log.error("background task failed", exc_info=e)
+
+
+def _resolve(future: asyncio.Future[JsonObject], result: JsonObject) -> None:
+    if not future.done():  # its waiter may have gone
+        future.set_result(result)
+
+
+def _fail(future: asyncio.Future[JsonObject], error: HubError) -> None:
+    if not future.done():
+        future.set_exception(error)
 
 
 def _sha256(token: str) -> str:
