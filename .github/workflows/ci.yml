@@ -61,3 +61,29 @@ jobs:
       - run: >-
           .venv/bin/pytest packages/wire packages/sdk --cov-report=term-missing
           --cov=tinyaisense_wire --cov=tinyaisense
+
+  firmware:
+    name: firmware (native tests, pio check, esp32 build)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: firmware
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@v10.2.0
+      # The toolchains, ESP-IDF and its Python env are large and change only with platformio.ini.
+      - uses: actions/cache@v6
+        with:
+          path: ~/.platformio
+          key: platformio-${{ runner.os }}-${{ hashFiles('firmware/platformio.ini') }}
+      - run: uv tool install platformio==6.2.0
+      # The pure-C libraries under ASan and UBSan, with -Wall -Wextra -Werror.
+      - run: pio test -e native
+      # -Wall -Wextra -Werror on every tinyaisense component.
+      - run: pio run -e m5stack-atom-echo
+      # After the build: the esp32 check reads the generated IDF config.
+      - run: >-
+          pio check -e m5stack-atom-echo -e native
+          --fail-on-defect=low --fail-on-defect=medium --fail-on-defect=high

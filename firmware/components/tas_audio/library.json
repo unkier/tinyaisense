@@ -1,0 +1,8 @@
+{
+  "name": "tas_audio",
+  "version": "0.0.0",
+  "description": "tinyaisense pure-C audio core: DSP, ramps, the speaker jitter buffer and the DMA-patch planner. No IDF calls.",
+  "build": {
+    "flags": ["-std=c11", "-Wall", "-Wextra", "-Werror"]
+  }
+}

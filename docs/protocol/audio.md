@@ -68,9 +68,9 @@ Conditioning runs on the device, so the wire carries clean, speech-level PCM and
 **Jitter buffer (device), elastic.**
 - Playback starts once `prefill_ms` (default 40) is buffered.
 - A missing frame while later frames are buffered is **lost**: it's concealed as silence and playback moves on.
-- An empty buffer is an **underrun**: playback pauses without skipping and resumes when frames arrive.
+- An empty buffer is an **underrun**: playback pauses and resumes at the oldest frame held once frames arrive. Frames still missing then are skipped, since the pause stood in for them, and they count as lost.
 - After `drain`, playback never pauses; missing frames are concealed.
-- The buffer holds 200 ms per stream and drops the oldest frames on overflow.
+- The buffer spans 200 ms of the stream from the playhead. A frame beyond that drops the frames the buffer no longer spans, and playback jumps to the oldest frame still held. The frames it skips count as lost.
 - Every edge gets a 2 ms linear ramp: start, cut, concealment, underrun pause and resume. Concealment is silence, never a repeated frame.
 
 **Stats**, reported by `stop`, `drained` and `stopped`:
@@ -78,7 +78,7 @@ Conditioning runs on the device, so the wire carries clean, speech-level PCM and
 | Stat | Meaning |
 |---|---|
 | `played_ms` | the stream position reached. Lost frames count toward it; underrun pauses don't |
-| `lost` | frames concealed as silence |
+| `lost` | frames never played: concealed as silence, or skipped on overflow or resume |
 | `underruns` | how many times playback paused on an empty buffer |
 | `underrun_ms` | the total time spent paused |
 

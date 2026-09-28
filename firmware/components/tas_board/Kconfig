@@ -1,0 +1,13 @@
+menu "tinyaisense"
+
+    choice TAS_BOARD
+        prompt "Board"
+        default TAS_BOARD_M5STACK_ATOM_ECHO
+        help
+            The hardware this firmware is built for. Each Board gets its own binary.
+
+        config TAS_BOARD_M5STACK_ATOM_ECHO
+            bool "M5Stack Atom Echo"
+    endchoice
+
+endmenu
