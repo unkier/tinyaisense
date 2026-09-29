@@ -29,6 +29,7 @@ from tinyaisense_wire import (
 from .config import Timing
 from .core import Core
 from .errors import HubError, HubErrorCode
+from .resampler import RATES
 from .session import EndReason, Session, UtteranceOptIn
 
 _PARSE_ERROR = -32700
@@ -43,7 +44,7 @@ _GOING_AWAY = 1001
 _POLICY = 1008
 """WebSocket close codes."""
 
-_RATES = [16000, 24000, 48000]
+_RATES = list(RATES)
 _HELLO: Schema = {
     "type": "object",
     "required": ["token"],

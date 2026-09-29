@@ -4,6 +4,7 @@ version = "0.1.0"
 description = "tinyaisense hub and owner CLI"
 requires-python = ">=3.14"
 dependencies = [
+    "numpy>=2.3",
     "starlette>=1.7",
     "tinyaisense-wire",
     "uvicorn>=0.54.0,<0.55",

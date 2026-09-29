@@ -2,14 +2,20 @@
 
 import logging
 from collections.abc import Callable
+from typing import TYPE_CHECKING
 
 from tinyaisense_wire import KINDS, JsonObject, Schema, SchemaError, validate
 
 from .alarm import Alarm, now_us
 from .config import Timing
+from .devices import DeviceConnection
 from .keepalive import Tick
 from .pacer import Close, Drain, Feed, Open, Overflow, Pacer, Remove, Send
+from .resampler import Resampler
 from .streams import FORMAT, Stream
+
+if TYPE_CHECKING:
+    from .session import Session  # it holds its streams
 
 STATS = ("played_ms", "lost", "underruns", "underrun_ms")
 
@@ -22,6 +28,28 @@ class SpeakerStream(Stream):
     sent_bytes = 0
     first_sent: int | None = None
     """When the first frame went out, in µs on the hub's monotonic clock."""
+
+    def __init__(
+        self,
+        handle: int,
+        session: Session,
+        conn: DeviceConnection,
+        cap: str,
+        stream_id: int,
+        address: str,
+        rate: int,
+    ) -> None:
+        super().__init__(handle, session, conn, cap, stream_id, address)
+        self._resampler = None if rate == FORMAT.rate else Resampler(rate, FORMAT.rate)
+        """From the agent's rate to the device's; None if they're the same."""
+
+    def to_device(self, pcm: bytes) -> bytes:
+        """The agent's audio, at the device's rate."""
+        return pcm if self._resampler is None else self._resampler.process(pcm)
+
+    def tail(self) -> bytes:
+        """The last of the agent's audio, which the resampler still holds: none follows."""
+        return b"" if self._resampler is None else self._resampler.flush()
 
     def estimate(self, now: int) -> JsonObject:
         """The stats, when the device can't report them: `played_ms` is the audio sent,
@@ -61,13 +89,13 @@ class Speakers:
         self._run(Open(stream, FORMAT.frame_bytes))
 
     def feed(self, stream: SpeakerStream, pcm: bytes) -> bool:
-        """Take the agent's audio. Returns whether the stream overflowed its buffer: the
-        pacer has forgotten it, and it must be stopped."""
-        return self._run(Feed(stream, pcm))
+        """Take the agent's audio, at the stream's rate. Returns whether the stream overflowed
+        its buffer: the pacer has forgotten it, and it must be stopped."""
+        return self._run(Feed(stream, stream.to_device(pcm)))
 
     def drain(self, stream: SpeakerStream) -> None:
         """No more audio follows: once it's all sent, the device gets `drain`."""
-        self._run(Close(stream))
+        self._run(Close(stream, stream.tail()))
 
     def remove(self, stream: SpeakerStream) -> None:
         self._run(Remove(stream))

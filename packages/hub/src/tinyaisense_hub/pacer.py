@@ -29,9 +29,11 @@ class Feed[K]:
 
 @dataclass(frozen=True, slots=True)
 class Close[K]:
-    """No more audio follows: once the stream is sent, it drains."""
+    """No more audio follows but `tail`, which the cap doesn't count: once the stream is sent,
+    it drains."""
 
     key: K
+    tail: bytes = b""
 
 
 @dataclass(frozen=True, slots=True)
@@ -119,8 +121,9 @@ class Pacer[K: Hashable]:
                         actions.append(Overflow(key))
             case Remove(key):
                 self._streams.pop(key, None)
-            case Close(key):
-                if (stream := self._streams.get(key)) is not None:
+            case Close(key, tail):
+                if (stream := self._streams.get(key)) is not None and not stream.closed:
+                    stream.source += tail
                     stream.closed = True
                     actions += self._send_due(key, stream, now)
             case Tick():

@@ -12,7 +12,6 @@ from .control import Control
 from .devices import Registry
 from .errors import HubError
 from .session import Holder, Session, Sessions, SessionSink, UtteranceOptIn
-from .streams import FORMAT
 
 
 class Core:
@@ -66,9 +65,7 @@ class Core:
         """Open a stream to the speaker, or from the mic, at `address`. Returns its handle.
         Raises `HubError`."""
         device, capability = self._registry.resolve(address)
-        if rate is not None and rate != FORMAT.rate:
-            raise HubError("unsupported", f"the hub streams at {FORMAT.rate} Hz only, for now")
-        return await self._control.stream_start(session, device, capability, prefill_ms)
+        return await self._control.stream_start(session, device, capability, rate, prefill_ms)
 
     def stream_feed(self, session: Session, handle: int, pcm: bytes) -> None:
         """The agent's audio for a speaker stream. Dropped if it names no open one."""

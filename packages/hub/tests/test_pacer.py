@@ -117,6 +117,16 @@ def test_unsent_audio_over_the_cap_overflows_and_the_stream_is_forgotten() -> No
     assert core.next_deadline() is None
 
 
+def test_the_tail_a_close_brings_goes_out_even_past_the_cap() -> None:
+    core = pacer(cap_ms=1000)
+    core.handle(Feed("a", pcm(106)), 0)  # at the cap
+
+    assert core.handle(Close("a", pcm(0.5)), 0) == []
+    for at in range(10, 1010, 10):
+        core.handle(Tick(), at * MS)
+    assert core.handle(Tick(), 1010 * MS) == [Send("a", 106, pcm(0.5)), Drain("a", 106)]
+
+
 def test_a_removed_stream_sends_nothing_more() -> None:
     core = pacer()
     core.handle(Feed("a", pcm(100)), 0)

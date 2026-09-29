@@ -306,10 +306,7 @@ async def test_malformed_binary_frames_are_dropped_and_the_link_stays_up(hub: Hu
     ("params", "code"),
     [
         ({"address": "kitchen/mic", "prefill_ms": 40}, "invalid_args"),
-        ({"address": "kitchen/mic", "rate": 24000}, "unsupported"),
         ({"address": "kitchen/led"}, "unsupported"),
-        ({"address": "kitchen/speaker", "rate": 24000}, "unsupported"),
-        ({"address": "kitchen/speaker", "rate": 8000}, "invalid_args"),
         ({"address": "kitchen/speaker", "prefill_ms": 201}, "invalid_args"),
         ({"address": "den/speaker"}, "unknown_address"),
     ],

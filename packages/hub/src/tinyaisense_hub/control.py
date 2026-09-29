@@ -30,6 +30,8 @@ type _HubStatus = Literal["no_agent", "agent"]
 
 _PREFILL_MS = 40
 """A speaker stream's default `prefill_ms`."""
+_RATE = 16000
+"""A stream's default rate, for the agent."""
 
 _log = logging.getLogger("tinyaisense_hub.control")
 
@@ -256,11 +258,12 @@ class Control:
         session: Session,
         device: DeviceRecord,
         capability: Capability,
+        rate: int | None,
         prefill_ms: int | None,
     ) -> int:
-        """Open a stream for the agent: to a speaker, or from a mic. A stream already open on
-        the capability, or on its peers in an `exclusive` group, ends `preempted`. Returns the
-        handle. Raises `HubError`."""
+        """Open a stream for the agent, at `rate` on its side: to a speaker, or from a mic. A
+        stream already open on the capability, or on its peers in an `exclusive` group, ends
+        `preempted`. Returns the handle. Raises `HubError`."""
         address = f"{device.name}/{capability.id}"
         if capability.kind not in ("speaker", "mic"):
             raise HubError("unsupported", f"{address} takes no stream")
@@ -268,6 +271,7 @@ class Control:
             raise HubError("unsupported", f"{address} has no 16 kHz mono PCM in 10 ms frames")
         if capability.kind == "mic" and prefill_ms is not None:
             raise HubError("invalid_args", "prefill_ms is for speaker streams")
+        rate = _RATE if rate is None else rate
         controller = self._controller(device)
 
         async def op() -> int:
@@ -279,11 +283,13 @@ class Control:
             stream: Stream
             if capability.kind == "speaker":
                 args["prefill_ms"] = _PREFILL_MS if prefill_ms is None else prefill_ms
-                stream = SpeakerStream(handle, session, conn, capability.id, stream_id, address)
+                stream = SpeakerStream(
+                    handle, session, conn, capability.id, stream_id, address, rate
+                )
             else:
                 tail = self._timing.mic_tail_ms * 1000
                 stream = MicStream(
-                    handle, session, conn, capability.id, stream_id, address, tail=tail
+                    handle, session, conn, capability.id, stream_id, address, rate, tail=tail
                 )
                 conn.receivers[stream_id] = stream  # its first frames may beat the reply
             preempted = [
@@ -311,9 +317,7 @@ class Control:
                 raise started
             controller.streams[capability.id] = stream
             session.streams[handle] = stream
-            session.notify(
-                "stream.started", {"handle": handle, "address": address, "rate": FORMAT.rate}
-            )
+            session.notify("stream.started", {"handle": handle, "address": address, "rate": rate})
             if isinstance(stream, SpeakerStream):
                 self._speakers.open(stream)
             else:

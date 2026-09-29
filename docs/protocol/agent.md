@@ -186,6 +186,7 @@ The cancelled request still gets its reply. Cancelling a request that has finish
 
 A **stream** carries raw audio between the agent and a capability. `stream.start{address, rate}` opens one on a mic (device → agent) or a speaker (agent → device):
 - `rate` is 16000 (the default), 24000 or 48000. The hub resamples both ways, so e.g. OpenAI Realtime's 24 kHz passes straight through.
+  - Resampled audio runs 1 ms late. Each mic frame still holds 10 ms, from 1 ms before its place on the timeline, so a mic stream's last 1 ms never arrives. A drained speaker stream plays 1 ms longer than what was sent. At 16000, nothing is resampled.
 - `prefill_ms` (speaker only, `invalid_args` on a mic; default 40, at most 200) is how much audio the device buffers before it starts playing.
 - It replies `{handle}` once the device has started. A u16 **handle** names the stream within the Session; the hub also announces every stream, including those it opens itself, with `stream.started`.
 

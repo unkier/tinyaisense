@@ -10,6 +10,7 @@ from .alarm import Alarm, now_us
 from .assembler import Deliver, Finished, Frame, Last, MicAssembler
 from .devices import DeviceConnection
 from .keepalive import Tick
+from .resampler import Resampler
 from .streams import FORMAT, Stream
 
 if TYPE_CHECKING:
@@ -21,9 +22,10 @@ _log = logging.getLogger("tinyaisense_hub.mic")
 
 
 class MicStream(Stream):
-    """One raw agent mic stream. Its frames reach the agent as a timeline, from `started` on:
-    frames that beat the `start` reply wait for it. After the `stop` reply's `last_seq`, the
-    stream is `finished` once its tail is in, or once it has waited `tail` µs for it."""
+    """One raw agent mic stream. Its frames reach the agent as a timeline at its rate, from
+    `started` on: frames that beat the `start` reply wait for it. After the `stop` reply's
+    `last_seq`, the stream is `finished` once its tail is in, or once it has waited `tail` µs
+    for it."""
 
     def __init__(
         self,
@@ -33,6 +35,7 @@ class MicStream(Stream):
         cap: str,
         stream_id: int,
         address: str,
+        rate: int,
         *,
         tail: int,
     ) -> None:
@@ -41,6 +44,9 @@ class MicStream(Stream):
         """Frames the device dropped from its queue, from its `stop` reply."""
         self.finished: asyncio.Future[None] = asyncio.get_running_loop().create_future()
         self._assembler = MicAssembler(FORMAT, tail=tail)
+        self._resampler = None if rate == FORMAT.rate else Resampler(FORMAT.rate, rate)
+        """From the device's rate to the agent's; None if they're the same. Each frame comes
+        out as one frame, and the last 1 ms of the stream stays in it."""
         self._alarm = Alarm(self._tick)
         self._waiting: list[Deliver] | None = []
         """What the timeline holds before the `start` reply; None after it."""
@@ -104,7 +110,9 @@ class MicStream(Stream):
             return
         for action in self._assembler.handle(input, now):
             match action:
-                case Deliver():
+                case Deliver(index, pcm):
+                    if self._resampler is not None:
+                        action = Deliver(index, self._resampler.process(pcm))
                     if self._waiting is not None:
                         self._waiting.append(action)
                     else:
