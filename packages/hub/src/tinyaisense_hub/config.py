@@ -33,6 +33,9 @@ class Timing:
     """The hub pings each agent link this often."""
     agent_dead_after_ms: int = 6000
     """An agent link with no inbound frame for this long is dead, and its Session ends."""
+    speaker_buffer_ms: int = 300_000
+    """How far ahead of playback an agent may send speaker audio. Past it, the stream ends
+    with `overflow`."""
 
 
 @dataclass(frozen=True, slots=True)

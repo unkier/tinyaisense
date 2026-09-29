@@ -9,7 +9,7 @@ from pathlib import Path
 
 from tinyaisense_wire import MDNS_SERVICE
 
-from .simulator import DEAD_AFTER_MS, Simulator
+from .simulator import DEAD_AFTER_MS, OUTPUT_LATENCY_MS, Simulator
 
 
 class SimulatorFactory:
@@ -26,9 +26,15 @@ class SimulatorFactory:
         seed: int = 0,
         dead_after_ms: int = DEAD_AFTER_MS,
         mdns_service: str = MDNS_SERVICE,
+        output_latency_ms: int = OUTPUT_LATENCY_MS,
     ) -> Simulator:
         sim = Simulator(
-            hub, state_dir, seed=seed, dead_after_ms=dead_after_ms, mdns_service=mdns_service
+            hub,
+            state_dir,
+            seed=seed,
+            dead_after_ms=dead_after_ms,
+            mdns_service=mdns_service,
+            output_latency_ms=output_latency_ms,
         )
         self._sims.append(sim)
         return sim

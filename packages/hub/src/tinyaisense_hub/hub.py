@@ -100,14 +100,14 @@ class Hub:
         self._udp, _ = await loop.create_datagram_endpoint(
             asyncio.DatagramProtocol, local_addr=(self._host or "0.0.0.0", port)
         )
-        self._control = Control()
+        self._control = Control(self.config.timing)
         sessions = Sessions(self._control)
         self._registry = Registry(
             StateStore(self._state_dir),
-            udp_port=self.udp_port,
+            udp=self._udp,
             timing=self.config.timing,
             auto_approve=self._auto_approve,
-            presence=self._control,
+            observer=self._control,
         )
         self._core = Core(self._registry, sessions, self._control, self.config.agent_token)
         self._tcp = await loop.create_server(self._registry.connection, self._host, port)

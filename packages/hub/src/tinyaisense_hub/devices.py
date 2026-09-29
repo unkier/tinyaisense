@@ -7,7 +7,7 @@ import re
 import secrets
 import socket
 import time
-from collections.abc import Callable, Coroutine
+from collections.abc import Coroutine
 from typing import Any, Literal, Protocol, cast
 
 from tinyaisense_wire import (
@@ -19,6 +19,7 @@ from tinyaisense_wire import (
     CommandContract,
     ControlDecoder,
     Error,
+    Event,
     FailedReply,
     Hello,
     JsonObject,
@@ -29,12 +30,15 @@ from tinyaisense_wire import (
     Pong,
     Reply,
     SchemaError,
+    StreamFrame,
     Welcome,
     WireError,
     encode_control,
+    encode_datagram,
     validate,
 )
 
+from .alarm import Alarm, now_us
 from .commands import Answered, CommandTimeouts, Replied, Sent, TimedOut
 from .config import Timing
 from .errors import HubError, HubErrorCode
@@ -58,48 +62,46 @@ type CommandSpec = tuple[str | None, str, JsonObject]
 """A command to send: `(cap, name, args)`, with `cap` None for a device-level one."""
 
 
-class Presence(Protocol):
-    """Told when a paired device's Connection is welcomed, and when it drops."""
+class DeviceObserver(Protocol):
+    """Told when a paired device's Connection is welcomed, when it sends an Event, and when it
+    drops."""
 
     def device_online(self, conn: DeviceConnection, record: DeviceRecord) -> None: ...
+
+    def device_event(self, conn: DeviceConnection, event: Event) -> None: ...
 
     def device_offline(self, conn: DeviceConnection) -> None: ...
 
 
-class _Alarm:
-    """One loop timer, set for the earliest deadline asked of it.
+class StreamIds:
+    """A Connection's hub-range stream ids, 1-127: docs/protocol/audio.md#stream-ids."""
 
-    Times are µs on the hub's monotonic clock. A deadline that moves later leaves the timer
-    early: it finds nothing due and asks for the next one.
-    """
+    FIRST = 1
+    LAST = 127
 
-    def __init__(self, due: Callable[[int], None]) -> None:
-        self._due = due
-        self._timer: asyncio.TimerHandle | None = None
-        self._at = 0
+    def __init__(self) -> None:
+        self._last = self.LAST
+        self._open: set[int] = set()
 
-    def set(self, deadline: int | None, now: int) -> None:
-        if deadline is not None and (self._timer is None or deadline < self._at):
-            self.cancel()
-            self._at = deadline
-            self._timer = asyncio.get_running_loop().call_later(
-                max(0, deadline - now) / 1_000_000, self._fire
-            )
+    def open(self) -> int:
+        """The next id after the last one used, round-robin, skipping open ones. Raises
+        `HubError`: `busy` if every id is open."""
+        for step in range(1, self.LAST - self.FIRST + 2):
+            stream = (self._last - self.FIRST + step) % (self.LAST - self.FIRST + 1) + self.FIRST
+            if stream not in self._open:
+                self._last = stream
+                self._open.add(stream)
+                return stream
+        raise HubError("busy", "every stream id is open")
 
-    def cancel(self) -> None:
-        if self._timer is not None:
-            self._timer.cancel()
-            self._timer = None
-
-    def _fire(self) -> None:
-        self._timer = None
-        self._due(_now_us())
+    def close(self, stream: int) -> None:
+        self._open.discard(stream)
 
 
 class DeviceConnection(asyncio.Protocol):
     """One device's Connection, from TCP accept to drop. Every handler is synchronous."""
 
-    def __init__(self, registry: Registry, timing: Timing) -> None:
+    def __init__(self, registry: Registry, timing: Timing, udp: asyncio.DatagramTransport) -> None:
         self.state: ConnectionState = "hello"
         self.hello: Hello | None = None
         self.conn_id = 0
@@ -108,19 +110,23 @@ class DeviceConnection(asyncio.Protocol):
         """The device name `welcome` gave it."""
         self.clock = ClockSync(window=timing.clock_window_ms * 1000)
         """The device clock, from its pongs."""
+        self.stream_ids = StreamIds()
         self._registry = registry
+        self._udp = udp
         self._timing = timing
         self._decoder = ControlDecoder()
         self._transport: asyncio.Transport | None = None
         self._hello_timer: asyncio.TimerHandle | None = None
         self._keepalive: Keepalive | None = None
         """Set by `hello`."""
-        self._keepalive_alarm = _Alarm(self._run_keepalive)
+        self._keepalive_alarm = Alarm(self._run_keepalive)
         self._timeouts = CommandTimeouts()
-        self._timeouts_alarm = _Alarm(self._run_timeouts)
+        self._timeouts_alarm = Alarm(self._run_timeouts)
         self._in_flight: dict[int, asyncio.Future[JsonObject]] = {}
         self._next_command_id = 1
         self._peer = "?"
+        self._peer_ip: str | None = None
+        """Where its datagrams go: None if the hub's UDP socket can't reach it."""
 
     def __str__(self) -> str:
         return self._peer if self.hello is None else self.manifest.device_id
@@ -134,11 +140,22 @@ class DeviceConnection(asyncio.Protocol):
     def last_seen(self) -> int:
         """Epoch ms of the last inbound frame, from the `hello` on."""
         assert self._keepalive is not None
-        return _now_ms() - (_now_us() - self._keepalive.last_inbound) // 1000
+        return _now_ms() - (now_us() - self._keepalive.last_inbound) // 1000
 
     def send(self, message: Message) -> None:
         if self._transport is not None and self.state != "closed":
             self._transport.write(encode_control(message))
+
+    def send_frame(self, stream: int, seq: int, payload: bytes) -> None:
+        """Send one stream frame over UDP, to the TCP peer IP at the device's UDP port."""
+        if self.state != "online" or self._peer_ip is None:
+            return
+        assert self.hello is not None
+        datagram = encode_datagram(StreamFrame(self.conn_id, stream, seq, 0, payload))
+        try:
+            self._udp.sendto(datagram, (self._peer_ip, self.hello.udp_port))
+        except OSError as e:
+            _log.debug("%s: UDP send failed: %s", self.name, e)
 
     def command(self, cap: str | None, name: str, args: JsonObject) -> asyncio.Future[JsonObject]:
         """Send a command to capability `cap`, or to the device itself if None, at once.
@@ -154,7 +171,7 @@ class DeviceConnection(asyncio.Protocol):
         self._next_command_id = command_id % _U32_MAX + 1
         self._in_flight[command_id] = future
         self.send(Command(command_id, cap, name, args))
-        now = _now_us()
+        now = now_us()
         self._timeouts.handle(Sent(command_id, self._timeout_ms(cap, name) * 1000), now)
         self._timeouts_alarm.set(self._timeouts.next_deadline(), now)
         return future
@@ -182,7 +199,15 @@ class DeviceConnection(asyncio.Protocol):
 
     def connection_made(self, transport: asyncio.BaseTransport) -> None:
         self._transport = cast(asyncio.Transport, transport)
-        self._peer = str(transport.get_extra_info("peername"))
+        # None if the socket was gone by the time asyncio asked for it.
+        peer = cast(tuple[str, int] | None, transport.get_extra_info("peername"))
+        self._peer = str(peer)
+        if peer is not None:
+            udp = cast(socket.socket, self._udp.get_extra_info("socket"))
+            if udp.family == socket.AF_INET and ":" in peer[0]:
+                _log.warning("%s: an IPv6 peer, but the hub's UDP is IPv4: no audio", self)
+            else:
+                self._peer_ip = peer[0]
         sock = cast(socket.socket, transport.get_extra_info("socket"))
         sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         self._hello_timer = asyncio.get_running_loop().call_later(
@@ -190,7 +215,7 @@ class DeviceConnection(asyncio.Protocol):
         )
 
     def data_received(self, data: bytes) -> None:
-        now = _now_us()
+        now = now_us()
         try:
             for message in self._decoder.feed(data):
                 if self.state == "closed":
@@ -234,6 +259,8 @@ class DeviceConnection(asyncio.Protocol):
                 self.close(f"{type(message).__name__} before welcome")
             case Reply() | FailedReply():
                 self._reply(message, now)
+            case Event():
+                self._registry.event(self, message)
             case _:
                 pass
 
@@ -314,10 +341,10 @@ class Registry:
         self,
         store: StateStore,
         *,
-        udp_port: int,
+        udp: asyncio.DatagramTransport,
         timing: Timing,
         auto_approve: bool,
-        presence: Presence,
+        observer: DeviceObserver,
     ) -> None:
         self._store = store
         self._records = store.load()
@@ -325,15 +352,16 @@ class Registry:
         """device_id → its pending or online Connection."""
         self._connections: set[DeviceConnection] = set()
         """Every open Connection, from accept on."""
-        self._udp_port = udp_port
+        self._udp = udp
+        self._udp_port = cast(tuple[str, int], udp.get_extra_info("sockname"))[1]
         self._timing = timing
         self._auto_approve = auto_approve
-        self._presence = presence
+        self._observer = observer
         self._tasks: set[asyncio.Task[Any]] = set()
 
     def connection(self) -> DeviceConnection:
         """The protocol factory for the device TCP server."""
-        conn = DeviceConnection(self, self._timing)
+        conn = DeviceConnection(self, self._timing, self._udp)
         self._connections.add(conn)
         return conn
 
@@ -519,6 +547,9 @@ class Registry:
             conn.send(Pending())
             _log.info("%s: pending, board %s", conn, conn.manifest.board)
 
+    def event(self, conn: DeviceConnection, event: Event) -> None:
+        self._observer.device_event(conn, event)
+
     def detach(self, conn: DeviceConnection) -> None:
         self._connections.discard(conn)
         if conn.hello is None:
@@ -531,7 +562,7 @@ class Registry:
         if (record := self._records.get(device_id)) is not None:
             record.last_seen = conn.last_seen
             self._spawn(self._save())
-        self._presence.device_offline(conn)
+        self._observer.device_offline(conn)
 
     # Internals.
 
@@ -575,7 +606,7 @@ class Registry:
         record.last_seen = _now_ms()
         self._spawn(self._save())
         _log.info("%s: online as %s", conn, record.name)
-        self._presence.device_online(conn, record)
+        self._observer.device_online(conn, record)
 
     def _default_name(self, manifest: Manifest) -> str:
         """`<board-short>-<last 4 hex of the MAC>`, e.g. `echo-c3d4`, made unique."""
@@ -667,8 +698,3 @@ def _sha256(token: str) -> str:
 
 def _now_ms() -> int:
     return time.time_ns() // 1_000_000
-
-
-def _now_us() -> int:
-    """The hub's monotonic clock, as `ping.t` carries it."""
-    return time.monotonic_ns() // 1000

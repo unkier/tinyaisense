@@ -9,20 +9,27 @@ from pathlib import Path
 
 import pytest
 from tinyaisense_wire import (
+    AgentAudio,
     AudioFormat,
     ControlDecoder,
     EventMirror,
+    HubAudio,
     Message,
     StreamFrame,
     WireError,
     WireErrorCode,
+    decode_agent_audio,
     decode_datagram,
+    decode_hub_audio,
+    encode_agent_audio,
     encode_control,
     encode_datagram,
+    encode_hub_audio,
 )
 
 VECTOR_DIR = Path(__file__).resolve().parents[3] / "docs" / "protocol" / "vectors"
 VECTOR_FILE = VECTOR_DIR / "device.vectors"
+AGENT_VECTOR_FILE = VECTOR_DIR / "agent.vectors"
 
 
 @dataclass
@@ -68,11 +75,12 @@ def load_vectors(path: Path) -> list[GoldenVector]:
 
 
 VECTORS = load_vectors(VECTOR_FILE)
+AGENT_VECTORS = load_vectors(AGENT_VECTOR_FILE)
 
 
-POSITIVE = [v for v in VECTORS if v.expect == "ok"]
+POSITIVE = [v for v in VECTORS + AGENT_VECTORS if v.expect == "ok"]
 IGNORED = [v for v in VECTORS if v.expect == "ignore"]
-NEGATIVE = [v for v in VECTORS if v.expect not in ("ok", "ignore")]
+NEGATIVE = [v for v in VECTORS + AGENT_VECTORS if v.expect not in ("ok", "ignore")]
 
 
 def ids(v: GoldenVector) -> str:
@@ -97,16 +105,34 @@ def decode_udp(v: GoldenVector) -> StreamFrame | EventMirror | None:
     return datagram
 
 
-def decode(v: GoldenVector) -> list[Message] | StreamFrame | EventMirror | None:
-    return decode_tcp(v.data) if v.layer == "tcp" else decode_udp(v)
+def decode(
+    v: GoldenVector,
+) -> list[Message] | StreamFrame | EventMirror | AgentAudio | HubAudio | None:
+    match v.layer:
+        case "tcp":
+            return decode_tcp(v.data)
+        case "udp":
+            return decode_udp(v)
+        case "agent_to_hub":
+            return decode_agent_audio(v.data)
+        case "hub_to_agent":
+            return decode_hub_audio(v.data)
+        case _:
+            raise AssertionError(f"unknown layer {v.layer!r}")
 
 
 def reencode(v: GoldenVector) -> bytes:
-    decoded = decode(v)
-    if isinstance(decoded, list):
-        return b"".join(encode_control(message) for message in decoded)
-    assert decoded is not None
-    return encode_datagram(decoded)
+    match decode(v):
+        case list() as messages:
+            return b"".join(encode_control(message) for message in messages)
+        case AgentAudio() as audio:
+            return encode_agent_audio(audio)
+        case HubAudio() as audio:
+            return encode_hub_audio(audio)
+        case None:
+            raise AssertionError("nothing decoded")
+        case datagram:
+            return encode_datagram(datagram)
 
 
 @pytest.mark.parametrize("vector", POSITIVE, ids=ids)
@@ -137,10 +163,14 @@ def test_tcp_decoding_does_not_depend_on_how_the_stream_is_split(vector: GoldenV
     assert decode_tcp(vector.data, chunk=1) == decode_tcp(vector.data)
 
 
-def test_every_decode_error_code_has_a_negative_vector() -> None:
-    assert {v.expect for v in NEGATIVE} == set(typing.get_args(WireErrorCode))
+def test_every_decode_error_code_has_a_negative_device_vector() -> None:
+    device_codes = {v.expect for v in NEGATIVE if v.layer in ("tcp", "udp")}
+    assert device_codes == set(typing.get_args(WireErrorCode))
 
 
 def test_committed_vectors_match_the_generator() -> None:
     generator = runpy.run_path(str(VECTOR_DIR / "generate.py"))
     assert generator["render"](generator["VECTORS"]) == VECTOR_FILE.read_text(encoding="ascii")
+    assert generator["render"](
+        generator["AGENT_VECTORS"], generator["AGENT_HEADER"]
+    ) == AGENT_VECTOR_FILE.read_text(encoding="ascii")

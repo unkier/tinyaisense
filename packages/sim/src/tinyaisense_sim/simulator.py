@@ -5,12 +5,14 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import hashlib
+import ipaddress
 import json
 import logging
 import os
 import random
 import socket
 import time
+from collections import Counter, deque
 from collections.abc import Callable
 from importlib.metadata import version
 from pathlib import Path
@@ -20,9 +22,12 @@ from tinyaisense_wire import (
     DEVICE_COMMANDS,
     KINDS,
     MDNS_SERVICE,
+    AudioFormat,
+    Capability,
     Command,
     ControlDecoder,
     Error,
+    Event,
     FailedReply,
     Hello,
     JsonObject,
@@ -33,8 +38,10 @@ from tinyaisense_wire import (
     Pong,
     Reply,
     SchemaError,
+    StreamFrame,
     Welcome,
     WireError,
+    decode_datagram,
     validate,
 )
 
@@ -49,6 +56,10 @@ from .status import Status, StatusLayers
 FIRMWARE = f"sim-{version('tinyaisense-sim')}"
 DEAD_AFTER_MS = 6000
 """A Connection with no inbound frame for this long is dead."""
+OUTPUT_LATENCY_MS = 30
+"""How long audio takes from the jitter buffer to the ear: the DMA."""
+_CLOSED_STREAMS = 16
+"""The closed stream ids a Connection remembers, to drop their late frames silently."""
 
 DeviceState = Literal["connecting", "pending", "online", "closed"]
 
@@ -71,12 +82,15 @@ class Simulator:
         seed: int = 0,
         dead_after_ms: int = DEAD_AFTER_MS,
         mdns_service: str = MDNS_SERVICE,
+        output_latency_ms: int = OUTPUT_LATENCY_MS,
     ) -> None:
         """`hub` is the hub's device address, `host:port`.
 
         Without one, devices find the hub over mDNS as `mdns_service`, as firmware does.
         Tokens live in `state_dir` if given, and only in memory otherwise. A device drops a
-        Connection that brings no frame for `dead_after_ms`.
+        Connection that brings no frame for `dead_after_ms`. A speaker's audio is heard
+        `output_latency_ms` after it leaves the jitter buffer. `seed` drives every random
+        choice, the UDP faults included.
         """
         self._mdns: Mdns | None = None
         if hub is None:
@@ -90,6 +104,7 @@ class Simulator:
         self._tokens = _Tokens(state_dir)
         self._seed = seed
         self._dead_after = dead_after_ms / 1000
+        self._output_latency_ms = output_latency_ms
         self._devices: list[SimDevice] = []
 
     @property
@@ -112,9 +127,11 @@ class Simulator:
             self._resolve,
             self._udp_host,
             self._tokens,
-            # Its own stream, so that one device's randomness doesn't shift another's.
+            # Its own streams, so that one device's randomness doesn't shift another's.
             random.Random(f"{self._seed}:{name}"),
+            random.Random(f"{self._seed}:{name}:udp"),
             self._dead_after,
+            self._output_latency_ms,
             self._devices.remove,
         )
         self._devices.append(device)
@@ -141,7 +158,9 @@ class SimDevice:
         udp_host: str,
         tokens: _Tokens,
         rng: random.Random,
+        udp_rng: random.Random,
         dead_after: float,
+        output_latency_ms: int,
         on_close: Callable[[SimDevice], None],
     ) -> None:
         self.instance = instance
@@ -155,7 +174,10 @@ class SimDevice:
         """From `welcome`, while the Connection lasts."""
         self.reconnects = 0
         """Connections the hub answered, after the first."""
-        self.faults = Faults()
+        self.faults = Faults(udp_rng)
+        self.stats: Counter[str] = Counter()
+        """Datagrams dropped, by why: `bad_source`, `bad_conn_id`, `unknown_stream`, or a
+        datagram or frame check's error code. Closed streams' late frames aren't counted."""
         self._board = board
         self._resolve = resolve
         self._udp_host = udp_host
@@ -166,6 +188,11 @@ class SimDevice:
         self._boot_ns = time.monotonic_ns()
         self._changed = asyncio.Event()
         self._udp: asyncio.DatagramTransport | None = None
+        self._conn: ConnectionSocket | None = None
+        self._hub_ip: ipaddress.IPv4Address | ipaddress.IPv6Address | None = None
+        """The TCP peer IP of the Connection: datagrams come from there."""
+        self._event_seq = 0
+        self._closed_streams: deque[int] = deque(maxlen=_CLOSED_STREAMS)
         self._task: asyncio.Task[None] | None = None
         self._answered_before = False
         """Whether the hub has answered any Connection yet."""
@@ -184,7 +211,7 @@ class SimDevice:
         self._status_led = next(iter(self._leds.values()), None)
         """The LED the Status shows on: the first one."""
         self._speakers = {
-            cap.id: SimSpeaker(board.default_volume)
+            cap.id: self._speaker(cap.id, board.default_volume, output_latency_ms)
             for cap in manifest.capabilities
             if cap.kind == "speaker"
         }
@@ -201,6 +228,11 @@ class SimDevice:
     def status(self) -> Status:
         """The Status the device shows now."""
         return self._layers.shown
+
+    @property
+    def udp_port(self) -> int:
+        assert self._udp is not None, "the device isn't running"
+        return cast(tuple[str, int], self._udp.get_extra_info("sockname"))[1]
 
     @property
     def speaker(self) -> SimSpeaker:
@@ -222,7 +254,7 @@ class SimDevice:
         # The UDP socket is bound before the first `hello`, which announces its port.
         loop = asyncio.get_running_loop()
         transport, _ = await loop.create_datagram_endpoint(
-            asyncio.DatagramProtocol, local_addr=(self._udp_host, 0)
+            lambda: _Datagrams(self._datagram), local_addr=(self._udp_host, 0)
         )
         self._udp = transport
         self._task = asyncio.create_task(self._run(), name=f"sim device {self.instance}")
@@ -239,6 +271,7 @@ class SimDevice:
             self._udp.close()
         if self._identify_timer is not None:
             self._identify_timer.cancel()
+        self._idle()
         self._close_vanished()
         self._set_state("closed")
         self._on_close(self)
@@ -278,13 +311,15 @@ class SimDevice:
 
     async def _connection(self, hub: tuple[str, int]) -> None:
         """One Connection, from connect to drop."""
-        assert self._udp is not None
-        udp_port = cast(tuple[str, int], self._udp.get_extra_info("sockname"))[1]
         connection = ConnectionSocket(*await asyncio.open_connection(*hub))
-        self.faults.connection = connection
         try:
+            self.faults.connection = connection
+            self._conn = connection
+            self._hub_ip = _ip(cast(tuple[str, int], connection.raw.getpeername())[0])
+            self._event_seq = 0
+            self._closed_streams.clear()
             connection.raw.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-            connection.send(Hello(self.token, udp_port, self.manifest))
+            connection.send(Hello(self.token, self.udp_port, self.manifest))
             decoder = ControlDecoder()
             answered = False
             loop = asyncio.get_running_loop()
@@ -308,6 +343,8 @@ class SimDevice:
                     self._receive(message, connection)
             decoder.close()
         finally:
+            self._conn = None
+            self._hub_ip = None
             self._connections_lost += 1
             if connection.vanished:
                 self._vanished.append(connection)
@@ -357,7 +394,80 @@ class SimDevice:
         """The Connection is over: every capability goes idle."""
         for led in self._leds.values():
             led.release()
+        for speaker in self._speakers.values():
+            speaker.cut()
         self._layers.claimed = False
+
+    def _emit(self, cap: str, name: str, data: JsonObject) -> None:
+        """Send an Event on the Connection, if it's up."""
+        if self._conn is None or self.state != "online":
+            return
+        self._conn.send(Event(self._event_seq, cap, name, self._clock(), data))
+        self._event_seq += 1
+
+    # UDP.
+
+    def _datagram(self, data: bytes, source: tuple[str, int]) -> None:
+        # The network's faults strike before the device sees the datagram.
+        self.faults.udp_down.apply(data, lambda data: self._deliver(data, source))
+
+    def _deliver(self, data: bytes, source: tuple[str, int]) -> None:
+        """Take a datagram in, or drop it: UDP junk never closes a Connection."""
+        if self._hub_ip is None or _ip(source[0]) != self._hub_ip:
+            self.stats["bad_source"] += 1
+            return
+        try:
+            datagram = decode_datagram(data)
+        except WireError as e:
+            self.stats[e.code] += 1
+            return
+        if not isinstance(datagram, StreamFrame):
+            return  # an unknown kind, or an event mirror: the hub sends none
+        if datagram.conn_id != self.conn_id:
+            self.stats["bad_conn_id"] += 1
+            return
+        speaker = next((s for s in self._speakers.values() if s.stream == datagram.stream), None)
+        if speaker is None:
+            if datagram.stream not in self._closed_streams:
+                self.stats["unknown_stream"] += 1
+            return
+        try:
+            speaker.push(datagram.seq, datagram.payload)
+        except WireError as e:
+            self.stats[e.code] += 1
+
+    # The speaker.
+
+    def _speaker(self, cap: str, level: int, output_latency_ms: int) -> SimSpeaker:
+        def drained(stream: int, stats: JsonObject) -> None:
+            self._closed_streams.append(stream)
+            self._emit(cap, "drained", {"stream": stream} | stats)
+
+        return SimSpeaker(level, output_latency_ms, drained, self._speaker_changed)
+
+    def _speaker_changed(self) -> None:
+        self._layers.speaking = any(s.stream is not None for s in self._speakers.values())
+        self._changed_now()
+
+    def _speaker_start(self, cap: Capability, args: JsonObject) -> JsonObject:
+        """Raises `_Refused`."""
+        speaker = self._speakers[cap.id]
+        if speaker.stream is not None:
+            raise _Refused("busy", "the speaker is playing")
+        stream: int = args["stream"]
+        if not 1 <= stream <= 127:
+            raise _Refused("invalid_args", f"stream {stream} isn't a hub-range id")
+        format = AudioFormat.from_json(args["format"])
+        if not format.offered(cap.params):
+            raise _Refused("invalid_args", f"the speaker doesn't play {args['format']}")
+        speaker.start(stream, format, args.get("prefill_ms", 40))
+        return {"format": format.to_json()}
+
+    def _speaker_stop(self, cap: str) -> JsonObject:
+        speaker = self._speakers[cap]
+        if (stream := speaker.stream) is not None:
+            self._closed_streams.append(stream)
+        return speaker.stop()
 
     def _command(self, command: Command) -> Reply | FailedReply:
         if (code := self.faults.next_failure()) is not None:
@@ -373,6 +483,7 @@ class SimDevice:
     def _apply(self, command: Command) -> JsonObject:
         """Raises `SchemaError` or `_Refused`."""
         name, args = command.name, command.args
+        cap = None
         if command.cap is None:
             contract = DEVICE_COMMANDS.get(name)
             kind = "device"
@@ -398,6 +509,15 @@ class SimDevice:
             case "speaker", "set_volume":
                 assert command.cap is not None
                 self._speakers[command.cap].level = args["level"]
+            case "speaker", "start":
+                assert cap is not None
+                result = self._speaker_start(cap, args)
+            case "speaker", "stop":
+                assert command.cap is not None
+                result = self._speaker_stop(command.cap)
+            case "speaker", "drain":
+                assert command.cap is not None
+                self._speakers[command.cap].drain(args["last_seq"])
             case "led", "set":
                 assert command.cap is not None
                 try:
@@ -442,6 +562,22 @@ class SimDevice:
     def _clock(self) -> int:
         """The device clock: µs since boot."""
         return (time.monotonic_ns() - self._boot_ns) // 1000
+
+
+class _Datagrams(asyncio.DatagramProtocol):
+    def __init__(self, received: Callable[[bytes, tuple[str, int]], None]) -> None:
+        self._received = received
+
+    def datagram_received(self, data: bytes, addr: tuple[str, int]) -> None:
+        self._received(data, addr)
+
+
+def _ip(host: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address:
+    """An IPv4-mapped IPv6 address as the IPv4 one, so both socket families compare."""
+    ip = ipaddress.ip_address(host.partition("%")[0])
+    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
+        return ip.ipv4_mapped
+    return ip
 
 
 class _Refused(Exception):

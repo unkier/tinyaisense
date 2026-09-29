@@ -94,14 +94,18 @@ class NullSink:
 
 async def test_no_session_starts_once_the_hub_is_shutting_down(tmp_path: Path) -> None:
     # The Session ends before the links close, so a hello can land in between.
-    control = Control()
+    udp, _ = await asyncio.get_running_loop().create_datagram_endpoint(
+        asyncio.DatagramProtocol, local_addr=("127.0.0.1", 0)
+    )
+    control = Control(Timing())
     sessions = Sessions(control)
     registry = Registry(
-        StateStore(tmp_path), udp_port=0, timing=Timing(), auto_approve=False, presence=control
+        StateStore(tmp_path), udp=udp, timing=Timing(), auto_approve=False, observer=control
     )
     core = Core(registry, sessions, control, TOKEN)
 
     await core.shutdown()
+    udp.close()
 
     with pytest.raises(HubError) as refused:
         await core.open_session(

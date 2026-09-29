@@ -1,11 +1,15 @@
 """Faults a simulated device can suffer. Each is live: set or trigger it at any time."""
 
 import asyncio
+import random
 import socket
 import struct
+from collections import deque
+from collections.abc import Callable, Iterable
+from dataclasses import dataclass
 from typing import cast
 
-from tinyaisense_wire import Message, encode_control
+from tinyaisense_wire import Message, StreamFrame, WireError, decode_datagram, encode_control
 
 
 class ConnectionSocket:
@@ -43,10 +47,120 @@ class ConnectionSocket:
             transport.resume_reading()
 
 
-class Faults:
-    """A device's faults on its TCP Connection. They act on the Connection of the moment."""
+@dataclass(frozen=True, slots=True)
+class GilbertElliott:
+    """Bursty loss: a two-state Markov chain, stepped once per datagram."""
 
-    def __init__(self) -> None:
+    p: float
+    """The chance of going from the good state to the bad one."""
+    r: float
+    """The chance of going from the bad state back to the good one."""
+    loss_good: float = 0.0
+    """The chance of losing a datagram in the good state."""
+    loss_bad: float = 1.0
+    """The chance of losing a datagram in the bad state."""
+
+
+class UdpFaults:
+    """Faults on the datagrams one way. Seeded: a run with the same seed loses the same
+    datagrams, given the same traffic."""
+
+    def __init__(self, rng: random.Random) -> None:
+        self._rng = rng
+        self.loss = 0.0
+        """The chance of losing each datagram: Bernoulli loss."""
+        self.bursts: GilbertElliott | None = None
+        """Bursty loss, on top of `loss`."""
+        self.delay_ms = 0.0
+        """Every datagram arrives this much later."""
+        self.jitter_ms = 0.0
+        """Up to this much more delay, uniform, per datagram. Datagrams keep their order,
+        as they do on one WiFi link."""
+        self.duplicate = 0.0
+        """The chance of each datagram arriving twice."""
+        self.dropped = 0
+        """Datagrams the faults lost."""
+        self._drops: dict[int | None, set[int]] = {}
+        self._bad = False
+        """The Gilbert-Elliott state."""
+        self._blackout_until = 0.0
+        self._delayed: deque[tuple[float, Callable[[], None]]] = deque()
+        """Datagrams on their way, in the order they arrive."""
+        self._timer: asyncio.TimerHandle | None = None
+
+    def drop(self, stream: int | None, seqs: Iterable[int]) -> None:
+        """Lose the stream frames with these `seqs`: of stream id `stream`, or of any stream."""
+        self._drops.setdefault(stream, set()).update(seqs)
+
+    def blackout(self, ms: float) -> None:
+        """Lose every datagram for the next `ms`."""
+        self._blackout_until = asyncio.get_running_loop().time() + ms / 1000
+
+    def apply(self, data: bytes, deliver: Callable[[bytes], None]) -> None:
+        """Deliver `data` once, twice, later or never, as the faults say."""
+        now = asyncio.get_running_loop().time()
+        if self._lost(data, now):
+            self.dropped += 1
+            return
+        copies = 2 if self.duplicate and self._rng.random() < self.duplicate else 1
+        delay = self.delay_ms + (self._rng.uniform(0, self.jitter_ms) if self.jitter_ms else 0)
+        due = now + delay / 1000
+        if self._delayed:
+            due = max(due, self._delayed[-1][0])  # no overtaking
+        elif due <= now:
+            for _ in range(copies):
+                deliver(data)
+            return
+        for _ in range(copies):
+            self._delayed.append((due, lambda: deliver(data)))
+        self._arm()
+
+    def _lost(self, data: bytes, now: float) -> bool:
+        # The burst state steps on every datagram, whatever else befalls it.
+        burst = False
+        if self.bursts is not None:
+            flip = self.bursts.r if self._bad else self.bursts.p
+            if self._rng.random() < flip:
+                self._bad = not self._bad
+            loss = self.bursts.loss_bad if self._bad else self.bursts.loss_good
+            burst = self._rng.random() < loss
+        if now < self._blackout_until or burst:
+            return True
+        if self._drops and _frame_in(data, self._drops):
+            return True
+        return bool(self.loss) and self._rng.random() < self.loss
+
+    def _arm(self) -> None:
+        if self._timer is None and self._delayed:
+            self._timer = asyncio.get_running_loop().call_at(self._delayed[0][0], self._arrive)
+
+    def _arrive(self) -> None:
+        """Deliver, in order, every datagram due by now."""
+        self._timer = None
+        now = asyncio.get_running_loop().time()
+        while self._delayed and self._delayed[0][0] <= now:
+            self._delayed.popleft()[1]()
+        self._arm()
+
+
+def _frame_in(data: bytes, drops: dict[int | None, set[int]]) -> bool:
+    try:
+        frame = decode_datagram(data)
+    except WireError:
+        return False
+    if not isinstance(frame, StreamFrame):
+        return False
+    return frame.seq in drops.get(frame.stream, ()) or frame.seq in drops.get(None, ())
+
+
+class Faults:
+    """A device's faults: on its TCP Connection, where they act on the Connection of the
+    moment, and on the datagrams it receives."""
+
+    def __init__(self, rng: random.Random) -> None:
+        """`rng` drives the UDP faults."""
+        self.udp_down = UdpFaults(rng)
+        """Faults on the datagrams from the hub."""
         self._connection: ConnectionSocket | None = None
         self._stall_reads = False
         self._reads_resumed = asyncio.Event()

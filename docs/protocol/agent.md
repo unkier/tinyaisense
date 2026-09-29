@@ -194,13 +194,13 @@ A **stream** carries raw audio between the agent and a capability. `stream.start
 | `reason` | Why |
 |---|---|
 | `drained` | a speaker stream played to its end |
-| `stopped` | the agent stopped it |
+| `stopped` | the agent stopped it, or the device failed its `drain` |
 | `preempted` | another stream took the capability, or its `exclusive` peer |
 | `reflex` | a button press cut the speaker |
 | `disconnected` | the device dropped, or the Session ended |
 | `overflow` | the agent sent more than 5 min ahead of playback |
 
-- Speaker `stats`: `{played_ms, lost, underruns, underrun_ms}`. `played_ms` is the stream position reached: frames lost on the network count toward it, pauses don't.
+- Speaker `stats`: `{played_ms, lost, underruns, underrun_ms}`. `played_ms` is the stream position reached: frames lost on the network count toward it, pauses don't. When a device drops, it can't report them: the hub estimates `played_ms` as the audio it sent, capped by the time since it started sending, and reports the rest as 0.
 - Mic `stats`: `{frames, lost, dropped, skipped}`: frames delivered, frames the hub zero-filled for network loss, frames the device dropped from its queue, and frames the hub skipped because the agent read too slowly.
 
 **Speaker audio from agents.** The agent sends as fast as it gets audio. The hub buffers up to 5 min per stream and paces it to the device; there are no progress Events. Frames on a handle that has ended are dropped silently.
@@ -217,6 +217,7 @@ One binary WebSocket frame is one audio frame, all integers little-endian:
 | agent → hub | `handle` u16, then PCM of any even length; the hub re-chunks it |
 
 - PCM is signed 16-bit little-endian, mono, at the stream's `rate`.
+- A frame shorter than its header (`truncated`), or whose PCM isn't a whole number of samples (`partial_sample`), is dropped. So is a frame on a handle that doesn't name an open speaker stream of the Session. The link stays up either way.
 - **Mic timeline.** `index` counts 10 ms frames from 0 at the start of the stream. The hub zero-fills audio lost on the network, so the timeline has no holes. If the agent reads too slowly and more than 2 s of audio waits for its socket, the hub drops the oldest frames: those, and only those, show up as gaps in `index`, and are counted in `skipped`.
 
 ### Overlap and exclusive groups

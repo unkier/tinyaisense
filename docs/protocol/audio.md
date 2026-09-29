@@ -63,7 +63,7 @@ Conditioning runs on the device, so the wire carries clean, speech-level PCM and
 
 ## Speaker stream
 
-**Pacing (hub).** The hub sends the first 60 ms as a burst, then paces in real time to keep a 60 ms lead on its monotonic clock. There's no drift compensation.
+**Pacing (hub).** The hub sends the first 60 ms as a burst, then paces in real time to keep a 60 ms lead on its monotonic clock. There's no drift compensation. If the agent's audio runs dry and the stream falls behind its schedule, the audio that follows starts a fresh 60 ms burst, which refills the jitter buffer after its underrun.
 
 **Jitter buffer (device), elastic.**
 - Playback starts once `prefill_ms` (default 40) is buffered.

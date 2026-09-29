@@ -8,7 +8,6 @@ import asyncio
 import contextlib
 import logging
 import socket
-import time
 from collections.abc import Generator
 from typing import Any, cast
 
@@ -16,6 +15,7 @@ import uvicorn
 from starlette.types import ASGIApp
 from uvicorn.protocols.websockets.websockets_sansio_impl import WebSocketsSansIOProtocol
 
+from .alarm import Alarm, now_us
 from .config import Timing
 from .keepalive import Dead, Inbound, Keepalive, SendPing, Tick
 
@@ -47,7 +47,7 @@ class AgentWebSocketProtocol(WebSocketsSansIOProtocol):
         # the app closes, and from then on discards messages before it would pause.
         self.read_paused = True
         self._keepalive: Keepalive | None = None
-        self._keepalive_timer: asyncio.TimerHandle | None = None
+        self._alarm = Alarm(self._run_keepalive)
 
     def connection_made(self, transport: asyncio.BaseTransport) -> None:
         super().connection_made(transport)
@@ -58,7 +58,7 @@ class AgentWebSocketProtocol(WebSocketsSansIOProtocol):
 
     def data_received(self, data: bytes) -> None:
         if self._keepalive is not None:
-            self._keepalive.handle(Inbound(), _now_us())
+            self._keepalive.handle(Inbound(), now_us())
         super().data_received(data)
 
     async def receive(self) -> Any:
@@ -69,25 +69,21 @@ class AgentWebSocketProtocol(WebSocketsSansIOProtocol):
         assert self.ping_interval is not None
         assert self.ping_timeout is not None
         self._keepalive = Keepalive(
-            _now_us(),
+            now_us(),
             ping_interval=round(self.ping_interval * 1_000_000),
             dead_after=round(self.ping_timeout * 1_000_000),
         )
-        self._run_keepalive()
+        self._run_keepalive(now_us())
 
     def stop_keepalive(self) -> None:
         super().stop_keepalive()
         self._keepalive = None
-        if self._keepalive_timer is not None:
-            self._keepalive_timer.cancel()
-            self._keepalive_timer = None
+        self._alarm.cancel()
 
-    def _run_keepalive(self) -> None:
-        self._keepalive_timer = None
-        if self._keepalive is None:
+    def _run_keepalive(self, now: int) -> None:
+        if (keepalive := self._keepalive) is None:
             return
-        now = _now_us()
-        for action in self._keepalive.handle(Tick(), now):
+        for action in keepalive.handle(Tick(), now):
             match action:
                 case SendPing():
                     if not self.close_sent and not self.transport.is_closing():
@@ -95,11 +91,8 @@ class AgentWebSocketProtocol(WebSocketsSansIOProtocol):
                         self.transport.write(b"".join(self.conn.data_to_send()))
                 case Dead():
                     self.keepalive_timeout()  # uvicorn's: close with 1011
-        deadline = self._keepalive.next_deadline()
-        if deadline is not None:
-            self._keepalive_timer = self.loop.call_later(
-                max(0, deadline - now) / 1_000_000, self._run_keepalive
-            )
+        if self._keepalive is keepalive:  # not stopped meanwhile
+            self._alarm.set(keepalive.next_deadline(), now)
 
 
 class HttpServer:
@@ -169,7 +162,3 @@ class _Server(uvicorn.Server):
     def capture_signals(self) -> Generator[None]:
         # The hub owns the process's signals.
         yield
-
-
-def _now_us() -> int:
-    return time.monotonic_ns() // 1000

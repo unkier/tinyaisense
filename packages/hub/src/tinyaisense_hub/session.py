@@ -10,6 +10,7 @@ from typing import Literal, Protocol
 from tinyaisense_wire import JsonObject
 
 from .errors import HubError
+from .speaker import SpeakerStream
 
 type Holder = Literal["agent_api", "mcp"]
 """Which front-end claimed the Session."""
@@ -17,6 +18,8 @@ type Holder = Literal["agent_api", "mcp"]
 type EndReason = Literal["closed", "taken_over", "shutdown"]
 """Why a Session ended: its link closed or went dead, another agent took over, or the hub
 is shutting down."""
+
+_MAX_HANDLE = 65535
 
 _log = logging.getLogger("tinyaisense_hub.session")
 
@@ -48,10 +51,23 @@ class Session:
     id: str = field(default_factory=lambda: secrets.token_urlsafe(16))
     since: int = field(default_factory=lambda: _now_ms())
     """Epoch ms."""
+    streams: dict[int, SpeakerStream] = field(default_factory=dict[int, SpeakerStream])
+    """The handle table: the Session's open streams, by handle."""
+    _last_handle: int = field(default=0, init=False)
 
     def notify(self, method: str, params: JsonObject) -> None:
         """Send a notification, stamped with `t`: now."""
         self.sink.notify(method, params | {"t": _now_ms()})
+
+    def new_handle(self) -> int:
+        """The next u16 handle after the last one used, round-robin from 1, skipping open
+        ones. Raises `HubError`: `busy` if every handle is open."""
+        for step in range(1, _MAX_HANDLE + 1):
+            handle = (self._last_handle + step - 1) % _MAX_HANDLE + 1
+            if handle not in self.streams:
+                self._last_handle = handle
+                return handle
+        raise HubError("busy", "every stream handle is open")
 
 
 class DeviceControl(Protocol):

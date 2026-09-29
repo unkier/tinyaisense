@@ -15,7 +15,14 @@ from typing import Any, cast
 from starlette.applications import Starlette
 from starlette.routing import WebSocketRoute
 from starlette.websockets import WebSocket, WebSocketDisconnect
-from tinyaisense_wire import JsonObject, Schema, SchemaError, validate
+from tinyaisense_wire import (
+    JsonObject,
+    Schema,
+    SchemaError,
+    WireError,
+    decode_agent_audio,
+    validate,
+)
 
 from .config import Timing
 from .core import Core
@@ -71,6 +78,24 @@ _DEVICE: Schema = {
     "properties": {"device": {"type": "string"}},
 }
 
+_STREAM_START: Schema = {
+    "type": "object",
+    "required": ["address"],
+    "additionalProperties": False,
+    "properties": {
+        "address": {"type": "string"},
+        "rate": {"type": "integer", "enum": _RATES},
+        "prefill_ms": {"type": "integer", "minimum": 0, "maximum": 200},
+    },
+}
+_HANDLE: Schema = {
+    "type": "object",
+    "required": ["handle"],
+    "additionalProperties": False,
+    "properties": {"handle": {"type": "integer", "minimum": 0, "maximum": 65535}},
+}
+_PREFILL_MS = 40
+
 _log = logging.getLogger("tinyaisense_hub.agent_api")
 
 
@@ -109,6 +134,9 @@ class AgentLink:
             "devices": (_NO_PARAMS, self._devices),
             "command": (_COMMAND, self._command),
             "led.release": (_DEVICE, self._led_release),
+            "stream.start": (_STREAM_START, self._stream_start),
+            "stream.stop": (_HANDLE, self._stream_stop),
+            "stream.drain": (_HANDLE, self._stream_drain),
         }
 
     async def run(self) -> None:
@@ -150,6 +178,8 @@ class AgentLink:
                 return  # gone, or closing: a late request mustn't run for a Session that ended
             if (text := message.get("text")) is not None:
                 await self._text(cast(str, text))
+            elif (data := message.get("bytes")) is not None and self._session is not None:
+                self._audio(cast(bytes, data))
 
     async def _text(self, text: str) -> None:
         request = self._parse(text)
@@ -172,6 +202,15 @@ class AgentLink:
             task = asyncio.create_task(self._request(request.id, run, request.params))
             self._requests.add(task)
             task.add_done_callback(self._requests.discard)
+
+    def _audio(self, data: bytes) -> None:
+        assert self._session is not None
+        try:
+            audio = decode_agent_audio(data)
+        except WireError as e:
+            _log.debug("agent audio dropped: %s", e)
+            return
+        self._core.stream_feed(self._session, audio.handle, audio.pcm)
 
     def _parse(self, text: str) -> _Request | None:
         """A request, or None for a notification or garbage, which gets its error here."""
@@ -261,6 +300,24 @@ class AgentLink:
         assert self._session is not None
         await self._core.led_release(self._session, params["device"])
         return {}
+
+    async def _stream_start(self, params: JsonObject) -> JsonObject:
+        assert self._session is not None
+        handle = await self._core.stream_start(
+            self._session,
+            params["address"],
+            params.get("rate"),
+            params.get("prefill_ms", _PREFILL_MS),
+        )
+        return {"handle": handle}
+
+    async def _stream_stop(self, params: JsonObject) -> JsonObject:
+        assert self._session is not None
+        return await self._core.stream_stop(self._session, params["handle"])
+
+    async def _stream_drain(self, params: JsonObject) -> JsonObject:
+        assert self._session is not None
+        return await self._core.stream_drain(self._session, params["handle"])
 
     # Writing.
 

@@ -1,4 +1,7 @@
+from __future__ import annotations
+
 from dataclasses import dataclass
+from typing import Any
 
 from .errors import WireError
 
@@ -11,6 +14,30 @@ class AudioFormat:
     rate: int
     channels: int
     frame_ms: int
+
+    @classmethod
+    def from_json(cls, format: dict[str, Any]) -> AudioFormat:
+        """From a `start{format}` that passed its schema."""
+        return cls(format["codec"], format["rate"], format["channels"], format["frame_ms"])
+
+    def to_json(self) -> dict[str, Any]:
+        return {
+            "codec": self.codec,
+            "rate": self.rate,
+            "channels": self.channels,
+            "frame_ms": self.frame_ms,
+        }
+
+    def offered(self, params: dict[str, Any] | None) -> bool:
+        """Whether a capability whose params are `params` advertises this format, at this
+        `frame_ms`, among its `formats`."""
+        formats: list[dict[str, Any]] = (params or {}).get("formats", [])
+        return any(
+            (f.get("codec"), f.get("rate"), f.get("channels"))
+            == (self.codec, self.rate, self.channels)
+            and self.frame_ms in f.get("frame_ms", [])
+            for f in formats
+        )
 
     @property
     def frame_samples(self) -> int:

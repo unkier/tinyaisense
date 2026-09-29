@@ -1,5 +1,13 @@
 from importlib.metadata import version
 
+from .agent_audio import (
+    AgentAudio,
+    HubAudio,
+    decode_agent_audio,
+    decode_hub_audio,
+    encode_agent_audio,
+    encode_hub_audio,
+)
 from .audio import AudioFormat
 from .control import ControlDecoder, encode_control
 from .datagrams import EventMirror, StreamFrame, decode_datagram, encode_datagram
@@ -40,6 +48,7 @@ __all__ = [
     "MAX_FRAME_BODY",
     "MDNS_SERVICE",
     "PROTOCOL",
+    "AgentAudio",
     "AudioFormat",
     "Capability",
     "Command",
@@ -54,6 +63,7 @@ __all__ = [
     "FrameDecoder",
     "FrameType",
     "Hello",
+    "HubAudio",
     "JsonObject",
     "KindContract",
     "Manifest",
@@ -68,11 +78,15 @@ __all__ = [
     "Welcome",
     "WireError",
     "WireErrorCode",
+    "decode_agent_audio",
     "decode_datagram",
+    "decode_hub_audio",
     "decode_message",
+    "encode_agent_audio",
     "encode_control",
     "encode_datagram",
     "encode_frame",
+    "encode_hub_audio",
     "encode_message",
     "validate",
 ]

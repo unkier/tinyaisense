@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from types import TracebackType
 from typing import Any, cast
 
-from tinyaisense_wire import JsonObject
+from tinyaisense_wire import AgentAudio, JsonObject, encode_agent_audio
 from websockets.asyncio.client import ClientConnection
 from websockets.asyncio.client import connect as ws_connect
 from websockets.exceptions import ConnectionClosed
@@ -19,6 +19,8 @@ from websockets.exceptions import ConnectionClosed
 PING_INTERVAL = 2.0
 PING_TIMEOUT = 4.0
 """The SDK pings the hub too, so that it notices a dead hub within ~6 s."""
+AUDIO_CHUNK = 32768
+"""`send_audio` sends at most this many bytes of PCM per binary frame."""
 
 
 class ApiError(Exception):
@@ -108,6 +110,41 @@ class Session:
     async def led_release(self, device: str) -> None:
         """Hand `device`'s LED back to its Status."""
         await self.call("led.release", device=device)
+
+    async def stream_start(
+        self, address: str, *, rate: int | None = None, prefill_ms: int | None = None
+    ) -> int:
+        """Open a stream on the capability at `address`, e.g. `kitchen/speaker`, and return
+        its handle. `rate` defaults to 16000; `prefill_ms`, for a speaker, to 40."""
+        params: JsonObject = {"address": address}
+        if rate is not None:
+            params["rate"] = rate
+        if prefill_ms is not None:
+            params["prefill_ms"] = prefill_ms
+        return cast(int, (await self.call("stream.start", **params))["handle"])
+
+    async def send_audio(self, handle: int, pcm: bytes) -> None:
+        """Send PCM (s16le mono, at the stream's rate) to a speaker stream, as fast as you
+        get it: the hub paces it. Raises `SessionEnded`, or `ValueError` for PCM that isn't a
+        whole number of samples."""
+        if len(pcm) % 2:
+            raise ValueError(f"{len(pcm)} bytes isn't a whole number of 16-bit samples")
+        if self.ended is not None:
+            raise SessionEnded(self.ended)
+        try:
+            for at in range(0, len(pcm), AUDIO_CHUNK):
+                chunk = pcm[at : at + AUDIO_CHUNK]
+                await self._ws.send(encode_agent_audio(AgentAudio(handle, chunk)))
+        except ConnectionClosed:
+            raise SessionEnded(self.ended or "closed") from None
+
+    async def stream_stop(self, handle: int) -> JsonObject:
+        """End a stream at once. Returns `{reason, stats}`."""
+        return await self.call("stream.stop", handle=handle)
+
+    async def stream_drain(self, handle: int) -> JsonObject:
+        """End a speaker stream once what was sent has played. Returns `{reason, stats}`."""
+        return await self.call("stream.drain", handle=handle)
 
     async def notifications(self) -> AsyncIterator[Notification]:
         """The Session's notifications, in order, until it ends. `session.ended`, if the hub

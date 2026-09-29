@@ -7,27 +7,36 @@ other, and device Events apply at once, outside the queue.
 """
 
 import asyncio
+import contextlib
 import logging
 from collections import deque
 from collections.abc import Callable, Coroutine
-from typing import Any, Literal, Protocol
+from typing import Any, Literal
 
-from tinyaisense_wire import KINDS, Capability, JsonObject
+from tinyaisense_wire import KINDS, Capability, Event, JsonObject
 
+from .alarm import now_us
+from .config import Timing
 from .devices import CommandSpec, DeviceConnection, check_args, volume_commands
 from .errors import HubError
+from .session import Session
+from .speaker import (
+    DRAINED,
+    FORMAT,
+    STOP_RESULT,
+    STOPPED,
+    EndReason,
+    Speakers,
+    SpeakerStream,
+    StreamEnd,
+    stats,
+)
 from .state import DeviceRecord
 
 type _Op[T] = Callable[[], Coroutine[Any, Any, T]]
 type _HubStatus = Literal["no_agent", "agent"]
 
 _log = logging.getLogger("tinyaisense_hub.control")
-
-
-class Session(Protocol):
-    """A Session, as the controllers see it: where its agent's notifications go."""
-
-    def notify(self, method: str, params: JsonObject) -> None: ...
 
 
 class Controller:
@@ -39,6 +48,8 @@ class Controller:
         self._queue: deque[tuple[_Op[Any], asyncio.Future[Any]]] = deque()
         self._worker: asyncio.Task[None] | None = None
         self._workers = workers
+        self.speakers: dict[str, SpeakerStream] = {}
+        """Speaker capability id → the stream open on it."""
 
     def submit[T](self, op: _Op[T]) -> asyncio.Future[T]:
         """Queue `op`. The future holds its outcome. Cancelling the future before the op starts
@@ -94,7 +105,8 @@ class LedClaim:
 class Control:
     """The controllers of the online devices, and what the Session wants of each device."""
 
-    def __init__(self) -> None:
+    def __init__(self, timing: Timing) -> None:
+        self._speakers = Speakers(timing, self._drain)
         self._controllers: dict[str, Controller] = {}
         """device_id → the controller of its online Connection."""
         self._workers: set[asyncio.Task[None]] = set()
@@ -106,8 +118,9 @@ class Control:
         """Wait for every op to finish: they fail fast once the Connections are closed."""
         while self._workers:
             await asyncio.wait(self._workers)
+        self._speakers.close()
 
-    # Presence, from the registry.
+    # The devices, from the registry.
 
     def device_online(self, conn: DeviceConnection, record: DeviceRecord) -> None:
         """Bring the device up to date, then tell the Session it's online."""
@@ -115,9 +128,24 @@ class Control:
         self._controllers[conn.manifest.device_id] = controller
         _log_failure(controller.submit(lambda: self._bring_up(conn, record)))
 
+    def device_event(self, conn: DeviceConnection, event: Event) -> None:
+        """Apply a device Event at once, outside the op queue."""
+        controller = self._controllers.get(conn.manifest.device_id)
+        if controller is None or controller.conn is not conn:
+            return
+        stream = controller.speakers.get(event.cap)
+        if stream is None or event.data.get("stream") != stream.stream_id:
+            return
+        if event.name == "drained":
+            self._end(stream, "drained", stats(DRAINED, event.data))
+        elif event.name == "stopped":  # the Reflex cut the speaker
+            self._end(stream, "reflex", stats(STOPPED, event.data))
+
     def device_offline(self, conn: DeviceConnection) -> None:
         device_id = conn.manifest.device_id
         if (controller := self._controllers.get(device_id)) is not None and controller.conn is conn:
+            for stream in list(controller.speakers.values()):
+                self._end(stream, "disconnected", None)
             del self._controllers[device_id]
         if self._session is not None:
             # By its welcome name: a rename or forget has changed the record already.
@@ -147,13 +175,37 @@ class Control:
             _log_failure(controller.submit(_pipeline_op(controller.conn, [_status("agent")])))
 
     async def session_ended(self, session: Session) -> None:
-        """Release the Session's LED claims, then set every device's Status to `no_agent`."""
+        """Stop the Session's speaker streams, release its LED claims, then set every
+        device's Status to `no_agent`."""
         self._session = None
         claims, self._claims = self._claims, {}
         ops: list[asyncio.Future[None]] = []
         for device_id, controller in self._controllers.items():
-            ops.append(controller.submit(_end_op(controller.conn, claims.get(device_id))))
+            ops.append(controller.submit(self._end_op(controller, session, claims.get(device_id))))
         await asyncio.gather(*ops, return_exceptions=True)
+
+    def _end_op(
+        self, controller: Controller, session: Session, claim: LedClaim | None
+    ) -> _Op[None]:
+        """Stop the Session's streams, release `claim`, then set the Status to `no_agent`,
+        pipelined. The streams and the claim are read when the op starts, so they hold what
+        the ops queued before it did."""
+
+        async def op() -> None:
+            conn = controller.conn
+            streams = [s for s in controller.speakers.values() if s.session is session]
+            commands = [self._halt(stream) for stream in streams]
+            commands += claim.releases() if claim is not None else []
+            commands.append(_status("no_agent"))
+            replies = await asyncio.gather(
+                *(conn.command(*command) for command in commands), return_exceptions=True
+            )
+            for stream, reply in zip(streams, replies, strict=False):
+                self._end(stream, "disconnected", _stop_stats(reply))
+            if failures := [r for r in replies[len(streams) :] if isinstance(r, BaseException)]:
+                raise failures[0]
+
+        return op
 
     # Agent ops, from the core.
 
@@ -204,7 +256,139 @@ class Control:
 
         await controller.submit(op)
 
+    async def stream_start(
+        self, session: Session, device: DeviceRecord, capability: Capability, prefill_ms: int
+    ) -> int:
+        """Open a speaker stream for the agent. A stream already open on the speaker ends
+        `preempted`. Returns the handle. Raises `HubError`."""
+        address = f"{device.name}/{capability.id}"
+        if capability.kind != "speaker":
+            raise HubError("unsupported", f"{address} takes no stream from the hub")
+        if not FORMAT.offered(capability.params):
+            raise HubError("unsupported", f"{address} doesn't play 16 kHz mono PCM in 10 ms frames")
+        controller = self._controller(device)
+
+        async def op() -> int:
+            self._require_current(session)
+            conn = controller.conn
+            stream_id = conn.stream_ids.open()
+            commands: list[CommandSpec] = []
+            if (old := controller.speakers.get(capability.id)) is not None:
+                commands.append(self._halt(old))
+            start = {"stream": stream_id, "format": FORMAT.to_json(), "prefill_ms": prefill_ms}
+            commands.append((capability.id, "start", start))
+            replies = await asyncio.gather(
+                *(conn.command(*command) for command in commands), return_exceptions=True
+            )
+            if old is not None:
+                self._end(old, "preempted", _stop_stats(replies[0]))
+            started = replies[-1]
+            if self._controllers.get(device.device_id) is not controller:
+                started = HubError("disconnected", f"{device.name} went offline")
+            if isinstance(started, BaseException):
+                if isinstance(started, HubError) and started.code == "timeout":
+                    # The device may yet start it: the speaker mustn't stay busy with it.
+                    with contextlib.suppress(HubError):
+                        await conn.command(capability.id, "stop", {})
+                conn.stream_ids.close(stream_id)
+                raise started
+            stream = SpeakerStream(
+                session.new_handle(), session, conn, capability.id, stream_id, address
+            )
+            controller.speakers[capability.id] = stream
+            session.streams[stream.handle] = stream
+            self._speakers.open(stream)
+            session.notify(
+                "stream.started", {"handle": stream.handle, "address": address, "rate": FORMAT.rate}
+            )
+            return stream.handle
+
+        return await controller.submit(op)
+
+    def stream_feed(self, session: Session, handle: int, pcm: bytes) -> None:
+        """Take the agent's audio for a stream. Audio for a stream that isn't open is
+        dropped."""
+        stream = session.streams.get(handle)
+        if stream is None or not stream.open:
+            return
+        if self._speakers.feed(stream, pcm):
+            self._halt(stream)
+            self._submit_stop(stream, "overflow")
+
+    async def stream_stop(self, session: Session, handle: int) -> StreamEnd:
+        """End a stream at once. Raises `HubError`: `disconnected` if it has ended."""
+        stream = self._stream(session, handle)
+        if stream.open:
+            # Its audio stops now, even while the `stop` waits its turn on the device.
+            self._halt(stream)
+            self._submit_stop(stream, "stopped")
+        return await asyncio.shield(stream.ended)
+
+    async def stream_drain(self, session: Session, handle: int) -> StreamEnd:
+        """End a stream once what the agent sent has played. Raises `HubError`:
+        `disconnected` if it has ended."""
+        stream = self._stream(session, handle)
+        if stream.open:
+            self._speakers.drain(stream)
+        return await asyncio.shield(stream.ended)
+
     # Internals.
+
+    def _stream(self, session: Session, handle: int) -> SpeakerStream:
+        stream = session.streams.get(handle)
+        if stream is None:
+            raise HubError("disconnected", f"stream {handle} has ended")
+        return stream
+
+    def _halt(self, stream: SpeakerStream) -> CommandSpec:
+        """Stop sending the stream's audio. Returns the command that stops it on its device;
+        once that's replied to, the stream ends."""
+        stream.stopping = True
+        self._speakers.remove(stream)
+        return (stream.cap, "stop", {})
+
+    def _submit_stop(self, stream: SpeakerStream, reason: EndReason) -> None:
+        """Queue an op that stops the stream on its device, and ends it with `reason`. If the
+        device has dropped, it has ended already."""
+        controller = self._controllers.get(stream.conn.manifest.device_id)
+        if controller is not None and controller.conn is stream.conn:
+            _log_failure(controller.submit(lambda: self._stop(stream, reason)))
+
+    async def _stop(self, stream: SpeakerStream, reason: EndReason) -> None:
+        if stream.ended.done():
+            return
+        try:
+            reply = await stream.conn.command(*self._halt(stream))
+        except HubError as e:
+            reply = e
+        self._end(stream, reason, _stop_stats(reply))
+
+    def _drain(self, stream: SpeakerStream, last_seq: int | None) -> None:
+        """The pacer has sent a drained stream's last frame: tell the device at once, outside
+        the queue. If it fails the `drain`, no `drained` will come: stop the stream."""
+
+        def sent(drain: asyncio.Future[JsonObject]) -> None:
+            if drain.cancelled() or (e := drain.exception()) is None or not stream.open:
+                return
+            _log.warning("%s: drain failed, so the stream stops: %s", stream.address, e)
+            self._halt(stream)
+            self._submit_stop(stream, "stopped")
+
+        stream.conn.command(stream.cap, "drain", {"last_seq": last_seq}).add_done_callback(sent)
+
+    def _end(self, stream: SpeakerStream, reason: EndReason, stats: JsonObject | None) -> None:
+        """End a stream, once. With no `stats` from the device, the hub estimates them."""
+        if stream.ended.done():
+            return
+        self._speakers.remove(stream)
+        stream.conn.stream_ids.close(stream.stream_id)
+        controller = self._controllers.get(stream.conn.manifest.device_id)
+        if controller is not None and controller.speakers.get(stream.cap) is stream:
+            del controller.speakers[stream.cap]
+        stream.session.streams.pop(stream.handle, None)
+        end = StreamEnd(reason, stream.estimate(now_us()) if stats is None else stats)
+        stream.ended.set_result(end)
+        stream.session.notify("stream.ended", {"handle": stream.handle, **end.to_json()})
 
     def _hub_status(self) -> _HubStatus:
         return "no_agent" if self._session is None else "agent"
@@ -229,15 +413,9 @@ def _pipeline_op(conn: DeviceConnection, commands: list[CommandSpec]) -> _Op[Non
     return lambda: conn.pipeline(commands)
 
 
-def _end_op(conn: DeviceConnection, claim: LedClaim | None) -> _Op[None]:
-    """Release `claim`, then set the Status to `no_agent`. The claim is read when the op
-    starts, so it holds what the ops queued before it recorded."""
-
-    async def op() -> None:
-        releases = claim.releases() if claim is not None else []
-        await conn.pipeline([*releases, _status("no_agent")])
-
-    return op
+def _stop_stats(reply: JsonObject | BaseException) -> JsonObject | None:
+    """The stats in a `stop` reply; None if it failed."""
+    return None if isinstance(reply, BaseException) else stats(STOP_RESULT, reply)
 
 
 def _log_failure(future: asyncio.Future[Any]) -> None:
