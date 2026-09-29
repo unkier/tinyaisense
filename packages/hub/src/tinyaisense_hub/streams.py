@@ -1,6 +1,7 @@
 """What every agent stream shares, speaker or mic: docs/protocol/agent.md#streams."""
 
 import asyncio
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal
 
@@ -28,6 +29,9 @@ class StreamEnd:
 
 class Stream:
     """One stream of a Session, from the device's `start` reply to its end."""
+
+    on_end: Callable[[StreamEnd], None] | None = None
+    """Called as the stream ends, before anything else hears of it."""
 
     def __init__(
         self,

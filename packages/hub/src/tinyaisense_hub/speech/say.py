@@ -4,7 +4,7 @@ share one stream, back to back."""
 import asyncio
 import contextlib
 import logging
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 
@@ -60,14 +60,18 @@ class Say:
     """Where each clause's audio ends on the stream, as it's fed."""
     end: int | None = None
     """Where its audio ends on the stream, once it's all fed, or the TTS failed on it."""
+    then: Callable[[], JsonObject] | None = None
+    """What it does if its stream drains after it, with no `say` following: `then_listen`.
+    Returns what its result adds."""
 
     def finish(self, reason: EndReason, played: int) -> None:
-        """Set its result, given how much of the stream played, in bytes, and send
-        `say.ended`. The audio it had played by then is what it played, and its `heard_text`
-        is the text of its clauses that played through. It was `interrupted` unless every
-        clause did."""
+        """Set its result, given why the stream ended, or `drained` for a `say` another
+        follows, and how much of it played, in bytes; and send `say.ended`. The audio it had
+        played by then is what it played, and its `heard_text` is the text of its clauses
+        that played through. It was `interrupted` unless every clause did."""
         if self.done.done():
             return
+        drained = reason == "drained"
         if self.start is None:
             played_ms, heard = 0, 0
         else:
@@ -83,6 +87,8 @@ class Say:
             "interrupted": reason != "drained" or heard < len(clauses),
             "heard_text": text[: clauses[heard - 1].end].strip() if heard else "",
         }
+        if drained and self.then is not None:
+            result |= self.then()
         self.done.set_result(result)
         self.session.notify("say.ended", {"address": self.address, "text": text, **result})
 
@@ -153,8 +159,15 @@ class Run:
         return self._closed and self._stream is not None and self._stream.open
 
     def add(self, say: Say) -> None:
+        self.followed()
         self.says.append(say)
         self._wake.set()
+
+    def followed(self) -> None:
+        """A `say` follows its last one on the speaker, in it or in the run after it: the
+        speaker doesn't drain after that one, which doesn't listen then."""
+        if self.says:
+            self.says[-1].then = None
 
     def replace(self) -> None:
         """A newer run cuts in: this one's stream, if it starts yet, is preempted."""

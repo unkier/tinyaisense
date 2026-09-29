@@ -86,7 +86,7 @@ async def test_the_session_ends_with_shutdown_when_the_hub_closes(hub: Hub) -> N
 
 
 class NullSink:
-    def notify(self, method: str, params: JsonObject) -> None:
+    def notify(self, method: str, params: JsonObject, after: int | None = None) -> None:
         pass
 
     def ended(self, reason: EndReason) -> None:
@@ -105,11 +105,12 @@ async def test_no_session_starts_once_the_hub_is_shutting_down(tmp_path: Path) -
         asyncio.DatagramProtocol, local_addr=("127.0.0.1", 0)
     )
     control = Control(Timing())
-    sessions = Sessions(control)
+    speech = Speech(SpeechConfig(), control, Timing())
+    sessions = Sessions(control, speech)
     registry = Registry(
         StateStore(tmp_path), udp=udp, timing=Timing(), auto_approve=False, observer=control
     )
-    core = Core(registry, sessions, control, Speech(SpeechConfig(), control), TOKEN)
+    core = Core(registry, sessions, control, speech, TOKEN)
 
     await core.shutdown()
     udp.close()

@@ -78,8 +78,11 @@ class Session:
         self._pending: dict[int, asyncio.Future[JsonObject]] = {}
         self._notifications: asyncio.Queue[Notification | None] = asyncio.Queue()
         self._audio: dict[int, asyncio.Queue[HubAudio | None]] = {}
-        """Each stream's frames, by handle, from `stream.started` until read. None ends a
-        stream's."""
+        """Each stream's frames, by handle, from `stream.started` or `utterance.start` until
+        read. None ends a stream's."""
+        self._utterance_handles: dict[int, int] = {}
+        """The handle of each Utterance whose audio is coming, by utterance id."""
+        self._cancels: set[asyncio.Task[None]] = set()
         self._reader = asyncio.create_task(self._read())
 
     async def __aenter__(self) -> Session:
@@ -94,17 +97,23 @@ class Session:
         await self.close()
 
     async def call(self, method: str, **params: Any) -> JsonObject:
-        """Make a request and return its result. Raises `ApiError` or `SessionEnded`."""
+        """Make a request and return its result. Raises `ApiError` or `SessionEnded`.
+        Cancelling it cancels the request on the hub, e.g. ends a `listen` `stopped`."""
         if self.ended is not None:
             raise SessionEnded(self.ended)
         request_id = next(self._ids)
         reply = self._pending[request_id] = asyncio.get_running_loop().create_future()
-        message = {"jsonrpc": "2.0", "id": request_id, "method": method, "params": params}
         try:
-            await self._ws.send(json.dumps(message, separators=(",", ":"), ensure_ascii=False))
-            return await reply
+            await self._send(request_id, method, params)
+            return await asyncio.shield(reply)
         except ConnectionClosed:
             raise SessionEnded(self.ended or "closed") from None
+        except asyncio.CancelledError:
+            if not reply.done() and self.ended is None:
+                cancel = asyncio.create_task(self._cancel(request_id))
+                self._cancels.add(cancel)
+                cancel.add_done_callback(self._cancels.discard)
+            raise
         finally:
             self._pending.pop(request_id, None)
 
@@ -168,6 +177,7 @@ class Session:
         voice: str | None = None,
         lang: str | None = None,
         replace: bool = False,
+        then_listen: bool | JsonObject = False,
     ) -> JsonObject:
         """Speak `text` on the speaker at `address`, e.g. `kitchen/speaker`. Returns once it
         has played, or been cut: `{reason, played_ms, interrupted, heard_text}`, where
@@ -176,14 +186,14 @@ class Session:
         A `say` queued on a speaker plays right after the ones before it; with `replace`, it
         cuts them off instead, and they end `preempted`. `voice` is a Voice id from `voices`.
         Without one, the hub speaks in its default Voice for `lang`, or for the language the
-        text is written in."""
+        text is written in.
+
+        `then_listen` listens on the device's mic once it has played to its end, as `listen`
+        does, and the result carries the `utterance_id` it comes as. It may be `{lang,
+        utterances}`, as `listen` takes; or `{raw: true}`, for a raw mic stream instead,
+        which comes as a `stream.started`."""
         params: JsonObject = {"address": address, "text": text}
-        if voice is not None:
-            params["voice"] = voice
-        if lang is not None:
-            params["lang"] = lang
-        if replace:
-            params["replace"] = True
+        _say_params(params, voice, lang, replace, then_listen)
         return await self.call("say", **params)
 
     async def say_open(
@@ -193,21 +203,17 @@ class Session:
         voice: str | None = None,
         lang: str | None = None,
         replace: bool = False,
+        then_listen: bool | JsonObject = False,
     ) -> int:
         """Start speaking text that comes in pieces, e.g. an LLM's reply as it streams, on the
         speaker at `address`. Returns its handle: pass the text to `say_append`, then call
         `say_close`. Speech starts after the first clause, not after the whole text.
 
-        It's queued, or cuts in with `replace`, as `say` is. Without a `voice` or `lang`, the
-        hub speaks in its default Voice for the language of the first clause. Close it, or
-        the `say`s queued after it never play."""
+        It's queued, or cuts in with `replace`, as `say` is, and takes `then_listen` as `say`
+        does. Without a `voice` or `lang`, the hub speaks in its default Voice for the
+        language of the first clause. Close it, or the `say`s queued after it never play."""
         params: JsonObject = {"address": address}
-        if voice is not None:
-            params["voice"] = voice
-        if lang is not None:
-            params["lang"] = lang
-        if replace:
-            params["replace"] = True
+        _say_params(params, voice, lang, replace, then_listen)
         return cast(int, (await self.call("say.open", **params))["handle"])
 
     async def say_append(self, handle: int, text: str) -> None:
@@ -220,9 +226,27 @@ class Session:
         what `say` returns."""
         return await self.call("say.close", handle=handle)
 
+    async def listen(
+        self, address: str, *, lang: str | None = None, utterances: JsonObject | None = None
+    ) -> JsonObject:
+        """Hear what the human says on the mic at `address`, e.g. `kitchen/mic`, until their
+        turn is over. Returns the `utterance.end` params: `{utterance_id, reason, transcript,
+        lang, stats}`, the transcript and lang if the Session opted in to transcripts.
+
+        `lang` is the language to hear, if known. `utterances`, `{transcript, audio, rate}`,
+        overrides the Session's opt-in for this one; its audio comes on the `handle` in
+        `utterance.start`, to read with `audio`. Cancelling the call ends it `stopped`: what
+        was heard so far still comes, in `utterance.end`."""
+        params: JsonObject = {"address": address}
+        if lang is not None:
+            params["lang"] = lang
+        if utterances is not None:
+            params["utterances"] = utterances
+        return await self.call("listen", **params)
+
     async def audio(self, handle: int) -> AsyncIterator[HubAudio]:
-        """A mic stream's frames, in order, until the stream ends: 10 ms of PCM each (s16le
-        mono, at the stream's rate), with its `index` on the stream's timeline. The hub
+        """A mic stream's frames, or an Utterance's, in order, until it ends: 10 ms of PCM
+        each (s16le mono, at the stream's rate), with its `index` on the stream's timeline. The hub
         zero-fills audio lost on the network, so a gap in `index` means that the hub skipped
         frames because they weren't read in time. Read each stream's frames once: they queue
         up until they are."""
@@ -266,6 +290,21 @@ class Session:
             for queue in self._audio.values():
                 queue.put_nowait(None)
 
+    def _audio_ended(self, handle: int) -> None:
+        if (queue := self._audio.pop(handle, None)) is not None:
+            if not queue.empty():
+                self._audio[handle] = queue  # for the reader still to come
+            queue.put_nowait(None)
+
+    async def _send(self, request_id: int, method: str, params: JsonObject) -> None:
+        message = {"jsonrpc": "2.0", "id": request_id, "method": method, "params": params}
+        await self._ws.send(json.dumps(message, separators=(",", ":"), ensure_ascii=False))
+
+    async def _cancel(self, request_id: int) -> None:
+        """Cancel a request, not waiting for the hub's reply."""
+        with contextlib.suppress(ConnectionClosed):
+            await self._send(next(self._ids), "cancel", {"id": request_id})
+
     def _receive_audio(self, data: bytes) -> None:
         try:
             frame = decode_hub_audio(data)
@@ -283,11 +322,15 @@ class Session:
             elif notification.method == "stream.started":
                 self._audio[notification.params["handle"]] = asyncio.Queue()
             elif notification.method == "stream.ended":
-                handle = notification.params["handle"]
-                if (queue := self._audio.pop(handle, None)) is not None:
-                    if not queue.empty():
-                        self._audio[handle] = queue  # for the reader still to come
-                    queue.put_nowait(None)
+                self._audio_ended(notification.params["handle"])
+            elif notification.method == "utterance.start":
+                if (handle := notification.params.get("handle")) is not None:
+                    self._utterance_handles[notification.params["utterance_id"]] = handle
+                    self._audio[handle] = asyncio.Queue()
+            elif notification.method == "utterance.end":
+                utterance_id = notification.params["utterance_id"]
+                if (handle := self._utterance_handles.pop(utterance_id, None)) is not None:
+                    self._audio_ended(handle)
             self._notifications.put_nowait(notification)
             return
         reply = self._pending.get(message.get("id", -1))
@@ -299,6 +342,23 @@ class Session:
             reply.set_exception(ApiError(data.get("code", "failed"), error["message"], data))
         else:
             reply.set_result(message["result"])
+
+
+def _say_params(
+    params: JsonObject,
+    voice: str | None,
+    lang: str | None,
+    replace: bool,
+    then_listen: bool | JsonObject,
+) -> None:
+    if voice is not None:
+        params["voice"] = voice
+    if lang is not None:
+        params["lang"] = lang
+    if replace:
+        params["replace"] = True
+    if then_listen:
+        params["then_listen"] = then_listen
 
 
 class _Connect:

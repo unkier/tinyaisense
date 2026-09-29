@@ -174,7 +174,7 @@ The cancelled request still gets its reply. Cancelling a request that has finish
 - **Cause before effect:** `button.down`, then the cut `say` result or `stream.ended` with reason `reflex`, then `utterance.start`.
 - Across devices, in the order the hub received them.
 - A stream's binary frames come after its `stream.start` reply or `stream.started`, and before its `stream.ended`. An Utterance's frames come after its `utterance.start` and before its `utterance.end`.
-- JSON messages never wait behind audio frames: the hub sends every pending JSON message before the next audio frame. The one exception is a stream's `stream.ended`, which waits for that stream's own last frames, so other messages may overtake it.
+- JSON messages never wait behind audio frames: the hub sends every pending JSON message before the next audio frame. The exceptions are a stream's `stream.ended`, and an Utterance's `utterance.end` and `listen` reply, which wait for their own last frames, so other messages may overtake them.
 
 ### The Interrupt contract
 
@@ -242,10 +242,12 @@ The hub turns text into speech and speech into text in its own speech layer. Age
 | `interrupted` | whether it ended before playing to the end |
 | `heard_text` | the text the human heard: the original text of the chunks that played in full. A chunk cut halfway is left out |
 | `degraded` | present and `true` if the cloud speech engine failed and a local one stood in |
-| `utterance_id` | with `then_listen`: the Utterance it opened |
+| `utterance_id` | with `then_listen`, if the speaker drained after it: the Utterance it opened |
 
 - **Language:** an explicit `lang`, else the text's dominant script (Cyrillic → `ru`, anything else → `en`), else the hub default. `voice` defaults to the hub's Voice for that language. One Voice per `say`.
-- **`then_listen`** (`true` or `{raw: true}`, plus listen params): the hub opens the mic as soon as the speaker drains, with no round trip to the agent. The Utterance arrives as notifications, so `say` doesn't wait for the human's answer. With `raw: true` the hub opens a raw mic stream instead, announced by `stream.started`.
+- **`then_listen`** (`true` or `{raw: true}`, plus listen params): the hub opens the device's mic as soon as the speaker drains, with no round trip to the agent. The Utterance arrives as notifications, so `say` doesn't wait for the human's answer. With `raw: true` the hub opens a raw mic stream instead, at the `utterances` rate, announced by `stream.started`.
+  - Only a `say` the speaker drains after listens: not one that's cut, nor one another `say` follows on the speaker.
+  - A device with no mic gets `unsupported`, as does a hub with no STT engine unless `raw`.
 - With no TTS engine, `say` gets `unsupported`.
 - Every `say` also ends with a `say.ended` notification, sent just before its reply.
 
@@ -266,7 +268,7 @@ The hub turns text into speech and speech into text in its own speech layer. Age
 An **Utterance** is one span of human speech captured from a mic, delivered as a unit however it started:
 
 - `utterance.start{utterance_id, address, trigger, handle?}`. `trigger` is `listen`, `then_listen` or `button`. `handle` names the stream carrying its audio, if the agent opted in to audio.
-- `transcript.partial{utterance_id, text, lang}`: one per speech segment, if the agent opted in to transcripts.
+- `transcript.partial{utterance_id, text, lang}`: one per speech segment that the STT heard words in, if the agent opted in to transcripts. The Utterance's `lang` is that of its longest such segment.
 - `utterance.end{utterance_id, reason, transcript?, lang?, degraded?, stats}`. `stats` is `{duration_ms, lost}`.
 
 **Opt-in.** `hello{utterances}` sets the Session default, and each `listen` can override it:
@@ -283,7 +285,7 @@ With no STT engine, Utterances carry no transcript, and `listen` gets `unsupport
 
 | `reason` | Why |
 |---|---|
-| `stopped` | the agent cancelled the `listen` |
+| `stopped` | the agent cancelled the `listen`, or took its mic: another stream or `listen` on it, or on its `exclusive` peer |
 | `end_of_turn` | the human finished speaking: silence plus the end-of-turn model |
 | `no_speech` | 8 s without speech |
 | `max_duration` | 60 s in all |
@@ -292,6 +294,7 @@ With no STT engine, Utterances carry no transcript, and `listen` gets `unsupport
 | `disconnected` | the device dropped, or the Session ended |
 
 **`listen{address, lang?, utterances?}`** opens the mic and replies with the `utterance.end` params, sent right after the notification.
+- Its audio, if the agent opted in, comes on the `handle` in `utterance.start`: a stream with no `stream.*` notifications, which ends with the Utterance.
 - A button press during a `listen` hands it to the human: the stream carries on without a restart, and the release ends it with `button`. The audio from before the press is kept.
 - **Push-to-talk:** a press on an armed device with no `listen` running always delivers an Utterance, with trigger `button`.
 - With no Session, the Reflex is disarmed and a press only produces raw Events, which nobody receives.

@@ -1,5 +1,5 @@
 """The fake speech plugin, for tests: text spoken as tones by `FakeTts`, and heard back by
-`FakeStt`.
+`FakeStt`, `FakeVad` and `FakeTurn`.
 
 Each character is one 10 ms symbol of two tones, one from a low group and one from a high
 group, at whole multiples of 100 Hz so that the symbols of a 10 ms window never blur into each
@@ -12,7 +12,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from .engines import Stt, Transcript, Tts
+from .engines import Stt, Transcript, Tts, Turn, Vad
 from .text import language
 
 SYMBOL_MS = 10
@@ -35,6 +35,8 @@ _HIGH_FIRST = 17
 _AMPLITUDE = 6000
 """Of each tone."""
 _SILENT_RMS = 500.0
+TURN_ENDS = ".!?…"
+"""`FakeTurn` hears a turn end at these marks."""
 
 
 def encode(text: str, rate: int = 16000, register: int = 0) -> bytes:
@@ -129,3 +131,23 @@ class FakeStt(Stt):
     def transcribe(self, pcm: bytes, lang: str | None) -> Transcript:
         text = decode(pcm, self.rate).text.replace(SILENCE, "")
         return Transcript(text, lang or language(text) or self.languages[0])
+
+
+class FakeVad(Vad):
+    """Hears any tone as speech, and nothing else."""
+
+    def new_state(self) -> object:
+        return None
+
+    def probability(self, state: object, pcm: bytes) -> float:
+        samples = np.frombuffer(pcm, "<i2").astype(np.float64)
+        return float(np.sqrt(np.mean(samples**2)) >= _SILENT_RMS)
+
+
+class FakeTurn(Turn):
+    """Hears a turn as complete when the last thing said ends it: a full stop, a question
+    mark or the like."""
+
+    def complete(self, pcm: bytes) -> float:
+        heard = decode(pcm, self.rate).text.replace(SILENCE, "")
+        return float(heard.endswith(tuple(TURN_ENDS)))

@@ -42,6 +42,17 @@ class Timing:
     agent_audio_ms: int = 2000
     """How much audio may wait for an agent's socket. Past it, the oldest frames are
     skipped."""
+    segment_silence_ms: int = 200
+    """A segment of speech ends after this much silence."""
+    turn_silence_ms: int = 1000
+    """After a segment, this much silence ends the human's turn, whatever the end-of-turn
+    model says. More than `segment_silence_ms`."""
+    no_speech_ms: int = 8000
+    """A listen that hears no speech for this long ends with `no_speech`."""
+    listen_max_ms: int = 60000
+    """A listen ends with `max_duration` after this long."""
+    thinking_ms: int = 60000
+    """A device shows `thinking` for at most this long after an Utterance is delivered."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -76,6 +87,13 @@ class SpeechConfig:
     """By a name of the owner's choosing, which the roles refer to."""
     tts: dict[str, str] = field(default_factory=dict[str, str])
     """Language → the engine that speaks it."""
+    stt: dict[str, str] = field(default_factory=dict[str, str])
+    """Language → the engine that hears it."""
+    vad: str | None = None
+    """The engine that tells speech from silence. Listening needs one."""
+    turn: str | None = None
+    """The engine that tells when the human has finished their turn. Without one, silence
+    alone does."""
     voices: tuple[VoiceConfig, ...] = ()
     """The first Voice of each language is its default."""
     lang: str = "en"
@@ -88,9 +106,14 @@ class SpeechConfig:
 
     def check(self) -> None:
         """Raises `ConfigError` if the engines, languages and Voices don't hold together."""
-        for lang, name in self.tts.items():
+        roles = [(f"tts.{lang}", name) for lang, name in self.tts.items()]
+        roles += [(f"stt.{lang}", name) for lang, name in self.stt.items()]
+        roles += [(role, name) for role, name in (("vad", self.vad), ("turn", self.turn)) if name]
+        for role, name in roles:
             if name not in self.engines:
-                raise ConfigError(f"speech.tts.{lang}: no engine {name!r} in [speech.engines]")
+                raise ConfigError(f"speech.{role}: no engine {name!r} in [speech.engines]")
+        if self.stt and self.vad is None:
+            raise ConfigError("speech.stt needs a speech.vad engine, to tell speech from silence")
         ids: set[str] = set()
         for voice in self.voices:
             if voice.id in ids:
@@ -143,7 +166,7 @@ http = {config.http_port}
 {timing}
 
 # Speech: the engines, and the Voices agents speak in. With no TTS engine, `say` is
-# unsupported.
+# unsupported; with no STT engine, `listen` is.
 [speech]
 # The language of text that doesn't show its own: en or ru.
 lang = "{speech.lang}"
@@ -163,6 +186,17 @@ speaker_latency_ms = {speech.speaker_latency_ms}
 #
 # [speech.tts]
 # en = "my_tts"
+#
+# The engines that hear each language, the one that tells speech from silence (which
+# listening needs), and the one that tells when the human has finished their turn (without
+# it, 1 s of silence does). They take 16 kHz audio.
+#
+# [speech]
+# vad = "my_vad"
+# turn = "my_turn"
+#
+# [speech.stt]
+# en = "my_stt"
 #
 # The Voices: agents pick one by `id`. The first of each language is its default.
 #
@@ -200,22 +234,28 @@ def parse_config(text: str) -> Config:
         raise ConfigError(
             "timing.agent_dead_after_ms must be more than timing.agent_ping_interval_ms"
         )
+    if config.timing.turn_silence_ms <= config.timing.segment_silence_ms:
+        raise ConfigError("timing.turn_silence_ms must be more than timing.segment_silence_ms")
     return config
 
 
 def _speech(table: _Table) -> SpeechConfig:
     engines = table.table("engines")
     tts = table.table("tts")
+    stt = table.table("stt")
     defaults = SpeechConfig()
     speech = SpeechConfig(
         engines={name: _engine(engines.table(name)) for name in engines.names()},
         tts={lang: tts.string(lang) for lang in tts.names()},
+        stt={lang: stt.string(lang) for lang in stt.names()},
+        vad=table.optional_string("vad"),
+        turn=table.optional_string("turn"),
         voices=tuple(_voice(voice) for voice in table.tables("voices")),
         lang=table.string("lang", defaults.lang),
         say_ahead_ms=table.positive_int("say_ahead_ms", defaults.say_ahead_ms),
         speaker_latency_ms=table.positive_int("speaker_latency_ms", defaults.speaker_latency_ms),
     )
-    for checked in (table, engines, tts):
+    for checked in (table, engines, tts, stt):
         checked.check_unknown()
     speech.check()
     return speech
@@ -335,6 +375,10 @@ class _Table:
         if not isinstance(value, str) or not value:
             raise ConfigError(f"{self._key(key)} must be a non-empty string")
         return value
+
+    def optional_string(self, key: str) -> str | None:
+        """A non-empty string, or None if it's left out."""
+        return None if self._table.get(key) is None else self.string(key)
 
     def port(self, key: str, default: int) -> int:
         value = self._get(key)

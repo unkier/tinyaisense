@@ -5,11 +5,12 @@ facade: it parses and checks requests, calls the core, and writes replies and no
 """
 
 import asyncio
+import functools
 import json
 import logging
 from collections import Counter, deque
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, cast
 
 from starlette.applications import Starlette
@@ -30,7 +31,7 @@ from .config import Timing
 from .core import Core
 from .errors import HubError, HubErrorCode
 from .resampler import RATES
-from .session import EndReason, Session, UtteranceOptIn
+from .session import EndReason, Session, ThenListen, UtteranceOptIn
 
 _PARSE_ERROR = -32700
 _INVALID_REQUEST = -32600
@@ -45,6 +46,15 @@ _POLICY = 1008
 """WebSocket close codes."""
 
 _RATES = list(RATES)
+_UTTERANCES: Schema = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "transcript": {"type": "boolean"},
+        "audio": {"type": "boolean"},
+        "rate": {"type": "integer", "enum": _RATES},
+    },
+}
 _HELLO: Schema = {
     "type": "object",
     "required": ["token"],
@@ -52,15 +62,7 @@ _HELLO: Schema = {
     "properties": {
         "token": {"type": "string"},
         "takeover": {"type": "boolean"},
-        "utterances": {
-            "type": "object",
-            "additionalProperties": False,
-            "properties": {
-                "transcript": {"type": "boolean"},
-                "audio": {"type": "boolean"},
-                "rate": {"type": "integer", "enum": _RATES},
-            },
-        },
+        "utterances": _UTTERANCES,
     },
 }
 _NO_PARAMS: Schema = {"type": "object", "additionalProperties": False}
@@ -97,6 +99,15 @@ _HANDLE: Schema = {
     "additionalProperties": False,
     "properties": {"handle": {"type": "integer", "minimum": 0, "maximum": 65535}},
 }
+_THEN_LISTEN: Schema = {
+    "type": ["boolean", "object"],
+    "additionalProperties": False,
+    "properties": {
+        "raw": {"type": "boolean"},
+        "lang": {"type": "string"},
+        "utterances": _UTTERANCES,
+    },
+}
 _SAY: Schema = {
     "type": "object",
     "required": ["address", "text"],
@@ -107,6 +118,7 @@ _SAY: Schema = {
         "voice": {"type": "string"},
         "lang": {"type": "string"},
         "replace": {"type": "boolean"},
+        "then_listen": _THEN_LISTEN,
     },
 }
 _SAY_OPEN: Schema = {
@@ -118,6 +130,7 @@ _SAY_OPEN: Schema = {
         "voice": {"type": "string"},
         "lang": {"type": "string"},
         "replace": {"type": "boolean"},
+        "then_listen": _THEN_LISTEN,
     },
 }
 _SAY_APPEND: Schema = {
@@ -129,6 +142,22 @@ _SAY_APPEND: Schema = {
         "text": {"type": "string"},
     },
 }
+_LISTEN: Schema = {
+    "type": "object",
+    "required": ["address"],
+    "additionalProperties": False,
+    "properties": {
+        "address": {"type": "string"},
+        "lang": {"type": "string"},
+        "utterances": _UTTERANCES,
+    },
+}
+_CANCEL: Schema = {
+    "type": "object",
+    "required": ["id"],
+    "additionalProperties": False,
+    "properties": {"id": {"type": ["string", "integer"]}},
+}
 _log = logging.getLogger("tinyaisense_hub.agent_api")
 
 
@@ -139,7 +168,15 @@ def agent_app(core: Core, timing: Timing) -> Starlette:
     return Starlette(routes=[WebSocketRoute("/agent", agent)])
 
 
-type _Method = Callable[[JsonObject], Awaitable[JsonObject]]
+@dataclass(frozen=True, slots=True)
+class _After:
+    """A result whose reply waits behind the audio frames queued on `handle`, if any."""
+
+    result: JsonObject
+    handle: int | None
+
+
+type _Method = Callable[[JsonObject], Awaitable[JsonObject | _After]]
 
 
 @dataclass(frozen=True, slots=True)
@@ -169,6 +206,8 @@ class AgentLink:
         self._close_code: int | None = None
         """Once set, the writer closes the link after the control lane is sent."""
         self._requests: set[asyncio.Task[None]] = set()
+        self._stops: dict[str | int, asyncio.Event] = {}
+        """What `cancel` sets to stop each request that can be, by request id."""
         self._methods: dict[str, tuple[Schema, _Method]] = {
             "devices": (_NO_PARAMS, self._devices),
             "voices": (_NO_PARAMS, self._voices),
@@ -181,6 +220,8 @@ class AgentLink:
             "say.open": (_SAY_OPEN, self._say_open),
             "say.append": (_SAY_APPEND, self._say_append),
             "say.close": (_HANDLE, self._say_close),
+            "listen": (_LISTEN, self._listen),
+            "cancel": (_CANCEL, self._cancel),
         }
 
     async def run(self) -> None:
@@ -199,18 +240,14 @@ class AgentLink:
 
     # SessionSink.
 
-    def notify(self, method: str, params: JsonObject) -> None:
+    def notify(self, method: str, params: JsonObject, after: int | None = None) -> None:
         message: JsonObject = {"jsonrpc": "2.0", "method": method, "params": params}
-        if method == "stream.ended" and (lane := self._lanes.get(params["handle"])):
-            # After the stream's own last frames, which nothing else waits behind.
-            lane.append(_encode(message))
-            return
         if method == "session.ended":
             # Nothing follows it: the streams' last frames and ends go first.
             for lane in self._lanes.values():
                 self._control.extend(lane)
             self._lanes.clear()
-        self._send(message)
+        self._send(message, after)
 
     def ended(self, reason: EndReason) -> None:
         self._finish(_GOING_AWAY if reason == "shutdown" else _NORMAL)
@@ -269,9 +306,16 @@ class AgentLink:
             except SchemaError as e:
                 self._error(request.id, _INVALID_PARAMS, "invalid_args", str(e))
                 return
+            stop = None
+            if request.method == "listen":
+                # Stopped by a `cancel` naming its id.
+                stop = self._stops[request.id] = asyncio.Event()
+                run = functools.partial(self._listen, stop=stop)
             task = asyncio.create_task(self._request(request.id, run, request.params))
             self._requests.add(task)
             task.add_done_callback(self._requests.discard)
+            if stop is not None:
+                task.add_done_callback(lambda _: self._forget_stop(request.id, stop))
 
     def _audio(self, data: bytes) -> None:
         assert self._session is not None
@@ -353,7 +397,10 @@ class AgentLink:
             _log.exception("agent request failed")
             self._error(request_id, _INTERNAL_ERROR, "failed", "failed; see the hub log")
         else:
-            self._reply(request_id, result)
+            if isinstance(result, _After):
+                self._reply(request_id, result.result, result.handle)
+            else:
+                self._reply(request_id, result)
 
     # Methods.
 
@@ -398,6 +445,7 @@ class AgentLink:
             voice=params.get("voice"),
             lang=params.get("lang"),
             replace=params.get("replace", False),
+            then_listen=self._then_listen(params),
         )
 
     async def _say_open(self, params: JsonObject) -> JsonObject:
@@ -408,6 +456,7 @@ class AgentLink:
             voice=params.get("voice"),
             lang=params.get("lang"),
             replace=params.get("replace", False),
+            then_listen=self._then_listen(params),
         )
         return {"handle": handle}
 
@@ -422,10 +471,48 @@ class AgentLink:
         assert self._session is not None
         return await self._core.say_close(self._session, params["handle"])
 
+    async def _listen(self, params: JsonObject, stop: asyncio.Event | None = None) -> _After:
+        assert self._session is not None
+        result, handle = await self._core.listen(
+            self._session,
+            params["address"],
+            lang=params.get("lang"),
+            utterances=self._utterances(params),
+            stop=stop,
+        )
+        # Like `utterance.end`, after the Utterance's last frames.
+        return _After(result, handle)
+
+    async def _cancel(self, params: JsonObject) -> JsonObject:
+        # Only a `listen` stops, for now.
+        if (stop := self._stops.get(params["id"])) is not None:
+            stop.set()
+        return {}
+
+    def _utterances(self, params: JsonObject) -> UtteranceOptIn:
+        """The Session's Utterance opt-in, as `params` override it."""
+        assert self._session is not None
+        return replace(self._session.utterances, **params.get("utterances", {}))
+
+    def _then_listen(self, params: JsonObject) -> ThenListen | None:
+        then: bool | JsonObject = params.get("then_listen", False)
+        if then is False:
+            return None
+        options: JsonObject = {} if then is True else then
+        return ThenListen(
+            raw=options.get("raw", False),
+            lang=options.get("lang"),
+            utterances=self._utterances(options),
+        )
+
+    def _forget_stop(self, request_id: str | int, stop: asyncio.Event) -> None:
+        if self._stops.get(request_id) is stop:
+            del self._stops[request_id]
+
     # Writing.
 
-    def _reply(self, request_id: object, result: JsonObject) -> None:
-        self._send({"jsonrpc": "2.0", "id": request_id, "result": result})
+    def _reply(self, request_id: object, result: JsonObject, after: int | None = None) -> None:
+        self._send({"jsonrpc": "2.0", "id": request_id, "result": result}, after)
 
     def _error(
         self,
@@ -438,8 +525,14 @@ class AgentLink:
         error = {"code": code, "message": message, "data": {"code": hub_code} | (data or {})}
         self._send({"jsonrpc": "2.0", "id": request_id, "error": error})
 
-    def _send(self, message: JsonObject) -> None:
-        if self._close_code is None:
+    def _send(self, message: JsonObject, after: int | None = None) -> None:
+        """Queue `message` on the control lane; or, `after` a handle, behind the audio frames
+        of it queued so far, which nothing else waits behind."""
+        if self._close_code is not None:
+            return
+        if after is not None and (lane := self._lanes.get(after)):
+            lane.append(_encode(message))
+        else:
             self._control.append(_encode(message))
             self._wake.set()
 

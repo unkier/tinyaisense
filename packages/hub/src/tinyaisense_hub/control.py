@@ -15,18 +15,20 @@ from typing import Any, Literal
 
 from tinyaisense_wire import KINDS, Capability, Event, JsonObject, Manifest
 
-from .alarm import now_us
+from .alarm import Alarm, now_us
 from .config import Timing
 from .devices import CommandSpec, DeviceConnection, check_args, volume_commands
 from .errors import HubError
+from .keepalive import Tick
 from .mic import MicStream
 from .session import Session
 from .speaker import DRAINED, STOP_RESULT, STOPPED, Speakers, SpeakerStream, stats
 from .state import DeviceRecord
 from .streams import FORMAT, EndReason, Stream, StreamEnd
+from .thinking import Delivered, Moved, Thinking
 
 type _Op[T] = Callable[[], Coroutine[Any, Any, T]]
-type _HubStatus = Literal["no_agent", "agent"]
+type _HubStatus = Literal["no_agent", "agent", "thinking"]
 
 _PREFILL_MS = 40
 """A speaker stream's default `prefill_ms`."""
@@ -39,9 +41,19 @@ _log = logging.getLogger("tinyaisense_hub.control")
 class Controller:
     """One online Connection's controller: its ops run one at a time, in order."""
 
-    def __init__(self, conn: DeviceConnection, workers: set[asyncio.Task[None]]) -> None:
-        """`workers` collects the task that runs the ops, while it runs."""
+    def __init__(
+        self,
+        conn: DeviceConnection,
+        workers: set[asyncio.Task[None]],
+        thinking: Thinking,
+        think: Callable[[Controller, Tick, int], None],
+    ) -> None:
+        """`workers` collects the task that runs the ops, while it runs. `think` runs the
+        `thinking` core when its deadline is due."""
         self.conn = conn
+        self.thinking = thinking
+        """Whether the device shows `thinking`, for the Session."""
+        self.thinking_alarm = Alarm(lambda now: think(self, Tick(), now))
         self._queue: deque[tuple[_Op[Any], asyncio.Future[Any]]] = deque()
         self._worker: asyncio.Task[None] | None = None
         self._workers = workers
@@ -122,7 +134,7 @@ class Control:
 
     def device_online(self, conn: DeviceConnection, record: DeviceRecord) -> None:
         """Bring the device up to date, then tell the Session it's online."""
-        controller = Controller(conn, self._workers)
+        controller = Controller(conn, self._workers, self._thinking(), self._think)
         self._controllers[conn.manifest.device_id] = controller
         _log_failure(controller.submit(lambda: self._bring_up(conn, record)))
 
@@ -144,6 +156,7 @@ class Control:
         if (controller := self._controllers.get(device_id)) is not None and controller.conn is conn:
             for stream in list(controller.streams.values()):
                 self._end(stream, "disconnected", None)
+            controller.thinking_alarm.cancel()
             del self._controllers[device_id]
         if self._session is not None:
             # By its welcome name: a rename or forget has changed the record already.
@@ -179,6 +192,8 @@ class Control:
         claims, self._claims = self._claims, {}
         ops: list[asyncio.Future[None]] = []
         for device_id, controller in self._controllers.items():
+            controller.thinking = self._thinking()
+            controller.thinking_alarm.cancel()
             ops.append(controller.submit(self._end_op(controller, session, claims.get(device_id))))
         await asyncio.gather(*ops, return_exceptions=True)
 
@@ -287,9 +302,19 @@ class Control:
             else:
                 tail = self._timing.mic_tail_ms * 1000
                 mic = MicStream(
-                    handle, session, conn, capability.id, stream_id, address, rate, tail=tail
+                    handle,
+                    session,
+                    conn,
+                    capability.id,
+                    stream_id,
+                    address,
+                    rate,
+                    audio=handle,
+                    tail=tail,
                 )
                 await self._open(controller, mic)
+            if capability.kind == "speaker":
+                self._think(controller, Moved())
             return handle
 
         return await controller.submit(op)
@@ -321,9 +346,55 @@ class Control:
             stream.on_starved = on_starved
             stream.on_end = on_end
             await self._open(controller, stream)
+            self._think(controller, Moved())
             return stream
 
         return await controller.submit(op)
+
+    async def mic_start(
+        self,
+        session: Session,
+        device: DeviceRecord,
+        capability: Capability,
+        *,
+        audio: int | None,
+        rate: int,
+        tap: Callable[[bytes], None],
+        on_started: Callable[[MicStream], None],
+        on_end: Callable[[StreamEnd], None],
+    ) -> MicStream:
+        """Open a mic stream that the hub runs itself, for a listen. The agent gets no
+        `stream.*` notifications for it: only its frames, on the handle `audio` at `rate`, if
+        given. `tap` takes each frame at the device's rate, from just after `on_started` is
+        called; `on_end` is called as the stream ends. It preempts as `stream_start` does, and
+        ends `thinking` on the device. Raises `HubError`."""
+        address = f"{device.name}/{capability.id}"
+        if not FORMAT.offered(capability.params):
+            raise HubError("unsupported", f"{address} has no 16 kHz mono PCM in 10 ms frames")
+        controller = self._controller(device)
+
+        async def op() -> MicStream:
+            self._require_current(session)
+            conn = controller.conn
+            stream_id = conn.stream_ids.open()
+            tail = self._timing.mic_tail_ms * 1000
+            stream = MicStream(
+                None, session, conn, capability.id, stream_id, address, rate, audio=audio, tail=tail
+            )
+            stream.tap = tap
+            stream.on_started = lambda: on_started(stream)
+            stream.on_end = on_end
+            await self._open(controller, stream)
+            self._think(controller, Moved())
+            return stream
+
+        return await controller.submit(op)
+
+    def utterance_delivered(self, device: DeviceRecord) -> None:
+        """An Utterance from `device` went to the agent: it shows `thinking`."""
+        controller = self._controllers.get(device.device_id)
+        if controller is not None:
+            self._think(controller, Delivered())
 
     def speaker_check(self, device: DeviceRecord, capability: Capability) -> None:
         """Raise the `HubError` that `speaker_start` would before it tries: `unsupported` for
@@ -417,7 +488,10 @@ class Control:
 
     async def stream_stop(self, session: Session, handle: int) -> StreamEnd:
         """End a stream at once. Raises `HubError`: `disconnected` if it has ended."""
-        stream = self._stream(session, handle)
+        return await self.stop(self._stream(session, handle))
+
+    async def stop(self, stream: Stream) -> StreamEnd:
+        """End a stream at once, with `stopped`. Returns how it ended, even if it had."""
         if stream.open:
             # Its audio stops now, even while the `stop` waits its turn on the device.
             self._halt(stream)
@@ -519,7 +593,7 @@ class Control:
             if conn.receivers.get(stream.stream_id) is stream:
                 del conn.receivers[stream.stream_id]
             # After the frames the agent's link still holds, which it no longer skips.
-            skipped = 0 if stream.handle is None else stream.session.audio_ended(stream.handle)
+            skipped = 0 if stream.audio is None else stream.session.audio_ended(stream.audio)
             stats = stream.stats(skipped=skipped)
         assert stats is not None
         conn.stream_ids.close(stream.stream_id)
@@ -529,12 +603,30 @@ class Control:
         end = StreamEnd(reason, stats)
         _log.info("%s: stream %d ended %s: %s", stream.address, stream.stream_id, reason, stats)
         stream.ended.set_result(end)
-        if isinstance(stream, SpeakerStream) and stream.on_end is not None:
+        if stream.on_end is not None:
             stream.on_end(end)
         if stream.handle is not None:
             if stream.session.streams.get(stream.handle) is stream:
                 del stream.session.streams[stream.handle]
-            stream.session.notify("stream.ended", {"handle": stream.handle, **end.to_json()})
+            stream.session.notify(
+                "stream.ended", {"handle": stream.handle, **end.to_json()}, after=stream.handle
+            )
+
+    def _thinking(self) -> Thinking:
+        return Thinking(timeout=self._timing.thinking_ms * 1000)
+
+    def _think(
+        self, controller: Controller, input: Delivered | Moved | Tick, now: int | None = None
+    ) -> None:
+        """Run the device's `thinking` core, and show what it says while the Session lasts."""
+        now = now_us() if now is None else now
+        for show in controller.thinking.handle(input, now):
+            if (
+                self._session is not None
+                and self._controllers.get(controller.conn.manifest.device_id) is controller
+            ):
+                _log_failure(controller.conn.command(*_status(show.state)))
+        controller.thinking_alarm.set(controller.thinking.next_deadline(), now)
 
     def _hub_status(self) -> _HubStatus:
         return "no_agent" if self._session is None else "agent"

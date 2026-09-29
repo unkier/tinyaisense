@@ -12,7 +12,7 @@ from .devices import DeviceConnection
 from .keepalive import Tick
 from .pacer import Close, Drain, Feed, Open, Overflow, Pacer, Remove, Send, Starved
 from .resampler import Resampler
-from .streams import FORMAT, Stream, StreamEnd
+from .streams import FORMAT, Stream
 
 if TYPE_CHECKING:
     from .session import Session  # it holds its streams
@@ -30,8 +30,6 @@ class SpeakerStream(Stream):
     """When the first frame went out, in µs on the hub's monotonic clock."""
     on_starved: Callable[[], None] | None = None
     """Called when the stream has sent every whole frame it was fed, and isn't draining."""
-    on_end: Callable[[StreamEnd], None] | None = None
-    """Called as the stream ends, before anything else hears of it."""
 
     def __init__(
         self,

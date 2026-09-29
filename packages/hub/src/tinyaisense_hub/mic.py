@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+from collections.abc import Callable
 from typing import TYPE_CHECKING
 
 from tinyaisense_wire import KINDS, JsonObject, SchemaError, StreamFrame, validate
@@ -22,14 +23,20 @@ _log = logging.getLogger("tinyaisense_hub.mic")
 
 
 class MicStream(Stream):
-    """One raw agent mic stream. Its frames reach the agent as a timeline at its rate, from
-    `started` on: frames that beat the `start` reply wait for it. After the `stop` reply's
+    """One mic stream. Its frames reach the agent on its `audio` handle, if it has one, as a
+    timeline at its rate, and its `tap`, if it has one, at the device's rate: both from
+    `started` on, as frames that beat the `start` reply wait for it. After the `stop` reply's
     `last_seq`, the stream is `finished` once its tail is in, or once it has waited `tail` µs
     for it."""
 
+    tap: Callable[[bytes], None] | None = None
+    """Takes each frame of the timeline, at the device's rate."""
+    on_started: Callable[[], None] | None = None
+    """Called as the stream starts, before the first frame goes out."""
+
     def __init__(
         self,
-        handle: int,
+        handle: int | None,
         session: Session,
         conn: DeviceConnection,
         cap: str,
@@ -37,26 +44,34 @@ class MicStream(Stream):
         address: str,
         rate: int,
         *,
+        audio: int | None,
         tail: int,
     ) -> None:
         super().__init__(handle, session, conn, cap, stream_id, address, rate)
-        self._handle = handle
+        self.audio = audio
+        """The handle its frames reach the agent on: its own, for a raw stream; the
+        Utterance's, for a listen's; None if they don't."""
         self.dropped = 0
         """Frames the device dropped from its queue, from its `stop` reply."""
         self.finished: asyncio.Future[None] = asyncio.get_running_loop().create_future()
         self._assembler = MicAssembler(FORMAT, tail=tail)
-        self._resampler = None if rate == FORMAT.rate else Resampler(FORMAT.rate, rate)
-        """From the device's rate to the agent's; None if they're the same. Each frame comes
-        out as one frame, and the last 1 ms of the stream stays in it."""
+        self._resampler = (
+            None if audio is None or rate == FORMAT.rate else Resampler(FORMAT.rate, rate)
+        )
+        """From the device's rate to the agent's; None if they're the same, or the agent
+        gets no frames. Each frame comes out as one frame, and the last 1 ms of the stream
+        stays in it."""
         self._alarm = Alarm(self._tick)
         self._waiting: list[Deliver] | None = []
         """What the timeline holds before the `start` reply; None after it."""
 
     def started(self) -> None:
-        """The device replied to `start`: the agent gets the timeline from now on."""
+        """The device replied to `start`: the frames go out from now on."""
+        if self.on_started is not None:
+            self.on_started()
         waiting, self._waiting = self._waiting, None
         for frame in waiting or []:
-            self.session.audio(self._handle, frame.index, frame.pcm)
+            self._deliver(frame)
 
     def frame(self, frame: StreamFrame, now: int) -> None:
         self._run(Frame(frame.seq, frame.payload), now)
@@ -111,14 +126,19 @@ class MicStream(Stream):
             return
         for action in self._assembler.handle(input, now):
             match action:
-                case Deliver(index, pcm):
-                    if self._resampler is not None:
-                        action = Deliver(index, self._resampler.process(pcm))
+                case Deliver():
                     if self._waiting is not None:
                         self._waiting.append(action)
                     else:
-                        self.session.audio(self._handle, action.index, action.pcm)
+                        self._deliver(action)
                 case Finished():
                     self.close()
                     return
         self._alarm.set(self._assembler.next_deadline(), now)
+
+    def _deliver(self, frame: Deliver) -> None:
+        if self.tap is not None:
+            self.tap(frame.pcm)
+        if self.audio is not None:
+            pcm = frame.pcm if self._resampler is None else self._resampler.process(frame.pcm)
+            self.session.audio(self.audio, frame.index, pcm)

@@ -51,6 +51,11 @@ def test_init_writes_a_config_with_a_random_agent_token(
         "speaker_buffer_ms": 300000,
         "mic_tail_ms": 30,
         "agent_audio_ms": 2000,
+        "segment_silence_ms": 200,
+        "turn_silence_ms": 1000,
+        "no_speech_ms": 8000,
+        "listen_max_ms": 60000,
+        "thinking_ms": 60000,
     }
     assert config["speech"] == {"lang": "en", "say_ahead_ms": 3000, "speaker_latency_ms": 50}
     assert len(config["agent_token"]) >= 32
@@ -263,6 +268,70 @@ def test_serve_refuses_a_default_language_no_voice_speaks(
     assert main(["serve"]) == 1
 
     assert "speech.lang: no Voice speaks de" in capsys.readouterr().err
+
+
+LISTEN = """
+[speech]
+vad = "vad"
+turn = "turn"
+
+[speech.stt]
+en = "stt"
+ru = "stt"
+
+[speech.engines.vad]
+class = "tinyaisense_hub.speech.fake:FakeVad"
+
+[speech.engines.turn]
+class = "tinyaisense_hub.speech.fake:FakeTurn"
+
+[speech.engines.stt]
+class = "tinyaisense_hub.speech.fake:FakeStt"
+"""
+"""The fake listening engines, in place of what `init` wrote in [speech]."""
+
+
+@pytest.mark.parametrize(
+    ("speech", "error"),
+    [
+        (LISTEN.replace('vad = "vad"', ""), "speech.stt needs a speech.vad engine"),
+        (LISTEN.replace('vad = "vad"', 'vad = "silero"'), "speech.vad: no engine 'silero'"),
+        (LISTEN.replace('turn = "turn"', 'turn = "smart"'), "speech.turn: no engine 'smart'"),
+        (LISTEN.replace('ru = "stt"', 'ru = "vosk"'), "speech.stt.ru: no engine 'vosk'"),
+        (LISTEN.replace("fake:FakeVad", "fake:FakeStt"), "fake:FakeStt isn't a Vad"),
+        (
+            LISTEN.replace('FakeStt"', 'FakeStt"\nparams = { languages = ["en"] }'),
+            "speech engine 'stt' doesn't hear ru",
+        ),
+        (
+            LISTEN.replace('FakeStt"', 'FakeStt"\nparams = { rate = 24000 }'),
+            "speech engine 'stt' hears at 24000 Hz: the hub listens at 16000 Hz only",
+        ),
+    ],
+)
+def test_serve_refuses_listening_engines_that_dont_hold_together(
+    speech: str, error: str, xdg: dict[str, str], capsys: pytest.CaptureFixture[str]
+) -> None:
+    main(["init"])
+    config = Path(xdg["XDG_CONFIG_HOME"]) / "tinyaisense" / "hub.toml"
+    text = re.sub(r"^\[speech\]$", "[old_speech]", config.read_text(), flags=re.M)
+    config.write_text(text.split("[old_speech]")[0] + speech)
+
+    assert main(["serve"]) == 1
+
+    assert error in capsys.readouterr().err
+
+
+def test_serve_refuses_a_turn_silence_within_the_segment_silence(
+    xdg: dict[str, str], capsys: pytest.CaptureFixture[str]
+) -> None:
+    main(["init"])
+    config = Path(xdg["XDG_CONFIG_HOME"]) / "tinyaisense" / "hub.toml"
+    config.write_text(config.read_text().replace("turn_silence_ms = 1000", "turn_silence_ms = 200"))
+
+    assert main(["serve"]) == 1
+
+    assert "timing.turn_silence_ms must be more than" in capsys.readouterr().err
 
 
 def test_serve_says_when_its_port_is_taken(

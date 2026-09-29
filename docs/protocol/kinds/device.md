@@ -10,7 +10,7 @@ Contract data: [`contracts/device.json`](../../../packages/wire/src/tinyaisense_
 
 `{state}` → `{}`. Sets the hub layer of the Status: `no_agent`, `agent` or `thinking`.
 - The hub layer starts at `no_agent` on every `welcome`. Right after `welcome`, the hub sends `agent` if a Session exists and `no_agent` otherwise, then keeps it up to date: `agent` when a Session starts, `no_agent` when it ends.
-- `thinking` is set when an Utterance is delivered to the agent. It clears on the next speaker start or listen on that device, or after 60 s.
+- `thinking` is set when an Utterance is delivered to the agent with something to answer: one that ended `end_of_turn`, `max_duration` or `button`. It clears on the next speaker start or listen on that device, or after 60 s.
 
 ### `identify` (hub-only)
 

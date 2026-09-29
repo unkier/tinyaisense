@@ -13,7 +13,8 @@ from .errors import HubError
 from .streams import Stream
 
 if TYPE_CHECKING:
-    from .speech.say import Say  # a Session holds its open says
+    from .speech.listen import Listen  # a Session holds its listens
+    from .speech.say import Say  # and its open says
 
 type Holder = Literal["agent_api", "mcp"]
 """Which front-end claimed the Session."""
@@ -31,7 +32,10 @@ class SessionSink(Protocol):
     """Where a Session's notifications and audio go: its agent-API link. No method may
     block."""
 
-    def notify(self, method: str, params: JsonObject) -> None: ...
+    def notify(self, method: str, params: JsonObject, after: int | None = None) -> None:
+        """Send a notification; `after` a stream handle, behind the frames of it queued so
+        far."""
+        ...
 
     def audio(self, handle: int, index: int, pcm: bytes) -> None:
         """Frame `index` of stream `handle`'s timeline."""
@@ -56,6 +60,16 @@ class UtteranceOptIn:
     rate: int = 16000
 
 
+@dataclass(frozen=True, slots=True)
+class ThenListen:
+    """What a `say` with `then_listen` does once it has played: listen as `listen` does,
+    or open a `raw` mic stream at `utterances.rate`."""
+
+    raw: bool
+    lang: str | None
+    utterances: UtteranceOptIn
+
+
 @dataclass(eq=False, slots=True)
 class Session:
     holder: Holder
@@ -69,11 +83,16 @@ class Session:
     says: dict[int, Say] = field(default_factory=dict[int, "Say"])
     """The Session's streaming `say`s, by handle, from `say.open` until `say.close`. They
     share the handles of streams."""
+    listens: set[Listen] = field(default_factory=set["Listen"])
+    """The Session's listens, until their Utterances end. The handle of one that delivers
+    audio is taken, as a stream's is."""
     _last_handle: int = field(default=0, init=False)
+    _last_utterance: int = field(default=0, init=False)
 
-    def notify(self, method: str, params: JsonObject) -> None:
-        """Send a notification, stamped with `t`: now."""
-        self.sink.notify(method, params | {"t": _now_ms()})
+    def notify(self, method: str, params: JsonObject, after: int | None = None) -> None:
+        """Send a notification, stamped with `t`: now. `after` a stream handle, it follows
+        the frames of it queued so far."""
+        self.sink.notify(method, params | {"t": _now_ms()}, after)
 
     def audio(self, handle: int, index: int, pcm: bytes) -> None:
         self.sink.audio(handle, index, pcm)
@@ -84,12 +103,17 @@ class Session:
     def new_handle(self) -> int:
         """The next u16 handle after the last one used, round-robin from 1, skipping open
         ones. Raises `HubError`: `busy` if every handle is open."""
+        listening = {listen.handle for listen in self.listens}
         for step in range(1, _MAX_HANDLE + 1):
             handle = (self._last_handle + step - 1) % _MAX_HANDLE + 1
-            if handle not in self.streams and handle not in self.says:
+            if handle not in self.streams and handle not in self.says and handle not in listening:
                 self._last_handle = handle
                 return handle
         raise HubError("busy", "every stream handle is open")
+
+    def new_utterance_id(self) -> int:
+        self._last_utterance += 1
+        return self._last_utterance
 
 
 class DeviceControl(Protocol):
@@ -102,12 +126,21 @@ class DeviceControl(Protocol):
         ...
 
 
+class SpeechControl(Protocol):
+    """The speech layer, told when a Session ends."""
+
+    async def session_ended(self, session: Session) -> None:
+        """End the Session's listens, once their Utterances are delivered."""
+        ...
+
+
 class Sessions:
     """The Session manager."""
 
-    def __init__(self, control: DeviceControl) -> None:
+    def __init__(self, control: DeviceControl, speech: SpeechControl) -> None:
         self.current: Session | None = None
         self._control = control
+        self._speech = speech
         self._lock = asyncio.Lock()
         """Held while a Session starts or ends, so that a takeover ends the old one first."""
         self._shut_down = False
@@ -151,6 +184,7 @@ class Sessions:
         self.current = None
         _log.info("Session %s ended: %s", session.id, reason)
         await self._control.session_ended(session)
+        await self._speech.session_ended(session)
         if reason != "closed":  # else its link is gone
             session.notify("session.ended", {"reason": reason})
         session.sink.ended(reason)

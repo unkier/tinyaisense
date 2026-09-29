@@ -105,7 +105,7 @@ class Hub:
         loop = asyncio.get_running_loop()
         self._control = Control(self.config.timing)
         # First: a bad engine fails the start before anything is served.
-        self._speech = Speech(self.config.speech, self._control)
+        self._speech = Speech(self.config.speech, self._control, self.config.timing)
         await self._speech.start()
         port = self.config.device_port
         dual_stack = self._host is None and socket.has_dualstack_ipv6()
@@ -123,7 +123,7 @@ class Hub:
             self._udp, datagrams = await loop.create_datagram_endpoint(
                 Datagrams, local_addr=(self._host or "0.0.0.0", port)
             )
-        sessions = Sessions(self._control)
+        sessions = Sessions(self._control, self._speech)
         self._registry = Registry(
             StateStore(self._state_dir),
             udp=self._udp,

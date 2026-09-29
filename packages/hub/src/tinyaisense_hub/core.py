@@ -4,6 +4,7 @@ The agent-facing front-ends (the agent API, and MCP later) only translate betwee
 and these calls. Behaviour lives here and below.
 """
 
+import asyncio
 import secrets
 
 from tinyaisense_wire import Capability, JsonObject
@@ -11,7 +12,7 @@ from tinyaisense_wire import Capability, JsonObject
 from .control import Control
 from .devices import Registry
 from .errors import HubError
-from .session import Holder, Session, Sessions, SessionSink, UtteranceOptIn
+from .session import Holder, Session, Sessions, SessionSink, ThenListen, UtteranceOptIn
 from .speech.layer import Speech
 from .state import DeviceRecord
 
@@ -100,22 +101,45 @@ class Core:
         voice: str | None,
         lang: str | None,
         replace: bool,
+        then_listen: ThenListen | None = None,
     ) -> JsonObject:
         """Speak `text` on the speaker at `address`, after what's queued on it, or cutting it
-        off if `replace`. Returns how it went once it has played. Raises `HubError`."""
+        off if `replace`; then, if it plays to the end, listen on the device's mic as
+        `then_listen` says. Returns how it went once it has played. Raises `HubError`."""
         device, capability = self._speaker(address)
         return await self._speech.say(
-            session, device, capability, text, voice=voice, lang=lang, replace=replace
+            session,
+            device,
+            capability,
+            text,
+            voice=voice,
+            lang=lang,
+            replace=replace,
+            then_listen=then_listen,
         )
 
     def say_open(
-        self, session: Session, address: str, *, voice: str | None, lang: str | None, replace: bool
+        self,
+        session: Session,
+        address: str,
+        *,
+        voice: str | None,
+        lang: str | None,
+        replace: bool,
+        then_listen: ThenListen | None = None,
     ) -> int:
         """Start a `say` on the speaker at `address` whose text comes in with `say_append`,
-        queued as `say` would be. Returns its handle. Raises `HubError`."""
+        queued, and listening then, as `say` would be. Returns its handle. Raises
+        `HubError`."""
         device, capability = self._speaker(address)
         return self._speech.say_open(
-            session, device, capability, voice=voice, lang=lang, replace=replace
+            session,
+            device,
+            capability,
+            voice=voice,
+            lang=lang,
+            replace=replace,
+            then_listen=then_listen,
         )
 
     def say_append(self, session: Session, handle: int, text: str) -> None:
@@ -126,6 +150,26 @@ class Core:
         """No more text comes for the open `say` `handle`. Returns how it went once it has
         played. Raises `HubError`."""
         return await self._speech.say_close(session, handle)
+
+    async def listen(
+        self,
+        session: Session,
+        address: str,
+        *,
+        lang: str | None,
+        utterances: UtteranceOptIn,
+        stop: asyncio.Event | None = None,
+    ) -> tuple[JsonObject, int | None]:
+        """Hear an Utterance on the mic at `address`, in `lang` if given, delivered as
+        `utterances` says. Returns the `utterance.end` params once it's delivered, and the
+        handle its audio went to the agent on, if it did. Setting `stop` ends it `stopped`.
+        Raises `HubError`."""
+        device, capability = self._registry.resolve(address)
+        if capability.kind != "mic":
+            raise HubError("unsupported", f"{address} isn't a mic")
+        return await self._speech.listen(
+            session, device, capability, lang=lang, utterances=utterances, stop=stop
+        )
 
     def _speaker(self, address: str) -> tuple[DeviceRecord, Capability]:
         """The speaker at `address`. Raises `HubError`."""
