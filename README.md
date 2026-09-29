@@ -8,12 +8,15 @@ uv run tinyaisense-hub serve     # devices on port 8420, TCP and UDP; --auto-app
 uv run tinyaisense-hub devices   # paired and pending devices, online or offline, and when last seen
 uv run tinyaisense-hub approve a1b2c3 as kitchen
 uv run tinyaisense-hub rename kitchen den
+uv run tinyaisense-hub identify den 10  # blinks it white for 10 s (default 5), to tell it apart
+uv run tinyaisense-hub diag den      # uptime, reset reason, heap, RSSI, reconnects, stack high-water marks
+uv run tinyaisense-hub volume den 60 # 0 (mute) to 100; the hub re-applies it on every reconnect
 uv run tinyaisense-hub forget den
 ```
 
 The hub advertises itself over mDNS as `_tinyaisense._tcp`, so devices find it without an address; `serve --no-mdns` turns that off. Every timeout, such as the 2 s ping and the 6 s dead Connection, lives in the config's `[timing]`.
 
-The owner commands reach the running hub over a 0600 Unix socket in `$XDG_RUNTIME_DIR/tinyaisense/`, and no other way. Paired devices live in `$XDG_STATE_HOME/tinyaisense/state.json`.
+The owner commands reach the running hub over a 0600 Unix socket in `$XDG_RUNTIME_DIR/tinyaisense/`, and no other way. Paired devices, with their volumes, live in `$XDG_STATE_HOME/tinyaisense/state.json`.
 
 ## Development
 

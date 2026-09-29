@@ -76,6 +76,20 @@ def _parser() -> argparse.ArgumentParser:
     forget = commands.add_parser("forget", help="unpair a device; it must pair again")
     forget.add_argument("device", help="its name or device_id")
     forget.set_defaults(run=_forget)
+
+    identify = commands.add_parser("identify", help="blink a device white, to tell it apart")
+    identify.add_argument("device", help="its name or device_id")
+    identify.add_argument("seconds", nargs="?", type=int, help="1 to 300 (default 5)")
+    identify.set_defaults(run=_identify)
+
+    diag = commands.add_parser("diag", help="show a device's health")
+    diag.add_argument("device", help="its name or device_id")
+    diag.set_defaults(run=_diag)
+
+    volume = commands.add_parser("volume", help="set a device's speaker volume")
+    volume.add_argument("device", help="its name or device_id")
+    volume.add_argument("level", type=int, help="0 (mute) to 100")
+    volume.set_defaults(run=_volume)
     return parser
 
 
@@ -178,6 +192,34 @@ def _rename(args: argparse.Namespace) -> int:
 def _forget(args: argparse.Namespace) -> int:
     _owner(lambda owner: owner.forget(args.device))
     print(f"forgot {args.device}")
+    return 0
+
+
+def _identify(args: argparse.Namespace) -> int:
+    identified = _owner(lambda owner: owner.identify(args.device, args.seconds))
+    print(f"{identified['name']} is blinking white")
+    return 0
+
+
+_DIAG_UNITS = {"heap_free": " B", "heap_min": " B", "rssi": " dBm"}
+
+
+def _diag(args: argparse.Namespace) -> int:
+    diag = _owner(lambda owner: owner.diag(args.device))
+    width = max(map(len, diag))
+    for key, value in diag.items():
+        if key == "stack_hwm":
+            value = " ".join(f"{task}={free}" for task, free in value.items())
+        print(f"{key.ljust(width)}  {value}{_DIAG_UNITS.get(key, '')}")
+    return 0
+
+
+def _volume(args: argparse.Namespace) -> int:
+    volume = _owner(lambda owner: owner.set_volume(args.device, args.level))
+    if volume["applied"]:
+        print(f"{volume['name']}: volume {args.level}")
+    else:
+        print(f"{volume['name']} is offline; it gets volume {args.level} when it's back")
     return 0
 
 

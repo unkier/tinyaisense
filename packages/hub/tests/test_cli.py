@@ -157,6 +157,26 @@ async def test_serve_pairs_a_device_the_owner_approves_from_the_cli(
     assert re.fullmatch(r"\d{4}-\d\d-\d\d", row.split()[3])  # then the local time
 
 
+async def test_the_owner_identifies_diagnoses_and_sets_the_volume_from_the_cli(
+    served: Served, xdg: dict[str, str], simulator: SimulatorFactory
+) -> None:
+    device = await simulator(served.device).add("m5stack-atom-echo", "kitchen")
+    await cli(xdg, "approve", device.device_id, "as", "kitchen")
+    await device.wait_for(lambda: device.state == "online")
+
+    identified = await cli(xdg, "identify", "kitchen", "2")
+    diag = dict(line.split(maxsplit=1) for line in (await cli(xdg, "diag", "kitchen")).splitlines())
+    volume = await cli(xdg, "volume", "kitchen", "35")
+
+    assert device.status == "identify"
+    assert "kitchen" in identified
+    assert diag.keys() >= {"uptime_s", "reset_reason", "heap_free", "heap_min", "rssi"}
+    assert (diag["reset_reason"], diag["rssi"], diag["reconnects"]) == ("poweron", "-61 dBm", "0")
+    assert "ctrl=" in diag["stack_hwm"]
+    assert device.speaker.level == 35
+    assert volume.strip() == "kitchen: volume 35"
+
+
 async def test_serve_serves_the_agent_api(served: Served) -> None:
     async with tinyaisense.connect(served.agent_url, served.agent_token) as agent:
         assert await agent.devices() == []

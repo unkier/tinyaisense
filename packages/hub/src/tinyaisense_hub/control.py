@@ -12,15 +12,13 @@ from collections import deque
 from collections.abc import Callable, Coroutine
 from typing import Any, Literal, Protocol
 
-from tinyaisense_wire import KINDS, Capability, JsonObject, SchemaError, validate
+from tinyaisense_wire import KINDS, Capability, JsonObject
 
-from .devices import DeviceConnection
+from .devices import CommandSpec, DeviceConnection, check_args, volume_commands
 from .errors import HubError
 from .state import DeviceRecord
 
 type _Op[T] = Callable[[], Coroutine[Any, Any, T]]
-type _Command = tuple[str | None, str, JsonObject]
-"""A command to send: `(cap, name, args)`."""
 type _HubStatus = Literal["no_agent", "agent"]
 
 _log = logging.getLogger("tinyaisense_hub.control")
@@ -73,7 +71,7 @@ class LedClaim:
     """A Session's claim on one device's LEDs: what brings each led capability back."""
 
     def __init__(self) -> None:
-        self._commands: dict[str, dict[int | None, _Command]] = {}
+        self._commands: dict[str, dict[int | None, CommandSpec]] = {}
         """Capability id → its commands to replay, by LED index; None for all of them."""
 
     def record(self, cap: str, name: str, args: JsonObject) -> None:
@@ -85,10 +83,10 @@ class LedClaim:
             commands.pop(index, None)  # replayed in order: after the latest whole-LED command
         commands[index] = (cap, name, args)
 
-    def replay(self) -> list[_Command]:
+    def replay(self) -> list[CommandSpec]:
         return [command for commands in self._commands.values() for command in commands.values()]
 
-    def releases(self) -> list[_Command]:
+    def releases(self) -> list[CommandSpec]:
         """The commands that end the claim."""
         return [(cap, "release", {}) for cap in self._commands]
 
@@ -111,11 +109,11 @@ class Control:
 
     # Presence, from the registry.
 
-    def device_online(self, conn: DeviceConnection) -> None:
+    def device_online(self, conn: DeviceConnection, record: DeviceRecord) -> None:
         """Bring the device up to date, then tell the Session it's online."""
         controller = Controller(conn, self._workers)
         self._controllers[conn.manifest.device_id] = controller
-        _log_failure(controller.submit(lambda: self._bring_up(conn)))
+        _log_failure(controller.submit(lambda: self._bring_up(conn, record)))
 
     def device_offline(self, conn: DeviceConnection) -> None:
         device_id = conn.manifest.device_id
@@ -125,12 +123,16 @@ class Control:
             # By its welcome name: a rename or forget has changed the record already.
             self._session.notify("device.offline", {"device": conn.name})
 
-    async def _bring_up(self, conn: DeviceConnection) -> None:
-        """After `welcome`, pipelined: the Status, then the Session's LED claim."""
-        commands = [_status(self._hub_status())]
+    async def _bring_up(self, conn: DeviceConnection, record: DeviceRecord) -> None:
+        """After `welcome`, pipelined: the owner's volume, the Status, then the LED claim."""
+        commands: list[CommandSpec] = []
+        if record.volume is not None:
+            # Read now, not at `welcome`: the owner may have changed it since.
+            commands += volume_commands(conn.manifest, record.volume)
+        commands.append(_status(self._hub_status()))
         if (claim := self._claims.get(conn.manifest.device_id)) is not None:
             commands += claim.replay()
-        await _pipeline(conn, commands, strict=False)
+        await conn.pipeline(commands, strict=False)
         if conn.state == "online" and self._session is not None:
             self._session.notify(
                 "device.online", {"device": conn.name, "manifest": conn.manifest.to_json()}
@@ -171,10 +173,7 @@ class Control:
         contract = kind.commands.get(name)
         if contract is None or contract.hub_only:
             raise HubError("unsupported", f"{address} has no command {name!r}")
-        try:
-            validate(contract.args, args, "args")
-        except SchemaError as e:
-            raise HubError("invalid_args", str(e)) from None
+        check_args(contract, args)
         controller = self._controller(device)
 
         async def op() -> JsonObject:
@@ -201,7 +200,7 @@ class Control:
         async def op() -> None:
             self._require_current(session)
             if (claim := self._claims.pop(device.device_id, None)) is not None:
-                await _pipeline(controller.conn, claim.releases())
+                await controller.conn.pipeline(claim.releases())
 
         await controller.submit(op)
 
@@ -222,26 +221,12 @@ class Control:
             raise HubError("disconnected", "the Session has ended")
 
 
-def _status(state: _HubStatus) -> _Command:
+def _status(state: _HubStatus) -> CommandSpec:
     return (None, "status", {"state": state})
 
 
-async def _pipeline(
-    conn: DeviceConnection, commands: list[_Command], *, strict: bool = True
-) -> None:
-    """Send `commands` back to back, then await every reply. Raises the first failure, if
-    `strict`; logs them otherwise."""
-    replies = [conn.command(cap, name, args) for cap, name, args in commands]
-    results = await asyncio.gather(*replies, return_exceptions=True)
-    failures = [r for r in results if isinstance(r, BaseException)]
-    for failure in failures if not strict else []:
-        _log.warning("%s: %s", conn.name, failure)
-    if strict and failures:
-        raise failures[0]
-
-
-def _pipeline_op(conn: DeviceConnection, commands: list[_Command]) -> _Op[None]:
-    return lambda: _pipeline(conn, commands)
+def _pipeline_op(conn: DeviceConnection, commands: list[CommandSpec]) -> _Op[None]:
+    return lambda: conn.pipeline(commands)
 
 
 def _end_op(conn: DeviceConnection, claim: LedClaim | None) -> _Op[None]:
@@ -250,7 +235,7 @@ def _end_op(conn: DeviceConnection, claim: LedClaim | None) -> _Op[None]:
 
     async def op() -> None:
         releases = claim.releases() if claim is not None else []
-        await _pipeline(conn, [*releases, _status("no_agent")])
+        await conn.pipeline([*releases, _status("no_agent")])
 
     return op
 

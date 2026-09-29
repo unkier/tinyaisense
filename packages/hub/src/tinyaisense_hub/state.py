@@ -27,6 +27,8 @@ class DeviceRecord:
     """The last Manifest the device sent."""
     last_seen: int
     """Epoch ms: when its last Connection started or ended."""
+    volume: int | None = None
+    """The owner's speaker volume, 0 to 100. None until set: the device keeps its default."""
 
     def to_json(self) -> dict[str, Any]:
         return {
@@ -35,16 +37,21 @@ class DeviceRecord:
             "token_sha256": self.token_sha256,
             "manifest": self.manifest.to_json(),
             "last_seen": self.last_seen,
+            "volume": self.volume,
         }
 
     @staticmethod
     def from_json(obj: dict[str, Any]) -> DeviceRecord:
+        volume = obj.get("volume")
+        if volume is not None and (type(volume) is not int or not 0 <= volume <= 100):
+            raise ValueError(f"volume {volume!r} isn't 0 to 100")
         return DeviceRecord(
             obj["device_id"],
             obj["name"],
             obj["token_sha256"],
             Manifest.from_json(obj["manifest"]),
             obj["last_seen"],
+            volume,
         )
 
 

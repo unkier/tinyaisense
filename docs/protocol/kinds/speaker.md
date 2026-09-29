@@ -39,5 +39,5 @@ The hub drives the speaker for `say` and `stream.start`. The volume is an owner 
 ### `set_volume` (hub-only)
 
 `{level}` → `{}`. Software gain on a log curve, `level` 0–100: 0 is mute, 1 is about −40 dB and 100 is 0 dB.
-- The hub stores the level per device and re-applies it after every `welcome`.
+- The hub stores the level per device and re-applies it after every `welcome`, first thing. Until the owner sets a level, the hub sends none, and the device keeps its default.
 - The device boots at a Kconfig default and never persists the level.

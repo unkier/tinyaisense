@@ -42,6 +42,9 @@ class OwnerServer:
             "approve": self._approve,
             "rename": self._rename,
             "forget": self._forget,
+            "identify": self._identify,
+            "diag": self._diag,
+            "set_volume": self._set_volume,
         }
 
     async def start(self) -> None:
@@ -134,6 +137,21 @@ class OwnerServer:
         await self._registry.forget(device)
         return {}
 
+    async def _identify(self, params: _Params) -> JsonObject:
+        device, seconds = params.string("device"), params.optional_integer("seconds")
+        params.done()
+        return await self._registry.identify(device, seconds)
+
+    async def _diag(self, params: _Params) -> JsonObject:
+        device = params.string("device")
+        params.done()
+        return await self._registry.diag(device)
+
+    async def _set_volume(self, params: _Params) -> JsonObject:
+        device, level = params.string("device"), params.integer("level")
+        params.done()
+        return await self._registry.set_volume(device, level)
+
 
 class OwnerClient:
     """The owner's side of the socket. Refusals raise `HubError`."""
@@ -188,6 +206,20 @@ class OwnerClient:
     async def forget(self, device: str) -> None:
         await self.call("forget", device=device)
 
+    async def identify(self, device: str, seconds: int | None = None) -> JsonObject:
+        """Blink the device white for `seconds`, 1 to 300; the device's default is 5."""
+        params = {"device": device} if seconds is None else {"device": device, "seconds": seconds}
+        return await self.call("identify", **params)
+
+    async def diag(self, device: str) -> JsonObject:
+        """The device's health: docs/protocol/kinds/device.md#diag-hub-only."""
+        return await self.call("diag", device=device)
+
+    async def set_volume(self, device: str, level: int) -> JsonObject:
+        """Set the device's speaker volume, 0 to 100, now if it's online and after every
+        `welcome`. `applied` in the result says whether the device has it yet."""
+        return await self.call("set_volume", device=device, level=level)
+
 
 def _error(request_id: object, code: int, message: str, hub_code: str) -> JsonObject:
     error = {"code": code, "message": message, "data": {"code": hub_code}}
@@ -214,6 +246,19 @@ class _Params:
         value = self._params.get(key)
         if value is not None and not isinstance(value, str):
             raise _BadParams(f"{key} must be a string")
+        return value
+
+    def integer(self, key: str) -> int:
+        value = self.optional_integer(key)
+        if value is None:
+            raise _BadParams(f"{key} is missing")
+        return value
+
+    def optional_integer(self, key: str) -> int | None:
+        self._read.add(key)
+        value = self._params.get(key)
+        if value is not None and (not isinstance(value, int) or isinstance(value, bool)):
+            raise _BadParams(f"{key} must be an integer")
         return value
 
     def done(self) -> None:

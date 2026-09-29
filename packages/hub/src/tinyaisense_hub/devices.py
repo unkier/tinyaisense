@@ -1,4 +1,4 @@
-"""Device Connections, the handshake and Pairing."""
+"""Device Connections, the handshake, Pairing and the owner's device ops."""
 
 import asyncio
 import hashlib
@@ -16,6 +16,7 @@ from tinyaisense_wire import (
     PROTOCOL,
     Capability,
     Command,
+    CommandContract,
     ControlDecoder,
     Error,
     FailedReply,
@@ -27,9 +28,11 @@ from tinyaisense_wire import (
     Ping,
     Pong,
     Reply,
+    SchemaError,
     Welcome,
     WireError,
     encode_control,
+    validate,
 )
 
 from .commands import Answered, CommandTimeouts, Replied, Sent, TimedOut
@@ -51,11 +54,14 @@ _DEVICE_ERRORS: set[HubErrorCode] = {"unsupported", "invalid_args", "busy", "fai
 """The error codes a device may reply with. Anything else counts as `failed`."""
 _U32_MAX = 2**32 - 1
 
+type CommandSpec = tuple[str | None, str, JsonObject]
+"""A command to send: `(cap, name, args)`, with `cap` None for a device-level one."""
+
 
 class Presence(Protocol):
     """Told when a paired device's Connection is welcomed, and when it drops."""
 
-    def device_online(self, conn: DeviceConnection) -> None: ...
+    def device_online(self, conn: DeviceConnection, record: DeviceRecord) -> None: ...
 
     def device_offline(self, conn: DeviceConnection) -> None: ...
 
@@ -152,6 +158,17 @@ class DeviceConnection(asyncio.Protocol):
         self._timeouts.handle(Sent(command_id, self._timeout_ms(cap, name) * 1000), now)
         self._timeouts_alarm.set(self._timeouts.next_deadline(), now)
         return future
+
+    async def pipeline(self, commands: list[CommandSpec], *, strict: bool = True) -> None:
+        """Send `commands` back to back, then await every reply. Raises the first failure, if
+        `strict`; logs them otherwise."""
+        replies = [self.command(cap, name, args) for cap, name, args in commands]
+        results = await asyncio.gather(*replies, return_exceptions=True)
+        failures = [r for r in results if isinstance(r, BaseException)]
+        for failure in failures if not strict else []:
+            _log.warning("%s: %s", self.name, failure)
+        if strict and failures:
+            raise failures[0]
 
     def close(self, reason: str) -> None:
         """Close the Connection. What was sent before goes out first."""
@@ -285,10 +302,12 @@ class DeviceConnection(asyncio.Protocol):
 
 
 class Registry:
-    """Paired devices, pending devices and their live Connections. Owns Pairing.
+    """Paired devices, pending devices and their live Connections. Owns Pairing and the
+    owner's device ops.
 
     A device is pending while it has an open Connection without a token. Pending devices
-    live in memory only.
+    live in memory only. The owner's device ops go straight to the Connection, so no agent op
+    queued on the device holds them up.
     """
 
     def __init__(
@@ -374,7 +393,7 @@ class Registry:
 
     async def rename(self, device: str, name: str) -> JsonObject:
         """Rename a paired device. Its Connection drops, and it reconnects under the new name."""
-        record = self._records[self._find(device, list(self._records))]
+        record = self._record(device)
         self._check_name(name, record.device_id)
         if name != record.name:
             old_name, record.name = record.name, name
@@ -389,15 +408,58 @@ class Registry:
 
     async def forget(self, device: str) -> None:
         """Remove a paired device. It must pair again."""
-        device_id = self._find(device, list(self._records))
-        record = self._records.pop(device_id)
-        if (conn := self._live.pop(device_id, None)) is not None:
+        record = self._record(device)
+        del self._records[record.device_id]
+        if (conn := self._live.pop(record.device_id, None)) is not None:
             conn.close("forgotten")
         try:
             await self._save()
         except BaseException:
-            self._records.setdefault(device_id, record)
+            self._records.setdefault(record.device_id, record)
             raise
+
+    async def identify(self, device: str, seconds: int | None = None) -> JsonObject:
+        """Blink a paired device white for `seconds`, or the device's default. Raises
+        `HubError`."""
+        conn = self._online(device)
+        args = {} if seconds is None else {"s": seconds}
+        check_args(DEVICE_COMMANDS["identify"], args)
+        await conn.command(None, "identify", args)
+        return {"device_id": conn.manifest.device_id, "name": conn.name}
+
+    async def diag(self, device: str) -> JsonObject:
+        """A paired device's health, as it reports it. Raises `HubError`."""
+        return await self._online(device).command(None, "diag", {})
+
+    async def set_volume(self, device: str, level: int) -> JsonObject:
+        """Store a paired device's volume, and set it on the device if it's online. The
+        device gets it again first thing after every `welcome`. Raises `HubError`."""
+        record = self._record(device)
+        commands = volume_commands(record.manifest, level)
+        if not commands:
+            raise HubError("unsupported", f"{record.name} has no speaker")
+        check_args(KINDS["speaker"].commands["set_volume"], {"level": level})
+        old, record.volume = record.volume, level
+        try:
+            await self._save()
+        except BaseException:
+            if record.volume == level:
+                record.volume = old
+            raise
+        applied = False
+        conn = self._live.get(record.device_id)
+        if conn is not None and conn.state == "online":
+            try:
+                await conn.pipeline(commands)
+            except HubError as e:
+                if e.code != "disconnected":
+                    message = (
+                        f"{e.message}; the volume is stored, for when {record.name} reconnects"
+                    )
+                    raise HubError(e.code, message) from None
+            else:
+                applied = True
+        return {"device_id": record.device_id, "name": record.name, "applied": applied}
 
     # Agent Addresses.
 
@@ -481,7 +543,8 @@ class Registry:
         if name is None:
             name = old.name if old is not None else self._default_name(manifest)
         token = secrets.token_urlsafe(32)
-        record = DeviceRecord(manifest.device_id, name, _sha256(token), manifest, _now_ms())
+        volume = None if old is None else old.volume
+        record = DeviceRecord(manifest.device_id, name, _sha256(token), manifest, _now_ms(), volume)
         self._records[record.device_id] = record
         try:
             await self._save()
@@ -512,7 +575,7 @@ class Registry:
         record.last_seen = _now_ms()
         self._spawn(self._save())
         _log.info("%s: online as %s", conn, record.name)
-        self._presence.device_online(conn)
+        self._presence.device_online(conn, record)
 
     def _default_name(self, manifest: Manifest) -> str:
         """`<board-short>-<last 4 hex of the MAC>`, e.g. `echo-c3d4`, made unique."""
@@ -528,6 +591,20 @@ class Registry:
             raise HubError("invalid_name", f"{name!r}: a name must match [a-z0-9-]+")
         if self._name_owner(name) not in (None, device_id):
             raise HubError("name_taken", f"another device is named {name!r}")
+
+    def _record(self, device: str) -> DeviceRecord:
+        """A paired device, by its name, its device_id or a unique prefix of it. Raises
+        `HubError`: `not_found` or `ambiguous`."""
+        return self._records[self._find(device, list(self._records))]
+
+    def _online(self, device: str) -> DeviceConnection:
+        """A paired device's online Connection. Raises `HubError`: `not_found`, `ambiguous`
+        or `disconnected`."""
+        record = self._record(device)
+        conn = self._live.get(record.device_id)
+        if conn is None or conn.state != "online":
+            raise HubError("disconnected", f"{record.name} is offline")
+        return conn
 
     def _name_owner(self, name: str) -> str | None:
         return next((r.device_id for r in self._records.values() if r.name == name), None)
@@ -555,6 +632,23 @@ class Registry:
         self._tasks.discard(task)
         if not task.cancelled() and (e := task.exception()) is not None:
             _log.error("background task failed", exc_info=e)
+
+
+def volume_commands(manifest: Manifest, level: int) -> list[CommandSpec]:
+    """The commands that set the volume: `set_volume` on each speaker, as `(cap, name, args)`."""
+    return [
+        (cap.id, "set_volume", {"level": level})
+        for cap in manifest.capabilities
+        if cap.kind == "speaker"
+    ]
+
+
+def check_args(contract: CommandContract, args: JsonObject) -> None:
+    """Raises `HubError`: `invalid_args` if `args` break the command's contract."""
+    try:
+        validate(contract.args, args, "args")
+    except SchemaError as e:
+        raise HubError("invalid_args", str(e)) from None
 
 
 def _resolve(future: asyncio.Future[JsonObject], result: JsonObject) -> None:

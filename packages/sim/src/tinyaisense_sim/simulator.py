@@ -43,6 +43,7 @@ from .discovery import Mdns, Resolve
 from .faults import ConnectionSocket, Faults
 from .led import Light, SimLed
 from .profiles import PROFILES, Board
+from .speaker import SimSpeaker
 from .status import Status, StatusLayers
 
 FIRMWARE = f"sim-{version('tinyaisense-sim')}"
@@ -155,6 +156,7 @@ class SimDevice:
         self.reconnects = 0
         """Connections the hub answered, after the first."""
         self.faults = Faults()
+        self._board = board
         self._resolve = resolve
         self._udp_host = udp_host
         self._tokens = tokens
@@ -167,9 +169,13 @@ class SimDevice:
         self._task: asyncio.Task[None] | None = None
         self._answered_before = False
         """Whether the hub has answered any Connection yet."""
+        self._connections_lost = 0
+        """Connections that ended since boot, answered or not: `diag` reports it."""
         self._vanished: list[ConnectionSocket] = []
         """Given up on, but left open: closing one would tell the hub."""
         self._layers = StatusLayers(connecting=True)
+        self._identify_timer: asyncio.TimerHandle | None = None
+        """Ends `identify`, while it shows."""
         self._leds = {
             cap.id: SimLed(cap.params["count"], board.led_brightness_cap)
             for cap in manifest.capabilities
@@ -177,6 +183,11 @@ class SimDevice:
         }
         self._status_led = next(iter(self._leds.values()), None)
         """The LED the Status shows on: the first one."""
+        self._speakers = {
+            cap.id: SimSpeaker(board.default_volume)
+            for cap in manifest.capabilities
+            if cap.kind == "speaker"
+        }
 
     @property
     def device_id(self) -> str:
@@ -190,6 +201,12 @@ class SimDevice:
     def status(self) -> Status:
         """The Status the device shows now."""
         return self._layers.shown
+
+    @property
+    def speaker(self) -> SimSpeaker:
+        """The speaker capability, on a Board with one."""
+        [speaker] = self._speakers.values()
+        return speaker
 
     def lights(self, cap: str = "led") -> tuple[Light, ...]:
         """What each LED of the led capability `cap` shows now, the Status included."""
@@ -220,6 +237,8 @@ class SimDevice:
                 await self._task
         if self._udp is not None:
             self._udp.close()
+        if self._identify_timer is not None:
+            self._identify_timer.cancel()
         self._close_vanished()
         self._set_state("closed")
         self._on_close(self)
@@ -289,6 +308,7 @@ class SimDevice:
                     self._receive(message, connection)
             decoder.close()
         finally:
+            self._connections_lost += 1
             if connection.vanished:
                 self._vanished.append(connection)
             else:
@@ -367,9 +387,17 @@ class SimDevice:
         if contract is None:
             raise _Refused("unsupported", f"{kind} has no command {name!r}")
         validate(contract.args, args, "args")
+        result: JsonObject = {}
         match kind, name:
             case "device", "status":
                 self._layers.hub = args["state"]
+            case "device", "identify":
+                self._identify(seconds=args.get("s", 5))
+            case "device", "diag":
+                result = self._diag()
+            case "speaker", "set_volume":
+                assert command.cap is not None
+                self._speakers[command.cap].level = args["level"]
             case "led", "set":
                 assert command.cap is not None
                 try:
@@ -385,7 +413,31 @@ class SimDevice:
             case _:
                 raise _Refused("unsupported", f"the Simulator doesn't do {kind} {name!r} yet")
         self._layers.claimed = self._status_led is not None and self._status_led.claim is not None
-        return {}
+        return result
+
+    def _identify(self, seconds: int) -> None:
+        """Show `identify` for `seconds` from now, cutting short any earlier one."""
+        if self._identify_timer is not None:
+            self._identify_timer.cancel()
+        self._layers.identify = True
+        self._identify_timer = asyncio.get_running_loop().call_later(seconds, self._identified)
+
+    def _identified(self) -> None:
+        self._identify_timer = None
+        self._layers.identify = False
+        self._changed_now()
+
+    def _diag(self) -> JsonObject:
+        health = self._board.health
+        return {
+            "uptime_s": self._clock() // 1_000_000,
+            "reset_reason": "poweron",
+            "heap_free": health.heap_free,
+            "heap_min": health.heap_min,
+            "rssi": health.rssi,
+            "reconnects": self._connections_lost,
+            "stack_hwm": dict(health.stack_hwm),
+        }
 
     def _clock(self) -> int:
         """The device clock: µs since boot."""

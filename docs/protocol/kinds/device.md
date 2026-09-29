@@ -15,6 +15,8 @@ Contract data: [`contracts/device.json`](../../../packages/wire/src/tinyaisense_
 ### `identify` (hub-only)
 
 `{s?}` → `{}`. Blinks white at 4 Hz for `s` seconds (1–300, default 5), so the owner can tell devices apart. It sits on top of every other Status.
+- A new `identify` restarts the blink, for its own `s`.
+- The blink runs its course even if the Connection drops.
 
 ### `diag` (hub-only)
 
