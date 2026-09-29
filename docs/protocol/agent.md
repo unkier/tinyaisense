@@ -251,7 +251,15 @@ The hub turns text into speech and speech into text in its own speech layer. Age
 
 ### Streaming text
 
-`say.open` → `{handle}`, then any number of `say.append{handle, text}`, then `say.close{handle}` → the say result. The hub cuts the text into clauses as it arrives, so speech starts after the first clause, not after the whole reply. Once the say has ended, e.g. cut by the Reflex, `say.append` is accepted and ignored, and `say.close` replies at once.
+`say.open` → `{handle}`, then any number of `say.append{handle, text}`, then `say.close{handle}` → the say result. The hub cuts the text into clauses as it arrives, so speech starts after the first clause, not after the whole reply.
+
+- **Queueing.** A `say.open` takes its place among the `say`s on the speaker as it opens, and cuts in with `replace: true`, just as a `say` does. A `say` queued after it waits until it's closed and has played.
+- **Clauses.** A clause is spoken once the text after it shows where it ends, e.g. by a space after its comma or full stop. However the text is split into appends, it's cut into the clauses of the whole text in one `say`, bar markdown that a clause's end splits, such as a link's text.
+- **The tail,** the text after the last clause, is spoken on `say.close`, or once no text has come for 500 ms if it has at least 4 words. Then a last word that nothing follows yet, not even a mark, may be half of one: it waits for more text, and doesn't count.
+- **Voice.** With no `voice` or `lang`, a streamed say speaks in the default Voice of the language of its first clause, along with any others cut from the same text.
+- `say.open` replies at once, so the text can follow while the speaker starts. If it fails to start, e.g. the device went offline, `say.append` and `say.close` get the error.
+- Once the say has ended, e.g. cut by the Reflex, `say.append` is accepted and ignored, and `say.close` replies at once. `say.append` or `say.close` on a handle that isn't open gets `disconnected`.
+- The handle is a u16 from the same range as stream handles: while it's open, no stream has it.
 
 ### Utterances
 

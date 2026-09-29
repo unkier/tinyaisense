@@ -307,9 +307,8 @@ class Control:
         gets no handle to it, and no `stream.*` notifications. It preempts as `stream_start`
         does. `on_starved` is called whenever it has sent every whole frame it was fed, and
         isn't draining; `on_end` as it ends, once it has started. Raises `HubError`."""
+        self.speaker_check(device, capability)
         address = f"{device.name}/{capability.id}"
-        if not FORMAT.offered(capability.params):
-            raise HubError("unsupported", f"{address} has no 16 kHz mono PCM in 10 ms frames")
         controller = self._controller(device)
 
         async def op() -> SpeakerStream:
@@ -325,6 +324,14 @@ class Control:
             return stream
 
         return await controller.submit(op)
+
+    def speaker_check(self, device: DeviceRecord, capability: Capability) -> None:
+        """Raise the `HubError` that `speaker_start` would before it tries: `unsupported` for
+        a speaker that doesn't play the hub's audio, `disconnected` if it's offline."""
+        address = f"{device.name}/{capability.id}"
+        if not FORMAT.offered(capability.params):
+            raise HubError("unsupported", f"{address} has no 16 kHz mono PCM in 10 ms frames")
+        self._controller(device)
 
     async def _open(
         self,

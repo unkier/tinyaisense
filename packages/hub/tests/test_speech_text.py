@@ -1,6 +1,7 @@
 """The text a `say` speaks: normalized, then cut into clauses for the TTS."""
 
-from tinyaisense_hub.speech.text import Clause, clauses, language, normalize, split
+import pytest
+from tinyaisense_hub.speech.text import Clause, Script, clauses, language, normalize, split
 
 
 def test_the_first_chunk_ends_at_a_clause_mark_after_four_words() -> None:
@@ -114,3 +115,64 @@ def test_the_language_of_a_text_is_its_dominant_script() -> None:
     assert language("Да, hi") == "en"  # a tie isn't dominance
     assert language("Ça va, señor?") == "en"
     assert language("42 + 7 = 49!") is None
+
+
+def test_streamed_text_is_cut_into_each_clause_as_soon_as_the_text_after_it_shows_its_end() -> None:
+    script = Script()
+
+    script.append("One two three four,")
+    assert script.clauses == []  # a comma may yet be followed by more of the word
+    script.append(" five six")
+    assert script.clauses == [Clause("One two three four,", 19)]
+    script.append(". Sev")
+    assert script.clauses == [Clause("One two three four,", 19), Clause("five six.", 29)]
+    script.append("en eight. ")  # the space shows the sentence has ended
+    assert script.clauses == [
+        Clause("One two three four,", 19),
+        Clause("five six.", 29),
+        Clause("Seven eight.", 42),
+    ]
+    script.close()
+    assert script.clauses[-1] == Clause("Seven eight.", 43)  # the last ends at the text's end
+    assert script.text == "One two three four, five six. Seven eight. "
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "**One** two three four, five 🎉 six. See https://x.io/a, then [Seven](c.png) eight.",
+        "Version 3.14 ships at 10:30 today, for 1,000 users. Yes!\n\n- one, two\n1. three",
+        "One two three four. " + " ".join(["word"] * 60) + ". Done.",
+        "Привет, как твои дела? Хорошо… Мои — нет.",
+    ],
+)
+def test_streamed_text_is_cut_as_the_whole_text_is_however_it_comes_in(text: str) -> None:
+    whole = clauses(text)
+    for at in range(len(text) + 1):
+        halves = Script()
+        halves.append(text[:at])
+        halves.append(text[at:])
+        halves.close()
+        assert halves.clauses == whole, at
+    chars = Script()
+    for char in text:
+        chars.append(char)
+    chars.close()
+    assert chars.clauses == whole
+
+
+def test_an_idle_tail_is_cut_as_a_clause_if_it_has_four_words_less_a_half_sent_last_one() -> None:
+    script = Script()
+    script.append("Well, one two three four. Five **six** 🎉")
+
+    script.idle()
+    assert script.clauses == [Clause("Well, one two three four.", 25)]
+    script.append(" seven eigh")
+    script.idle()  # "eigh" may be half of a word: that leaves three
+    assert script.clauses[1:] == []
+    script.append("t nine")
+    script.idle()
+    assert script.clauses[1:] == [Clause("Five six seven eight", 52)]
+    script.append(" ten eleven twelve.")
+    script.idle()  # the full stop ends the last word
+    assert script.clauses[2:] == [Clause("nine ten eleven twelve.", 76)]

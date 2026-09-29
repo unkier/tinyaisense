@@ -186,6 +186,40 @@ class Session:
             params["replace"] = True
         return await self.call("say", **params)
 
+    async def say_open(
+        self,
+        address: str,
+        *,
+        voice: str | None = None,
+        lang: str | None = None,
+        replace: bool = False,
+    ) -> int:
+        """Start speaking text that comes in pieces, e.g. an LLM's reply as it streams, on the
+        speaker at `address`. Returns its handle: pass the text to `say_append`, then call
+        `say_close`. Speech starts after the first clause, not after the whole text.
+
+        It's queued, or cuts in with `replace`, as `say` is. Without a `voice` or `lang`, the
+        hub speaks in its default Voice for the language of the first clause. Close it, or
+        the `say`s queued after it never play."""
+        params: JsonObject = {"address": address}
+        if voice is not None:
+            params["voice"] = voice
+        if lang is not None:
+            params["lang"] = lang
+        if replace:
+            params["replace"] = True
+        return cast(int, (await self.call("say.open", **params))["handle"])
+
+    async def say_append(self, handle: int, text: str) -> None:
+        """More text for the `say` `handle`. Once it has ended, e.g. cut by the button, the
+        text is ignored."""
+        await self.call("say.append", handle=handle, text=text)
+
+    async def say_close(self, handle: int) -> JsonObject:
+        """No more text comes for the `say` `handle`. Returns once it has played, or been cut,
+        what `say` returns."""
+        return await self.call("say.close", handle=handle)
+
     async def audio(self, handle: int) -> AsyncIterator[HubAudio]:
         """A mic stream's frames, in order, until the stream ends: 10 ms of PCM each (s16le
         mono, at the stream's rate), with its `index` on the stream's timeline. The hub

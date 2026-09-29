@@ -14,8 +14,8 @@ from ..resampler import RATES
 from ..session import Session
 from ..state import DeviceRecord
 from .engines import Engine, Tts
-from .say import Run, Say
-from .text import Clause, clauses, language
+from .say import EngineVoice, Run, Say
+from .text import IDLE_MS, Script, language
 
 
 class Speech:
@@ -91,15 +91,102 @@ class Speech:
     ) -> JsonObject:
         """Speak `text` on a speaker, after the `say`s queued on it, or cutting them off if
         `replace`. Returns how it went once it has played. Raises `HubError`."""
-        if not self._tts:
-            raise HubError("unsupported", "the hub has no TTS engine")
-        to_speak = clauses(text)
-        chosen = self._voice(voice, lang, to_speak)
-        engine = self._tts[chosen.lang]
-        address = f"{device.name}/{capability.id}"
-        say = Say(text, to_speak, engine, chosen.engine_voice, session, address)
+        say = self._say(session, device, capability, Script.whole(text), voice, lang)
+        self._more(say)
         self._run(session, device, capability, replace).add(say)
         return await asyncio.shield(say.done)
+
+    def say_open(
+        self,
+        session: Session,
+        device: DeviceRecord,
+        capability: Capability,
+        *,
+        voice: str | None,
+        lang: str | None,
+        replace: bool = False,
+    ) -> int:
+        """Start a `say` whose text comes in with `say_append`, queued as `say` would be.
+        Returns its handle. Raises `HubError`; once it's open, the error its speech failed to
+        start with comes from `say_append` and `say_close`."""
+        say = self._say(session, device, capability, Script(), voice, lang)
+        self._control.speaker_check(device, capability)
+        handle = session.new_handle()
+        session.says[handle] = say
+        say.done.add_done_callback(_retrieve)  # in case it's never closed
+        self._run(session, device, capability, replace).add(say)
+        return handle
+
+    def say_append(self, session: Session, handle: int, text: str) -> None:
+        """More text for an open `say`: each clause it completes is spoken, and its tail is
+        once no text comes for `IDLE_MS`. Once the `say` has ended, the text is ignored.
+        Raises `HubError`."""
+        say = self._open_say(session, handle)
+        if say.done.done():
+            if (e := say.done.exception()) is not None:
+                raise e
+            return
+        say.script.append(text)
+        self._more(say)
+        if say.idle is not None:
+            say.idle.cancel()
+        say.idle = asyncio.get_running_loop().call_later(IDLE_MS / 1000, self._idle, say)
+
+    async def say_close(self, session: Session, handle: int) -> JsonObject:
+        """No more text comes for an open `say`: its tail is spoken. Returns how it went once
+        it has played, or at once if it has ended. Raises `HubError`."""
+        say = self._open_say(session, handle)
+        del session.says[handle]
+        if say.idle is not None:
+            say.idle.cancel()
+        if not say.done.done():
+            say.script.close()
+            self._more(say)
+        return await asyncio.shield(say.done)
+
+    def _say(
+        self,
+        session: Session,
+        device: DeviceRecord,
+        capability: Capability,
+        script: Script,
+        voice: str | None,
+        lang: str | None,
+    ) -> Say:
+        """A new `say` of `script`, in `voice` or `lang` if given. Raises `HubError`."""
+        if not self._tts:
+            raise HubError("unsupported", "the hub has no TTS engine")
+        say = Say(script, session, f"{device.name}/{capability.id}")
+        if (chosen := self._voice(voice, lang)) is not None:
+            say.voice = self._engine_voice(chosen)
+        return say
+
+    def _open_say(self, session: Session, handle: int) -> Say:
+        """The open `say` `handle`. Raises `HubError`."""
+        say = session.says.get(handle)
+        if say is None:
+            raise HubError("disconnected", f"no say {handle} is open")
+        return say
+
+    def _more(self, say: Say) -> None:
+        """`say`'s script has more clauses, or has closed: have them spoken. Its Voice, if it
+        has none yet, is the default of the language they're written in, or of the hub's
+        default language: a streamed `say` is judged by the clauses it has when its first is
+        cut."""
+        if say.voice is None and say.script.clauses:
+            written = language(" ".join(clause.text for clause in say.script.clauses))
+            chosen = self._defaults.get(written or "", self._defaults[self._config.lang])
+            say.voice = self._engine_voice(chosen)
+        say.more.set()
+
+    def _idle(self, say: Say) -> None:
+        """No text has come for `say` for `IDLE_MS`."""
+        if not say.done.done():
+            say.script.idle()
+            self._more(say)
+
+    def _engine_voice(self, voice: VoiceConfig) -> EngineVoice:
+        return EngineVoice(self._tts[voice.lang], voice.engine_voice)
 
     def _run(
         self, session: Session, device: DeviceRecord, capability: Capability, replace: bool
@@ -129,10 +216,9 @@ class Speech:
         task.add_done_callback(done)
         return run
 
-    def _voice(self, voice: str | None, lang: str | None, to_speak: list[Clause]) -> VoiceConfig:
-        """The Voice a `say` speaks in: `voice`, else the default Voice of `lang`, of the
-        language the text is written in, or of the hub's default language. Raises
-        `HubError`."""
+    def _voice(self, voice: str | None, lang: str | None) -> VoiceConfig | None:
+        """The Voice a `say` speaks in: `voice`, else the default Voice of `lang`; None if
+        neither is given. Raises `HubError`."""
         if voice is not None:
             chosen = next((v for v in self._config.voices if v.id == voice), None)
             if chosen is None:
@@ -144,8 +230,7 @@ class Speech:
             if lang not in self._defaults:
                 raise HubError("unsupported", f"no voice speaks {lang!r}")
             return self._defaults[lang]
-        written = language(" ".join(clause.text for clause in to_speak))
-        return self._defaults.get(written or "", self._defaults[self._config.lang])
+        return None
 
     async def _load[E: Engine](self, name: str, role: type[E]) -> E:
         """Make engine `name` on `role`'s thread, and warm it up there."""
@@ -169,3 +254,9 @@ class Speech:
         except Exception as e:
             raise ConfigError(f"speech engine {name!r}: {e}") from e
         return engine
+
+
+def _retrieve(done: asyncio.Future[JsonObject]) -> None:
+    """Mark the error a `say` failed with as seen."""
+    if not done.cancelled():
+        done.exception()

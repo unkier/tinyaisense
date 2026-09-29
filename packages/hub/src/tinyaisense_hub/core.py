@@ -6,13 +6,14 @@ and these calls. Behaviour lives here and below.
 
 import secrets
 
-from tinyaisense_wire import JsonObject
+from tinyaisense_wire import Capability, JsonObject
 
 from .control import Control
 from .devices import Registry
 from .errors import HubError
 from .session import Holder, Session, Sessions, SessionSink, UtteranceOptIn
 from .speech.layer import Speech
+from .state import DeviceRecord
 
 
 class Core:
@@ -102,9 +103,33 @@ class Core:
     ) -> JsonObject:
         """Speak `text` on the speaker at `address`, after what's queued on it, or cutting it
         off if `replace`. Returns how it went once it has played. Raises `HubError`."""
-        device, capability = self._registry.resolve(address)
-        if capability.kind != "speaker":
-            raise HubError("unsupported", f"{address} isn't a speaker")
+        device, capability = self._speaker(address)
         return await self._speech.say(
             session, device, capability, text, voice=voice, lang=lang, replace=replace
         )
+
+    def say_open(
+        self, session: Session, address: str, *, voice: str | None, lang: str | None, replace: bool
+    ) -> int:
+        """Start a `say` on the speaker at `address` whose text comes in with `say_append`,
+        queued as `say` would be. Returns its handle. Raises `HubError`."""
+        device, capability = self._speaker(address)
+        return self._speech.say_open(
+            session, device, capability, voice=voice, lang=lang, replace=replace
+        )
+
+    def say_append(self, session: Session, handle: int, text: str) -> None:
+        """More text for the open `say` `handle`. Raises `HubError`."""
+        self._speech.say_append(session, handle, text)
+
+    async def say_close(self, session: Session, handle: int) -> JsonObject:
+        """No more text comes for the open `say` `handle`. Returns how it went once it has
+        played. Raises `HubError`."""
+        return await self._speech.say_close(session, handle)
+
+    def _speaker(self, address: str) -> tuple[DeviceRecord, Capability]:
+        """The speaker at `address`. Raises `HubError`."""
+        device, capability = self._registry.resolve(address)
+        if capability.kind != "speaker":
+            raise HubError("unsupported", f"{address} isn't a speaker")
+        return device, capability

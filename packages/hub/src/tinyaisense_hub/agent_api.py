@@ -109,6 +109,26 @@ _SAY: Schema = {
         "replace": {"type": "boolean"},
     },
 }
+_SAY_OPEN: Schema = {
+    "type": "object",
+    "required": ["address"],
+    "additionalProperties": False,
+    "properties": {
+        "address": {"type": "string"},
+        "voice": {"type": "string"},
+        "lang": {"type": "string"},
+        "replace": {"type": "boolean"},
+    },
+}
+_SAY_APPEND: Schema = {
+    "type": "object",
+    "required": ["handle", "text"],
+    "additionalProperties": False,
+    "properties": {
+        "handle": {"type": "integer", "minimum": 0, "maximum": 65535},
+        "text": {"type": "string"},
+    },
+}
 _log = logging.getLogger("tinyaisense_hub.agent_api")
 
 
@@ -158,6 +178,9 @@ class AgentLink:
             "stream.stop": (_HANDLE, self._stream_stop),
             "stream.drain": (_HANDLE, self._stream_drain),
             "say": (_SAY, self._say),
+            "say.open": (_SAY_OPEN, self._say_open),
+            "say.append": (_SAY_APPEND, self._say_append),
+            "say.close": (_HANDLE, self._say_close),
         }
 
     async def run(self) -> None:
@@ -376,6 +399,28 @@ class AgentLink:
             lang=params.get("lang"),
             replace=params.get("replace", False),
         )
+
+    async def _say_open(self, params: JsonObject) -> JsonObject:
+        assert self._session is not None
+        handle = self._core.say_open(
+            self._session,
+            params["address"],
+            voice=params.get("voice"),
+            lang=params.get("lang"),
+            replace=params.get("replace", False),
+        )
+        return {"handle": handle}
+
+    async def _say_append(self, params: JsonObject) -> JsonObject:
+        # Requests run as tasks, in the order they came in: an append takes effect before
+        # the next request starts, since nothing here awaits.
+        assert self._session is not None
+        self._core.say_append(self._session, params["handle"], params["text"])
+        return {}
+
+    async def _say_close(self, params: JsonObject) -> JsonObject:
+        assert self._session is not None
+        return await self._core.say_close(self._session, params["handle"])
 
     # Writing.
 

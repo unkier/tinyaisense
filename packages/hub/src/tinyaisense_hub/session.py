@@ -5,12 +5,15 @@ import logging
 import secrets
 import time
 from dataclasses import dataclass, field
-from typing import Literal, Protocol
+from typing import TYPE_CHECKING, Literal, Protocol
 
 from tinyaisense_wire import JsonObject
 
 from .errors import HubError
 from .streams import Stream
+
+if TYPE_CHECKING:
+    from .speech.say import Say  # a Session holds its open says
 
 type Holder = Literal["agent_api", "mcp"]
 """Which front-end claimed the Session."""
@@ -63,6 +66,9 @@ class Session:
     """Epoch ms."""
     streams: dict[int, Stream] = field(default_factory=dict[int, Stream])
     """The handle table: the Session's open streams, by handle."""
+    says: dict[int, Say] = field(default_factory=dict[int, "Say"])
+    """The Session's streaming `say`s, by handle, from `say.open` until `say.close`. They
+    share the handles of streams."""
     _last_handle: int = field(default=0, init=False)
 
     def notify(self, method: str, params: JsonObject) -> None:
@@ -80,7 +86,7 @@ class Session:
         ones. Raises `HubError`: `busy` if every handle is open."""
         for step in range(1, _MAX_HANDLE + 1):
             handle = (self._last_handle + step - 1) % _MAX_HANDLE + 1
-            if handle not in self.streams:
+            if handle not in self.streams and handle not in self.says:
                 self._last_handle = handle
                 return handle
         raise HubError("busy", "every stream handle is open")

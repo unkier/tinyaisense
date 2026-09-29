@@ -20,7 +20,7 @@ from ..speaker import SpeakerStream
 from ..state import DeviceRecord
 from ..streams import FORMAT, EndReason, StreamEnd
 from .engines import Tts
-from .text import Clause
+from .text import Clause, Script
 
 BYTES_PER_MS = FORMAT.frame_bytes // FORMAT.frame_ms
 """Of the device's audio."""
@@ -28,17 +28,27 @@ BYTES_PER_MS = FORMAT.frame_bytes // FORMAT.frame_ms
 _log = logging.getLogger("tinyaisense_hub.speech")
 
 
+@dataclass(frozen=True, slots=True)
+class EngineVoice:
+    """A Voice, as its engine knows it."""
+
+    engine: Tts
+    name: str
+
+
 @dataclass(eq=False)
 class Say:
-    """One `say`, in a run."""
+    """One `say`, in a run. Its text may still be coming in, from `say.append`."""
 
-    text: str
-    clauses: list[Clause]
-    engine: Tts
-    engine_voice: str
-    """The engine's name for the Voice."""
+    script: Script
     session: Session
     address: str
+    voice: EngineVoice | None = None
+    """What it speaks in. Picked by the time its script has a clause."""
+    more: asyncio.Event = field(default_factory=asyncio.Event)
+    """Set when its script has more clauses, or closes."""
+    idle: asyncio.TimerHandle | None = None
+    """Cuts the tail of its script once no text has come for a while."""
     done: asyncio.Future[JsonObject] = field(
         default_factory=lambda: asyncio.get_running_loop().create_future()
     )
@@ -66,14 +76,15 @@ class Say:
             fed = self.ends[-1] if self.ends else self.start
             played_ms = max(0, min(played, fed) - self.start) // BYTES_PER_MS
             heard = sum(end <= played for end in self.ends)
+        text, clauses = self.script.text, self.script.clauses
         result: JsonObject = {
             "reason": reason,
             "played_ms": played_ms,
-            "interrupted": reason != "drained" or heard < len(self.clauses),
-            "heard_text": self.text[: self.clauses[heard - 1].end].strip() if heard else "",
+            "interrupted": reason != "drained" or heard < len(clauses),
+            "heard_text": text[: clauses[heard - 1].end].strip() if heard else "",
         }
         self.done.set_result(result)
-        self.session.notify("say.ended", {"address": self.address, "text": self.text, **result})
+        self.session.notify("say.ended", {"address": self.address, "text": text, **result})
 
 
 class Cut(Exception):
@@ -206,11 +217,14 @@ class Run:
             index += 1
 
     async def _feed_say(self, say: Say, starting: asyncio.Future[SpeakerStream]) -> bool:
-        """Synthesize `say` a clause at a time, and feed it. If the TTS fails, the rest of it
-        is skipped. Returns False if the stream was cut: nothing more is synthesized."""
+        """Synthesize `say` a clause at a time, as they come in, and feed it. If the TTS
+        fails, the rest of it is skipped. Returns False if the stream was cut: nothing more
+        is synthesized."""
         say.start = self._fed
-        for clause in say.clauses:
-            synthesis = _Synthesis(self._executor, say.engine, clause.text, say.engine_voice)
+        while (clause := await _clause(say, len(say.ends))) is not None:
+            voice = say.voice
+            assert voice is not None
+            synthesis = _Synthesis(self._executor, voice.engine, clause.text, voice.name)
             try:
                 while not self._cut:
                     try:
@@ -222,7 +236,7 @@ class Run:
                     if pcm is None:
                         break
                     stream = await starting
-                    self._feed_pcm(stream, pcm, say.engine.rate)
+                    self._feed_pcm(stream, pcm, voice.engine.rate)
                     await self._keep_ahead(stream)
             finally:
                 synthesis.close()
@@ -297,6 +311,16 @@ class Run:
         for say in self.says:
             say.finish(end.reason, played)
         self.ended.set_result(end.reason)
+
+
+async def _clause(say: Say, index: int) -> Clause | None:
+    """Clause `index` of `say`'s script, once it's in; None if the script closes without
+    it."""
+    clauses = say.script.clauses
+    while index == len(clauses) and not say.script.closed:
+        say.more.clear()
+        await say.more.wait()
+    return clauses[index] if index < len(clauses) else None
 
 
 class _Synthesis:
