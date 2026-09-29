@@ -369,6 +369,7 @@ async def test_a_restart_goes_out_as_stop_then_start_on_a_new_id_pipelined(
     device, speaker = await online(hub)
     async with tinyaisense.connect(hub.agent_url, TOKEN) as agent:
         await command(device)  # the Status: agent
+        await command(device)  # arming the Reflex
         first = asyncio.create_task(agent.stream_start(speaker))
         start = await command(device)
         device.send(Reply(start.id, {"format": start.args["format"]}))
@@ -400,6 +401,7 @@ async def test_a_drained_event_ends_the_stream_with_the_devices_stats(
     device, speaker = await online(hub)
     async with tinyaisense.connect(hub.agent_url, TOKEN) as agent:
         await command(device)  # the Status: agent
+        await command(device)  # arming the Reflex
         handle = await started(device, agent, speaker)
 
         ending = asyncio.create_task(agent.stream_drain(handle))
@@ -591,6 +593,7 @@ async def test_a_reflex_cut_on_the_device_ends_the_stream_reflex(start_hub: Star
     async with tinyaisense.connect(hub.agent_url, TOKEN) as agent:
         notifications = agent.notifications()
         await command(device)  # the Status: agent
+        await command(device)  # arming the Reflex
         handle = await started(device, agent, speaker)
 
         device.send(Event(0, "speaker", "stopped", 0, {"stream": 1, "reason": "reflex"} | STATS))
@@ -612,6 +615,7 @@ async def test_a_start_that_times_out_is_stopped_in_case_the_device_starts_it_la
     device, speaker = await online(hub)
     async with tinyaisense.connect(hub.agent_url, TOKEN) as agent:
         await command(device)  # the Status: agent
+        await command(device)  # arming the Reflex
         starting = asyncio.create_task(agent.stream_start(speaker))
         start = await command(device)  # and no reply
 

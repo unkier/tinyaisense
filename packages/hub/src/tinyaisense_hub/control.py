@@ -13,15 +13,16 @@ from collections import deque
 from collections.abc import Callable, Coroutine
 from typing import Any, Literal
 
-from tinyaisense_wire import KINDS, Capability, Event, JsonObject, Manifest
+from tinyaisense_wire import KINDS, Capability, Event, JsonObject, Manifest, SchemaError, validate
 
 from .alarm import Alarm, now_us
 from .config import Timing
 from .devices import CommandSpec, DeviceConnection, check_args, volume_commands
 from .errors import HubError
-from .gestures import Down, Gestures, Up
+from .gestures import Down, Gesture, Gestures, Up
 from .keepalive import Tick
-from .mic import MicStream
+from .mic import STARTED as MIC_STARTED
+from .mic import Listener, MicStream
 from .session import Session
 from .speaker import DRAINED, STOP_RESULT, STOPPED, Speakers, SpeakerStream, stats
 from .state import DeviceRecord
@@ -35,6 +36,8 @@ _PREFILL_MS = 40
 """A speaker stream's default `prefill_ms`."""
 _RATE = 16000
 """A stream's default rate, for the agent."""
+_RELEASE_WAIT_MS = KINDS["mic"].commands["stop"].timeout_ms
+"""How long a Reflex stream waits for its `mic.stopped` after the release, as for a `stop`."""
 
 _log = logging.getLogger("tinyaisense_hub.control")
 
@@ -45,6 +48,7 @@ class Controller:
     def __init__(
         self,
         conn: DeviceConnection,
+        record: DeviceRecord,
         workers: set[asyncio.Task[None]],
         thinking: Thinking,
         think: Callable[[Controller, Tick, int], None],
@@ -54,6 +58,8 @@ class Controller:
         """`workers` collects the task that runs the ops, while it runs. `think` runs the
         `thinking` core when its deadline is due, and `gesture` the `gestures` when one is."""
         self.conn = conn
+        self.record = record
+        """The device's record as it came online."""
         self.up_to_date = False
         """Whether the bring-up is done: the Session hears of the device from then on."""
         self.thinking = thinking
@@ -66,7 +72,8 @@ class Controller:
         self._worker: asyncio.Task[None] | None = None
         self._workers = workers
         self.streams: dict[str, Stream] = {}
-        """Capability id → the agent stream open on it."""
+        """Capability id → the Session's stream open on it: the agent's, the hub's for it, or
+        the Reflex's."""
 
     def submit[T](self, op: _Op[T]) -> asyncio.Future[T]:
         """Queue `op`. The future holds its outcome. Cancelling the future before the op starts
@@ -131,6 +138,11 @@ class Control:
         self._session: Session | None = None
         self._claims: dict[str, LedClaim] = {}
         """device_id → the Session's LED claim on it."""
+        self._disarmed: set[str] = set()
+        """The device_ids whose Reflex the Session has disarmed. Every other one is armed while
+        the Session lasts."""
+        self.talk: Callable[[Session, DeviceRecord, Capability], Listener] | None = None
+        """Makes the Utterance that push-to-talk on a mic is, and returns what hears it."""
 
     async def close(self) -> None:
         """Wait for every op to finish: they fail fast once the Connections are closed."""
@@ -153,7 +165,7 @@ class Control:
             if cap.kind == "button"
         }
         controller = Controller(
-            conn, self._workers, self._thinking(), self._think, gestures, self._gestures
+            conn, record, self._workers, self._thinking(), self._think, gestures, self._gestures_due
         )
         self._controllers[conn.manifest.device_id] = controller
         _log_failure(controller.submit(lambda: self._bring_up(conn, record)))
@@ -171,16 +183,35 @@ class Control:
             return
         if event.cap in controller.gestures and event.name in ("down", "up"):
             at = conn.clock.to_hub(event.ts)
-            edge = (Down if event.name == "down" else Up)(now_us() if at is None else at)
-            self._gestures(controller, edge, now_us(), event.cap)
+            at = now_us() if at is None else at
+            if event.name == "down":
+                armed = self._armed(conn.manifest.device_id)
+                self._gestures(controller, Down(at, armed), now_us(), event.cap)
+                if armed:
+                    self._hold(controller)
+            else:
+                gestures = self._gestures(controller, Up(at), now_us(), event.cap)
+                self._release(controller, click=any(g.name == "click" for g in gestures))
             return
         stream = controller.streams.get(event.cap)
-        if not isinstance(stream, SpeakerStream) or event.data.get("stream") != stream.stream_id:
-            return
-        if event.name == "drained":
-            self._end(stream, "drained", stats(DRAINED, event.data))
-        elif event.name == "stopped":  # the Reflex cut the speaker
-            self._end(stream, "reflex", stats(STOPPED, event.data))
+        ours = stream is not None and event.data.get("stream") == stream.stream_id
+        if isinstance(stream, SpeakerStream) and ours:
+            if event.name == "drained":
+                self._end(stream, "drained", stats(DRAINED, event.data))
+            elif event.name == "stopped":  # the Reflex cut the speaker
+                self._end(stream, "reflex", stats(STOPPED, event.data))
+        elif event.name == "started" and _kind(conn.manifest, event.cap) == "mic":
+            self._reflex_started(controller, event)
+        elif isinstance(stream, MicStream) and ours and stream.reflex and event.name == "stopped":
+            if stream.open:  # no `up` closed it
+                self._closing(stream)
+            stream.stopped(event.data)
+
+    def device_stream(self, conn: DeviceConnection, stream: int) -> MicStream | None:
+        """A frame on a device-range id that isn't open: the Reflex's stream, if it's armed.
+        Its frames wait for its `mic.started`."""
+        controller = self._current(conn)
+        return None if controller is None else self._reflex_open(controller, stream)
 
     def device_offline(self, conn: DeviceConnection) -> None:
         device_id = conn.manifest.device_id
@@ -195,12 +226,15 @@ class Control:
             self._session.notify("device.offline", {"device": conn.name})
 
     async def _bring_up(self, conn: DeviceConnection, record: DeviceRecord) -> None:
-        """After `welcome`, pipelined: the owner's volume, the Status, then the LED claim."""
+        """After `welcome`, pipelined: the owner's volume, the Status, the Reflex, then the LED
+        claim. The device came up disarmed."""
         commands: list[CommandSpec] = []
         if record.volume is not None:
             # Read now, not at `welcome`: the owner may have changed it since.
             commands += volume_commands(conn.manifest, record.volume)
         commands.append(_status(self._hub_status()))
+        if self._armed(conn.manifest.device_id):
+            commands += _reflex(conn.manifest, armed=True)
         if (claim := self._claims.get(conn.manifest.device_id)) is not None:
             commands += claim.replay()
         await conn.pipeline(commands, strict=False)
@@ -216,14 +250,17 @@ class Control:
     def session_started(self, session: Session) -> None:
         self._session = session
         self._claims = {}
+        self._disarmed = set()
         for controller in self._controllers.values():
-            _log_failure(controller.submit(_pipeline_op(controller.conn, [_status("agent")])))
+            commands = [_status("agent"), *_reflex(controller.conn.manifest, armed=True)]
+            _log_failure(controller.submit(_pipeline_op(controller.conn, commands)))
 
     async def session_ended(self, session: Session) -> None:
-        """Stop the Session's streams, release its LED claims, then set every device's
-        Status to `no_agent`."""
+        """Stop the Session's speaker streams, then its mic streams, release its LED claims,
+        disarm the Reflex, then set every device's Status to `no_agent`."""
         self._session = None
         claims, self._claims = self._claims, {}
+        self._disarmed = set()
         ops: list[asyncio.Future[None]] = []
         for device_id, controller in self._controllers.items():
             controller.thinking = self._thinking()
@@ -234,15 +271,20 @@ class Control:
     def _end_op(
         self, controller: Controller, session: Session, claim: LedClaim | None
     ) -> _Op[None]:
-        """Stop the Session's streams, release `claim`, then set the Status to `no_agent`,
-        pipelined. The streams and the claim are read when the op starts, so they hold what
-        the ops queued before it did."""
+        """Stop the Session's speaker streams, then its mic streams, which ends its listens,
+        release `claim`, disarm the Reflex, then set the Status to `no_agent`, pipelined. The
+        streams and the claim are read when the op starts, so they hold what the ops queued
+        before it did."""
 
         async def op() -> None:
             conn = controller.conn
-            streams = [s for s in controller.streams.values() if s.session is session]
+            streams = sorted(
+                (s for s in controller.streams.values() if s.session is session),
+                key=lambda stream: isinstance(stream, MicStream),
+            )
             commands = [self._halt(stream) for stream in streams]
             commands += claim.releases() if claim is not None else []
+            commands += _reflex(conn.manifest, armed=False)
             commands.append(_status("no_agent"))
             replies = await asyncio.gather(
                 *(conn.command(*command) for command in commands), return_exceptions=True
@@ -302,6 +344,107 @@ class Control:
 
         await controller.submit(op)
 
+    def _reflex_started(self, controller: Controller, event: Event) -> None:
+        """The Reflex opened a mic stream: it starts, opening first if no frame has yet."""
+        conn = controller.conn
+        try:
+            validate(MIC_STARTED, event.data, "data")
+        except SchemaError as e:
+            _log.warning("%s: bad mic.started: %s", conn.name, e)
+            return
+        stream_id: int = event.data["stream"]
+        stream = conn.receivers.get(stream_id)
+        if stream is None and stream_id not in conn.stream_ids.closed:
+            stream = self._reflex_open(controller, stream_id)
+        if isinstance(stream, MicStream) and stream.reflex and stream.cap == event.cap:
+            stream.started()
+
+    def _reflex_open(self, controller: Controller, stream_id: int) -> MicStream | None:
+        """Open the stream the Reflex started on `stream_id`, while it's armed: push-to-talk,
+        held. None if the hub takes no stream from it, and its frames are dropped. A stream
+        the hub stopped on the mic, which waits for its tail, doesn't keep it out."""
+        conn, record = controller.conn, controller.record
+        session, mic = self._session, _reflex_mic(conn.manifest)
+        if (
+            session is None
+            or self.talk is None
+            or mic is None
+            or ((old := controller.streams.get(mic.id)) is not None and old.open)
+            or not self._armed(record.device_id)
+        ):
+            return None
+        try:
+            listener = self.talk(session, record, mic)
+        except HubError as e:
+            _log.warning("%s/%s: push-to-talk failed: %s", record.name, mic.id, e)
+            return None
+        tail = self._timing.mic_tail_ms * 1000
+        address = f"{record.name}/{mic.id}"
+        stream = MicStream.listened(session, conn, mic.id, stream_id, address, listener, tail=tail)
+        stream.reflex = True
+        conn.receivers[stream_id] = stream
+        controller.streams[mic.id] = stream
+        stream.held = True
+        listener.held()
+        self._think(controller, Moved())
+        return stream
+
+    def _hold(self, controller: Controller) -> None:
+        """An armed press: a listen on the Reflex's mic is the human's to end, from now on."""
+        mic = _reflex_mic(controller.conn.manifest)
+        stream = None if mic is None else controller.streams.get(mic.id)
+        if not isinstance(stream, MicStream) or stream.held or not stream.open:
+            return
+        if stream.listener is not None:
+            stream.held = True
+            stream.listener.held()
+
+    def _release(self, controller: Controller, *, click: bool) -> None:
+        """The button let go: the listen it held ends, `button`, or `click` after a click. The
+        device closes a stream its Reflex opened by itself."""
+        for stream in list(controller.streams.values()):
+            if isinstance(stream, MicStream) and stream.held:
+                stream.held = False
+                if stream.reflex and stream.open:
+                    self._closing(stream)
+                if stream.listener is not None:
+                    stream.listener.released(click)
+
+    def _closing(self, stream: MicStream) -> None:
+        """The device is closing a Reflex stream by itself: it ends `reflex` once its tail is
+        in, after its `mic.stopped`, or once that's overdue."""
+        stream.stopping = True
+        task = asyncio.create_task(self._released(stream))
+        self._workers.add(task)
+        task.add_done_callback(self._workers.discard)
+
+    async def _released(self, stream: MicStream) -> None:
+        with contextlib.suppress(TimeoutError):
+            async with asyncio.timeout(_RELEASE_WAIT_MS / 1000 + self._timing.mic_tail_ms / 1000):
+                await asyncio.shield(stream.finished)
+        self._end(stream, "reflex", None)
+
+    async def reflex_set(self, session: Session, device: DeviceRecord, armed: bool) -> None:
+        """Arm or disarm the device's Reflex while the Session lasts, reconnects included.
+        Raises `HubError`: `unsupported` for a device with no button."""
+        self._require_current(session)
+        if not _reflex(device.manifest, armed=armed):
+            raise HubError("unsupported", f"{device.name} has no button")
+        if armed:
+            self._disarmed.discard(device.device_id)
+        else:
+            self._disarmed.add(device.device_id)
+        controller = self._controllers.get(device.device_id)
+        if controller is None:
+            return  # it's armed or not as it comes back
+
+        async def op() -> None:
+            self._require_current(session)
+            conn = controller.conn
+            await conn.pipeline(_reflex(conn.manifest, armed=self._armed(device.device_id)))
+
+        await controller.submit(op)
+
     async def stream_start(
         self,
         session: Session,
@@ -325,6 +468,8 @@ class Control:
 
         async def op() -> int:
             self._require_current(session)
+            if capability.kind == "speaker":
+                _check_held(controller, address)
             conn = controller.conn
             handle = session.new_handle()
             stream_id = conn.stream_ids.open()
@@ -372,6 +517,7 @@ class Control:
 
         async def op() -> SpeakerStream:
             self._require_current(session)
+            _check_held(controller, address)
             conn = controller.conn
             stream_id = conn.stream_ids.open()
             stream = SpeakerStream(
@@ -390,18 +536,12 @@ class Control:
         session: Session,
         device: DeviceRecord,
         capability: Capability,
-        *,
-        audio: int | None,
-        rate: int,
-        tap: Callable[[bytes], None],
-        on_started: Callable[[MicStream], None],
-        on_end: Callable[[StreamEnd], None],
+        listener: Listener,
     ) -> MicStream:
-        """Open a mic stream that the hub runs itself, for a listen. The agent gets no
-        `stream.*` notifications for it: only its frames, on the handle `audio` at `rate`, if
-        given. `tap` takes each frame at the device's rate, from just after `on_started` is
-        called; `on_end` is called as the stream ends. It preempts as `stream_start` does, and
-        ends `thinking` on the device. Raises `HubError`."""
+        """Open a mic stream that the hub runs itself, for a listen, which `listener` hears.
+        The agent gets no `stream.*` notifications for it: only its frames, on the listener's
+        `audio` handle, if it has one. It preempts as `stream_start` does, and ends `thinking`
+        on the device. Raises `HubError`."""
         address = f"{device.name}/{capability.id}"
         if not FORMAT.offered(capability.params):
             raise HubError("unsupported", f"{address} has no 16 kHz mono PCM in 10 ms frames")
@@ -412,12 +552,9 @@ class Control:
             conn = controller.conn
             stream_id = conn.stream_ids.open()
             tail = self._timing.mic_tail_ms * 1000
-            stream = MicStream(
-                None, session, conn, capability.id, stream_id, address, rate, audio=audio, tail=tail
+            stream = MicStream.listened(
+                session, conn, capability.id, stream_id, address, listener, tail=tail
             )
-            stream.tap = tap
-            stream.on_started = lambda: on_started(stream)
-            stream.on_end = on_end
             await self._open(controller, stream)
             self._think(controller, Moved())
             return stream
@@ -648,18 +785,24 @@ class Control:
 
     def _gestures(
         self, controller: Controller, input: Down | Up | Tick, now: int, cap: str | None = None
-    ) -> None:
+    ) -> list[Gesture]:
         """Run the gestures of button `cap`, or of every button for a `Tick`, and send what
-        they see to the Session."""
+        they see to the Session. Returns what they saw."""
         conn = controller.conn
+        seen: list[Gesture] = []
         for cap_id, gestures in controller.gestures.items():
             if cap is not None and cap_id != cap:
                 continue
             for gesture in gestures.handle(input, now):
+                seen.append(gesture)
                 self._button_event(controller, cap_id, gesture.name, {}, gesture.ts)
         deadlines = [d for g in controller.gestures.values() if (d := g.next_deadline())]
         if self._current(conn) is controller:
             controller.gestures_alarm.set(min(deadlines, default=None), now)
+        return seen
+
+    def _gestures_due(self, controller: Controller, tick: Tick, now: int) -> None:
+        self._gestures(controller, tick, now)
 
     def _button_event(
         self,
@@ -699,6 +842,10 @@ class Control:
     def _hub_status(self) -> _HubStatus:
         return "no_agent" if self._session is None else "agent"
 
+    def _armed(self, device_id: str) -> bool:
+        """Whether the device's Reflex is to be armed."""
+        return self._session is not None and device_id not in self._disarmed
+
     def _current(self, conn: DeviceConnection) -> Controller | None:
         """The controller of `conn`, while it's the device's online Connection."""
         controller = self._controllers.get(conn.manifest.device_id)
@@ -727,6 +874,35 @@ def _group(manifest: Manifest, cap: str) -> list[str]:
 
 def _status(state: _HubStatus) -> CommandSpec:
     return (None, "status", {"state": state})
+
+
+def _reflex(manifest: Manifest, *, armed: bool) -> list[CommandSpec]:
+    """Each button's `set_reflex`. Armed, it cuts every speaker, then opens `_reflex_mic`."""
+    capabilities = manifest.capabilities
+    args: JsonObject = {"armed": armed}
+    if armed:
+        if stop := [cap.id for cap in capabilities if cap.kind == "speaker"]:
+            args["stop"] = stop
+        if (mic := _reflex_mic(manifest)) is not None:
+            args["start"] = {"cap": mic.id, "format": FORMAT.to_json()}
+    return [(cap.id, "set_reflex", args) for cap in capabilities if cap.kind == "button"]
+
+
+def _reflex_mic(manifest: Manifest) -> Capability | None:
+    """The mic the Reflex opens: the first that captures the hub's format."""
+    mics = (cap for cap in manifest.capabilities if cap.kind == "mic")
+    return next((mic for mic in mics if FORMAT.offered(mic.params)), None)
+
+
+def _kind(manifest: Manifest, cap: str) -> str | None:
+    return next((c.kind for c in manifest.capabilities if c.id == cap), None)
+
+
+def _check_held(controller: Controller, address: str) -> None:
+    """Raises `busy` while the human holds the button for a mic of the device: the human
+    wins."""
+    if any(isinstance(s, MicStream) and s.held for s in controller.streams.values()):
+        raise HubError("busy", f"{address}: the human holds the button to talk")
 
 
 def _pipeline_op(conn: DeviceConnection, commands: list[CommandSpec]) -> _Op[None]:

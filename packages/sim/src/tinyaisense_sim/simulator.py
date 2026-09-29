@@ -15,6 +15,7 @@ import time
 from collections import Counter, deque
 from collections.abc import Callable
 from importlib.metadata import version
+from os import PathLike
 from pathlib import Path
 from typing import Literal, cast
 
@@ -47,8 +48,9 @@ from tinyaisense_wire import (
     validate,
 )
 
+from . import sources
 from .backoff import Backoff
-from .button import Edge, SimButton
+from .button import FIRST_STREAM, LAST_STREAM, Edge, Reflex, SimButton
 from .discovery import Mdns, Resolve
 from .faults import ConnectionSocket, Faults
 from .led import Light, SimLed
@@ -238,6 +240,14 @@ class SimDevice:
             for cap in manifest.capabilities
             if cap.kind == "button"
         }
+        self._reflexes: dict[str, Reflex] = {}
+        """The armed buttons' Reflexes. A drop disarms them all."""
+        self._pressed: set[str] = set()
+        """The buttons pressed while online, on this Connection: only their `up` goes out."""
+        self._opened: dict[str, tuple[str, int]] = {}
+        """The mic and stream id each held button's Reflex opened."""
+        self._device_stream = LAST_STREAM
+        """The device-range stream id the Reflex opened last."""
 
     @property
     def device_id(self) -> str:
@@ -274,6 +284,35 @@ class SimDevice:
         """The button capability, on a Board with one."""
         [button] = self._buttons.values()
         return button
+
+    @property
+    def armed(self) -> bool:
+        """Whether the button's Reflex is armed, on a Board with one button."""
+        [button] = self._buttons
+        return button in self._reflexes
+
+    async def talk(self, audio: bytes | str | PathLike[str], button: str | None = None) -> None:
+        """Push to talk: press `button`, let the mic hear `audio` in real time, then release.
+
+        `audio` is PCM, e.g. from `sources`, or a WAV file. The mic is the Reflex's, or the
+        Board's only one. It hears only while it streams: with the Reflex disarmed and the mic
+        idle, the press and release go out, and nothing is heard. What's left unheard when the
+        mic stops is never heard. `button` may be left out on a Board with one.
+        """
+        if button is None:
+            [button] = self._buttons
+        pcm = audio if isinstance(audio, bytes) else sources.wav(audio)
+        reflex = self._reflexes.get(button)
+        cap = next(iter(self._mics)) if reflex is None or reflex.start is None else reflex.start[0]
+        mic = self._mics[cap]
+        self._buttons[button].press()
+        try:
+            if mic.stream is not None:
+                mic.feed(pcm)
+                await self.wait_for(lambda: mic.stream is None or not mic.unheard)
+                mic.forget()
+        finally:
+            self._buttons[button].release()
 
     def lights(self, cap: str = "led") -> tuple[Light, ...]:
         """What each LED of the led capability `cap` shows now, the Status included."""
@@ -436,6 +475,9 @@ class SimDevice:
             speaker.cut()
         for mic in self._mics.values():
             mic.cut()
+        self._reflexes.clear()
+        self._pressed.clear()
+        self._opened.clear()
         self._layers.claimed = False
 
     def _emit(self, cap: str, name: str, data: JsonObject, *, mirror: bool = False) -> None:
@@ -459,7 +501,85 @@ class SimDevice:
     # The button.
 
     def _button_edge(self, cap: str) -> Callable[[Edge], None]:
-        return lambda edge: self._emit(cap, edge, {}, mirror=True)
+        return lambda edge: self._edge(cap, edge)
+
+    def _edge(self, cap: str, edge: Edge) -> None:
+        """Send an edge, then run the Reflex. A press made offline, or held across a
+        reconnect, is ignored until the next one."""
+        if edge == "down":
+            if self.state != "online":
+                return
+            self._pressed.add(cap)
+            self._emit(cap, "down", {}, mirror=True)
+            if (reflex := self._reflexes.get(cap)) is not None:
+                self._reflex_down(cap, reflex)
+        elif cap in self._pressed:
+            self._pressed.remove(cap)
+            self._emit(cap, "up", {}, mirror=True)
+            self._reflex_up(cap)
+
+    def _set_reflex(self, button: str, args: JsonObject) -> None:
+        """Raises `_Refused`."""
+        if not args["armed"]:
+            self._reflexes.pop(button, None)
+            return
+        stop = tuple[str, ...](args.get("stop", []))
+        for cap in stop:
+            if cap not in self._speakers:
+                raise _Refused("invalid_args", f"the Reflex can't cut {cap!r}: it's no speaker")
+        start = None
+        if (target := args.get("start")) is not None:
+            mic = next((c for c in self.manifest.capabilities if c.id == target["cap"]), None)
+            if mic is None or mic.kind != "mic":
+                raise _Refused("invalid_args", f"the Reflex can't open {target['cap']!r}: no mic")
+            format = AudioFormat.from_json(target["format"])
+            if not format.offered(mic.params):
+                raise _Refused("invalid_args", f"the mic doesn't capture {target['format']}")
+            start = (mic.id, format)
+        self._reflexes[button] = Reflex(stop, start)
+
+    def _reflex_down(self, button: str, reflex: Reflex) -> None:
+        """Cut the `stop` speakers, run the exclusive switch, then open the `start` mic."""
+        if reflex.start is not None and self._mics[reflex.start[0]].stream is not None:
+            return  # the mic is on a hub stream: the hub decides what happens to it
+        for cap in reflex.stop:
+            self._cut(cap)
+        if reflex.start is None:
+            return
+        cap, format = reflex.start
+        for group in self.manifest.exclusive:
+            if cap in group:
+                for peer in group:
+                    self._cut(peer)
+        stream = self._next_device_stream()
+        self._mics[cap].start(stream, format)
+        self._opened[button] = (cap, stream)
+        self._emit(cap, "started", {"stream": stream, "format": format.to_json()})
+
+    def _reflex_up(self, button: str) -> None:
+        """Close the mic this press's Reflex opened, unless the hub has stopped it."""
+        if (opened := self._opened.pop(button, None)) is None:
+            return
+        cap, stream = opened
+        mic = self._mics[cap]
+        if mic.stream == stream:
+            self._emit(cap, "stopped", {"stream": stream, "reason": "reflex"} | mic.stop())
+
+    def _cut(self, cap: str) -> None:
+        """Patch-cut `cap` if it's a playing speaker, for the Reflex."""
+        speaker = self._speakers.get(cap)
+        if speaker is not None and (stream := speaker.stream) is not None:
+            stats = self._speaker_stop(cap)
+            self._emit(cap, "stopped", {"stream": stream, "reason": "reflex"} | stats)
+
+    def _next_device_stream(self) -> int:
+        """The next device-range stream id, round-robin, past any a mic has open."""
+        busy = {mic.stream for mic in self._mics.values()}
+        while True:
+            last = self._device_stream
+            self._device_stream = FIRST_STREAM if last == LAST_STREAM else last + 1
+            if self._device_stream not in busy:
+                return self._device_stream
 
     # UDP.
 
@@ -642,6 +762,9 @@ class SimDevice:
             case "led", "release":
                 assert command.cap is not None
                 self._leds[command.cap].release()
+            case "button", "set_reflex":
+                assert command.cap is not None
+                self._set_reflex(command.cap, args)
             case _:
                 raise _Refused("unsupported", f"the Simulator doesn't do {kind} {name!r} yet")
         self._layers.claimed = self._status_led is not None and self._status_led.claim is not None

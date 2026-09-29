@@ -1,8 +1,9 @@
-"""`listen`: an Utterance heard on a mic, on a stream the hub runs.
+"""`listen`: an Utterance heard on a mic, on a stream the hub runs, or the Reflex opened.
 
 The VAD rates the mic's audio as it comes in, on its own thread, and the listen core
 (`listening`) cuts it into segments and says when the listen ends. Each segment is
-transcribed, and the end-of-turn model judges it, at once and in parallel.
+transcribed, and the end-of-turn model judges it, at once and in parallel. While the human
+holds the button, only the release ends it.
 """
 
 import asyncio
@@ -20,12 +21,12 @@ from ..config import Timing
 from ..control import Control
 from ..errors import HubError
 from ..keepalive import Tick
-from ..mic import MicStream
+from ..mic import Listener, MicStream
 from ..session import Session, UtteranceOptIn
 from ..state import DeviceRecord
 from ..streams import FORMAT, StreamEnd
 from .engines import Engine, Stt, Transcript, Turn, Vad
-from .listening import End, EndReason, Listening, Segment, Stop, TurnVerdict, Window
+from .listening import End, EndReason, Hold, Listening, Segment, Stop, TurnVerdict, Window
 
 type Trigger = Literal["listen", "then_listen", "button"]
 """What started an Utterance."""
@@ -62,7 +63,7 @@ class Listen:
 
     def __init__(
         self,
-        ears: Ears,
+        ears: Ears | None,
         control: Control,
         timing: Timing,
         session: Session,
@@ -94,6 +95,8 @@ class Listen:
         """From the mic's start."""
         self._stop: EndReason | None = None
         """Why it ends, if it's stopped before its mic starts."""
+        self._held = False
+        """Whether the human holds the button for it."""
         self._alarm = Alarm(lambda now: self._run(Tick(), now))
         self._audio = bytearray()
         """What the mic heard, at the device's rate."""
@@ -106,18 +109,23 @@ class Listen:
         """Each segment's length in samples, and its transcript to come."""
         self._tasks: set[asyncio.Future[None]] = set()
 
+    def listener(self) -> Listener:
+        """What hears its mic stream."""
+        return Listener(
+            audio=self.handle,
+            rate=self._utterances.rate,
+            hear=self._hear,
+            started=self._started,
+            ended=self._mic_ended,
+            held=self._hold,
+            released=self._released,
+        )
+
     async def start(self) -> None:
         """Open the mic. Raises `HubError`, as `done` does, the listen being over."""
         try:
             await self._control.mic_start(
-                self.session,
-                self._device,
-                self._capability,
-                audio=self.handle,
-                rate=self._utterances.rate,
-                tap=self._hear,
-                on_started=self._started,
-                on_end=self._mic_ended,
+                self.session, self._device, self._capability, self.listener()
             )
         except BaseException as e:
             self.session.listens.discard(self)
@@ -141,6 +149,15 @@ class Listen:
         else:
             self._run(Stop(reason))
 
+    def _hold(self) -> None:
+        """The human holds the button: push-to-talk, until the release."""
+        self._held = True
+        if self._core is not None:
+            self._run(Hold())
+
+    def _released(self, click: bool) -> None:
+        self.stop("click" if click else "button")
+
     def _started(self, stream: MicStream) -> None:
         self._stream = stream
         params: JsonObject = {
@@ -151,11 +168,17 @@ class Listen:
         if self.handle is not None:
             params["handle"] = self.handle
         self.session.notify("utterance.start", params)
-        self._core = Listening(now_us(), self._timing, window=self._ears.vad.window)
+        window = 0 if self._ears is None else self._ears.vad.window
+        self._core = Listening(now_us(), self._timing, window=window)
+        if self._held:
+            self._run(Hold())
         self._run(Stop(self._stop) if self._stop is not None else Tick())
 
     def _hear(self, pcm: bytes) -> None:
-        """A frame from the mic: have the VAD rate each whole window it completes."""
+        """A frame from the mic: have the VAD rate each whole window it completes. With no
+        engines to hear with, only the release or the time limit ends the listen."""
+        if self._ears is None:
+            return
         self._audio += pcm
         window = self._ears.vad.window * _SAMPLE
         loop = asyncio.get_running_loop()
@@ -168,6 +191,7 @@ class Listen:
 
     def _rate(self, pcm: bytes) -> float:
         """On the VAD's thread."""
+        assert self._ears is not None
         vad = self._ears.vad
         if self._vad_state is None:
             self._vad_state = vad.new_state()
@@ -185,9 +209,16 @@ class Listen:
                 self._run(Window(rating.result()))
 
     def _mic_ended(self, end: StreamEnd) -> None:
-        self.stop("disconnected" if end.reason == "disconnected" else "stopped")
+        if self._stream is None:  # the Reflex's stream, ended before it started
+            self.session.listens.discard(self)
+            self.done.cancel()  # the agent never heard of it
+            return
+        reasons: dict[str, EndReason] = {"disconnected": "disconnected", "reflex": "button"}
+        self.stop(reasons.get(end.reason, "stopped"))
 
-    def _run(self, input: Window | TurnVerdict | Stop | Tick, now: int | None = None) -> None:
+    def _run(
+        self, input: Window | TurnVerdict | Hold | Stop | Tick, now: int | None = None
+    ) -> None:
         assert self._core is not None
         now = now_us() if now is None else now
         for action in self._core.handle(input, now):
@@ -204,6 +235,7 @@ class Listen:
         before = self._segments[-1][1] if self._segments else None
         transcript = asyncio.ensure_future(self._transcribe(pcm, before))
         self._segments.append((segment.end - segment.start, transcript))
+        assert self._ears is not None
         if segment.turn and self._ears.turn is not None:
             start = max(0, segment.end - TURN_MS * FORMAT.rate // 1000)
             turn = bytes(self._audio[start * _SAMPLE : segment.end * _SAMPLE])
@@ -216,6 +248,7 @@ class Listen:
         segments before it; None if the STT failed."""
         if not self._utterances.transcript:
             return None
+        assert self._ears is not None
         loop = asyncio.get_running_loop()
         try:
             transcript = await loop.run_in_executor(
@@ -234,6 +267,7 @@ class Listen:
         return transcript
 
     async def _judge(self, index: int, pcm: bytes) -> None:
+        assert self._ears is not None
         turn = self._ears.turn
         assert turn is not None
         loop = asyncio.get_running_loop()
@@ -245,8 +279,13 @@ class Listen:
         self._run(TurnVerdict(index, complete >= TURN_COMPLETE))
 
     async def _end(self, reason: EndReason) -> None:
-        """Close the mic, and deliver the Utterance once its segments are transcribed."""
+        """Close the mic, and deliver the Utterance once its segments are transcribed. A click
+        discards what was said."""
         assert self._stream is not None
+        if reason == "click":
+            for _, transcript in self._segments:
+                transcript.cancel()
+            self._segments = []
         end = await self._control.stop(self._stream)
         heard = [(length, await transcript) for length, transcript in self._segments]
         frames = end.stats["frames"] + end.stats["skipped"]
@@ -266,9 +305,10 @@ class Listen:
         lost: int,
     ) -> JsonObject:
         """The `utterance.end` params, given each segment's length and transcript. Its
-        transcript joins theirs, and its lang is that of the longest one with words."""
+        transcript joins theirs, and its lang is that of the longest one with words. With no
+        engines to hear with, it has no transcript."""
         result: JsonObject = {"utterance_id": self.id, "reason": reason}
-        if self._utterances.transcript:
+        if self._utterances.transcript and self._ears is not None:
             transcripts = [(length, t) for length, t in heard if t is not None and t.text]
             result["transcript"] = " ".join(t.text for _, t in transcripts)
             if transcripts:

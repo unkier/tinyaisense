@@ -118,6 +118,7 @@ async def test_once_a_streamed_say_is_cut_its_text_is_ignored_and_close_replies_
     device, speaker = await online(hub)
     async with tinyaisense.connect(hub.agent_url, TOKEN) as agent:
         await command(device)  # the Status: agent
+        await command(device)  # arming the Reflex
         handle = await agent.say_open(speaker)
         start = await command(device)
         device.send(Reply(start.id, {"format": start.args["format"]}))
@@ -226,6 +227,7 @@ async def test_when_a_streamed_says_speaker_fails_to_start_append_and_close_say_
     device, speaker = await online(hub)
     async with tinyaisense.connect(hub.agent_url, TOKEN) as agent:
         await command(device)  # the Status: agent
+        await command(device)  # arming the Reflex
         handle = await agent.say_open(speaker)
         start = await command(device)
         device.send(FailedReply(start.id, "failed", "the amp is off"))

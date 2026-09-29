@@ -9,6 +9,9 @@ of the listen's audio.
 At each segment end the end-of-turn model gives its verdict. A complete turn ends the listen;
 an incomplete one keeps it going, until `turn_silence_ms` of silence ends it anyway. Silence is
 measured on the audio; the listen's own time limits, on the hub's monotonic clock in µs.
+
+While the button is held, the human decides when the turn ends: no verdict or silence ends it,
+and no lack of speech does either. Only the release, a `Stop`, or the time limit does.
 """
 
 from dataclasses import dataclass
@@ -48,6 +51,11 @@ class TurnVerdict:
 
     segment: int
     complete: bool
+
+
+@dataclass(frozen=True, slots=True)
+class Hold:
+    """The human holds the button: push-to-talk, from now on."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -98,9 +106,12 @@ class Listening:
         self._cut = 0
         """Where the last segment ended: the next one's pre-roll starts no earlier."""
         self._segments = 0
+        self._held = False
         self._ended = False
 
-    def handle(self, input: Window | TurnVerdict | Stop | Tick, now: int) -> list[Segment | End]:
+    def handle(
+        self, input: Window | TurnVerdict | Hold | Stop | Tick, now: int
+    ) -> list[Segment | End]:
         if self._ended:
             return []
         actions: list[Segment | End] = []
@@ -108,8 +119,16 @@ class Listening:
             case Window(p):
                 self._rate(p, now, actions)
             case TurnVerdict(segment, complete):
-                if complete and segment == self._segments - 1 and self._speech is None:
+                if (
+                    complete
+                    and not self._held
+                    and segment == self._segments - 1
+                    and self._speech is None
+                ):
                     self._end("end_of_turn", actions)
+            case Hold():
+                self._held = True
+                self._no_speech_at = None
             case Stop(reason):
                 self._end(reason, actions)
             case Tick():
@@ -133,7 +152,8 @@ class Listening:
             if p >= START:
                 self._speech = at
             elif (
-                self._last_speech is not None
+                not self._held
+                and self._last_speech is not None
                 and self._pos - self._last_speech >= self._turn_silence
             ):
                 self._end("end_of_turn", actions)
@@ -144,7 +164,7 @@ class Listening:
             if self._quiet is None:
                 self._quiet = at
             if self._pos - self._quiet >= self._segment_silence:
-                self._end_speech(self._quiet, turn=True, actions=actions)
+                self._end_speech(self._quiet, turn=not self._held, actions=actions)
                 if self._no_speech_due(now):
                     self._end("no_speech", actions)
                 return
@@ -177,8 +197,9 @@ class Listening:
         self._speech = self._quiet = None
 
     def _end(self, reason: EndReason, actions: list[Segment | End]) -> None:
-        """End the listen. The speech going on, if long enough, is its last segment."""
-        if self._speech is not None:
+        """End the listen. The speech going on, if long enough, is its last segment, unless a
+        click ended it: that discards what was said."""
+        if self._speech is not None and reason != "click":
             self._end_speech(self._so_far, turn=False, actions=actions)
         self._ended = True
         actions.append(End(reason))

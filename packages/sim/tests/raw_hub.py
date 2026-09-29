@@ -124,8 +124,9 @@ class RawUdp(asyncio.DatagramProtocol):
         self._datagrams.put_nowait(data)
 
     async def frame(self) -> StreamFrame:
-        datagram = decode_datagram(await self._datagrams.get())
-        assert isinstance(datagram, StreamFrame)
+        """The next stream frame, past any event mirrors."""
+        while not isinstance(datagram := decode_datagram(await self._datagrams.get()), StreamFrame):
+            assert isinstance(datagram, EventMirror)
         return datagram
 
     async def mirror(self) -> EventMirror:
@@ -137,13 +138,11 @@ class RawUdp(asyncio.DatagramProtocol):
         return [await self.frame() for _ in range(count)]
 
     def pending(self) -> list[StreamFrame]:
-        """The frames in so far, without waiting."""
-        frames: list[StreamFrame] = []
-        while not self._datagrams.empty():
-            datagram = decode_datagram(self._datagrams.get_nowait())
-            assert isinstance(datagram, StreamFrame)
-            frames.append(datagram)
-        return frames
+        """The frames in so far, past any event mirrors, without waiting."""
+        datagrams = [
+            decode_datagram(self._datagrams.get_nowait()) for _ in range(self._datagrams.qsize())
+        ]
+        return [d for d in datagrams if isinstance(d, StreamFrame)]
 
     def close(self) -> None:
         if self._transport is not None:

@@ -13,9 +13,11 @@ from .keepalive import Tick
 
 @dataclass(frozen=True, slots=True)
 class Down:
-    """The button went down at `ts`."""
+    """The button went down at `ts`. A press while the Reflex is `armed` is push-to-talk, so
+    it's never a long press."""
 
     ts: int
+    armed: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -44,6 +46,8 @@ class Gestures:
         """While the button is down: when it went down."""
         self._long_pressed = False
         """Whether the press it's down for is a long press yet."""
+        self._armed = False
+        """Whether the press it's down for came while the Reflex was armed."""
         self._clicked: int | None = None
         """When the last click ended, if a double click may yet follow it."""
         self._second = False
@@ -57,16 +61,17 @@ class Gestures:
                 return []
             self._latest = input.ts
         match input:
-            case Down(ts):
+            case Down(ts, armed):
                 self._down = ts
                 self._long_pressed = False
+                self._armed = armed
                 self._second = self._clicked is not None and ts - self._clicked < self._double_click
                 self._clicked = None
             case Up(ts):
                 down, self._down = self._down, None
                 if down is None or self._long_pressed:
                     return []
-                if ts - down >= self._long_press:  # its deadline hasn't come in yet
+                if not self._armed and ts - down >= self._long_press:  # its deadline isn't in yet
                     return [Gesture("long_press", down + self._long_press)]
                 if ts - down >= self._click:
                     return []
@@ -81,6 +86,6 @@ class Gestures:
         return []
 
     def next_deadline(self) -> int | None:
-        if self._down is None or self._long_pressed:
+        if self._down is None or self._long_pressed or self._armed:
             return None
         return self._down + self._long_press

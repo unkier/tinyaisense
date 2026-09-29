@@ -80,6 +80,11 @@ class DeviceObserver(Protocol):
         """An Event, in `seq` order: raw button edges again, in their turn."""
         ...
 
+    def device_stream(self, conn: DeviceConnection, stream: int) -> FrameReceiver | None:
+        """A frame came in on device-range stream id `stream`, which isn't open: what takes
+        the Reflex's stream, if the hub opens one for it."""
+        ...
+
     def device_offline(self, conn: DeviceConnection) -> None: ...
 
 
@@ -92,10 +97,13 @@ class FrameReceiver(Protocol):
 
 
 class StreamIds:
-    """A Connection's hub-range stream ids, 1-127: docs/protocol/audio.md#stream-ids."""
+    """A Connection's hub-range stream ids, 1-127, and the device-range ones it closed:
+    docs/protocol/audio.md#stream-ids."""
 
     FIRST = 1
     LAST = 127
+    DEVICE_FIRST = 128
+    """The first device-range id, up to 255: the Reflex opens mic streams on them."""
     REMEMBERED = 16
     """How many closed ids a Connection remembers, to drop their late frames silently."""
 
@@ -119,7 +127,8 @@ class StreamIds:
         raise HubError("busy", "every stream id is open")
 
     def close(self, stream: int) -> None:
-        if stream in self._open:
+        """Close a hub-range id, or a device-range one the Reflex opened."""
+        if stream in self._open or (stream >= self.DEVICE_FIRST and stream not in self.closed):
             self._open.discard(stream)
             self.closed.append(stream)
 
@@ -202,11 +211,15 @@ class DeviceConnection(asyncio.Protocol):
         return self._peer_ip is not None and _ip(host) == self._peer_ip
 
     def stream_frame(self, frame: StreamFrame, now: int) -> None:
-        """A stream frame from the device, checked to be of this Connection."""
+        """A stream frame from the device, checked to be of this Connection. One on a
+        device-range id that isn't open may open the Reflex's stream."""
         receiver = self.receivers.get(frame.stream)
+        closed = frame.stream in self.stream_ids.closed
+        if receiver is None and frame.stream >= StreamIds.DEVICE_FIRST and not closed:
+            receiver = self._registry.device_stream(self, frame.stream)
         if receiver is not None:
             receiver.frame(frame, now)
-        elif frame.stream not in self.stream_ids.closed:  # else a late frame: silent
+        elif not closed:  # else a late frame: silent
             self._registry.udp_drops["unknown_stream"] += 1
 
     def command(self, cap: str | None, name: str, args: JsonObject) -> asyncio.Future[JsonObject]:
@@ -637,6 +650,9 @@ class Registry:
 
     def event(self, conn: DeviceConnection, event: Event) -> None:
         self._observer.device_event(conn, event)
+
+    def device_stream(self, conn: DeviceConnection, stream: int) -> FrameReceiver | None:
+        return self._observer.device_stream(conn, stream)
 
     def datagram(self, data: bytes, source: tuple[Any, ...]) -> None:
         """Take a datagram in, or drop it: UDP junk never closes a Connection."""

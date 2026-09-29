@@ -37,7 +37,7 @@ The `stream` byte names the stream a frame belongs to.
 | 128–255 | device | streams the Reflex opens |
 
 - Each side assigns its ids round-robin: the next id after the last one it used, wrapping within its range and skipping open ids. A just-closed id isn't reused soon.
-- A frame on an unknown **device-range** id opens a Reflex mic stream at once, in the format the Reflex was armed with, if the Reflex is armed. The hub doesn't wait for the `mic.started` event, which only confirms. Otherwise the frame is dropped and counted.
+- A frame on an unknown **device-range** id opens a Reflex mic stream at once, in the format the Reflex was armed with, if the Reflex is armed. The hub doesn't wait for the `mic.started` event to open it, but it holds the frames until that event comes: that event follows the speaker cut, and the agent hears of the cut before the Utterance. Otherwise the frame is dropped and counted.
 - A frame on an unknown **hub-range** id is dropped.
 - Each side remembers the last 16 closed ids of the Connection and silently drops their late frames.
 

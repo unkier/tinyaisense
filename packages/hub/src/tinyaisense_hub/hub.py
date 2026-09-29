@@ -109,6 +109,7 @@ class Hub:
         self._control = Control(self.config.timing)
         # First: a bad engine fails the start before anything is served.
         self._speech = Speech(self.config.speech, self._control, self.config.timing)
+        self._control.talk = self._speech.talk
         await self._speech.start()
         port = self.config.device_port
         dual_stack = self._host is None and socket.has_dualstack_ipv6()

@@ -71,6 +71,10 @@ class Core:
         """Hand a device's LEDs back to its Status. Raises `HubError`."""
         await self._control.led_release(session, self._registry.named(device))
 
+    async def reflex_set(self, session: Session, device: str, armed: bool) -> None:
+        """Arm or disarm a device's Reflex for the Session. Raises `HubError`."""
+        await self._control.reflex_set(session, self._registry.named(device), armed)
+
     async def stream_start(
         self, session: Session, address: str, rate: int | None, prefill_ms: int | None
     ) -> int:

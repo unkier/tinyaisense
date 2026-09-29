@@ -344,6 +344,7 @@ async def test_a_reflex_cut_ends_the_say_playing_and_the_ones_queued_reflex(
     device, speaker = await online(hub)
     async with tinyaisense.connect(hub.agent_url, TOKEN) as agent:
         await command(device)  # the Status: agent
+        await command(device)  # arming the Reflex
         cut = asyncio.ensure_future(agent.say(speaker, LONG))
         queued = asyncio.ensure_future(agent.say(speaker, "Never heard."))
         start = await command(device)

@@ -84,6 +84,12 @@ _DEVICE: Schema = {
     "additionalProperties": False,
     "properties": {"device": {"type": "string"}},
 }
+_REFLEX_SET: Schema = {
+    "type": "object",
+    "required": ["device", "armed"],
+    "additionalProperties": False,
+    "properties": {"device": {"type": "string"}, "armed": {"type": "boolean"}},
+}
 
 _STREAM_START: Schema = {
     "type": "object",
@@ -230,6 +236,7 @@ class AgentLink:
             "voices": (_NO_PARAMS, self._voices),
             "command": (_COMMAND, self._command),
             "led.release": (_DEVICE, self._led_release),
+            "reflex.set": (_REFLEX_SET, self._reflex_set),
             "stream.start": (_STREAM_START, self._stream_start),
             "stream.stop": (_HANDLE, self._stream_stop),
             "stream.drain": (_HANDLE, self._stream_drain),
@@ -442,6 +449,11 @@ class AgentLink:
     async def _led_release(self, params: JsonObject) -> JsonObject:
         assert self._session is not None
         await self._core.led_release(self._session, params["device"])
+        return {}
+
+    async def _reflex_set(self, params: JsonObject) -> JsonObject:
+        assert self._session is not None
+        await self._core.reflex_set(self._session, params["device"], params["armed"])
         return {}
 
     async def _stream_start(self, params: JsonObject) -> JsonObject:

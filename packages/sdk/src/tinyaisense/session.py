@@ -134,6 +134,11 @@ class Session:
         """Hand `device`'s LED back to its Status."""
         await self.call("led.release", device=device)
 
+    async def reflex_set(self, device: str, armed: bool) -> None:
+        """Arm or disarm `device`'s Reflex, barge-in and push-to-talk, for this Session. It's
+        armed on every device by default."""
+        await self.call("reflex.set", device=device, armed=armed)
+
     async def stream_start(
         self, address: str, *, rate: int | None = None, prefill_ms: int | None = None
     ) -> int:

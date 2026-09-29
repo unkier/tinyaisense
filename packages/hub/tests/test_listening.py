@@ -5,7 +5,15 @@ from collections.abc import Sequence
 
 from tinyaisense_hub import Timing
 from tinyaisense_hub.keepalive import Tick
-from tinyaisense_hub.speech.listening import End, Listening, Segment, Stop, TurnVerdict, Window
+from tinyaisense_hub.speech.listening import (
+    End,
+    Hold,
+    Listening,
+    Segment,
+    Stop,
+    TurnVerdict,
+    Window,
+)
 
 S = 1_000_000
 """One second in µs."""
@@ -185,3 +193,50 @@ def test_the_timeouts_come_from_the_timing() -> None:
     # The speech ended at 15360; 400 ms later is 21760, 12.5 windows on from there.
     assert windows(core, [0] * 5) == []
     assert windows(core, [0]) == [End("end_of_turn")]
+
+
+def test_a_held_listen_never_ends_its_turn_and_asks_no_verdict() -> None:
+    core = listening()
+    core.handle(Hold(), 0)
+    said = segment(core, SPEECH)
+
+    assert said.turn is False
+    assert core.handle(TurnVerdict(said.index, complete=True), 0) == []
+    assert windows(core, [0] * 100) == []
+
+
+def test_a_hold_mid_listen_outdates_the_verdict_it_was_waiting_for() -> None:
+    core = listening()
+    said = segment(core, SPEECH)
+
+    assert core.handle(Hold(), 0) == []
+    assert core.handle(TurnVerdict(said.index, complete=True), 0) == []
+    assert windows(core, [0] * 100) == []
+
+
+def test_a_held_listen_has_no_no_speech_but_still_ends_at_60_s() -> None:
+    core = listening()
+    core.handle(Hold(), 0)
+
+    assert core.next_deadline() == 60 * S
+    assert core.handle(Tick(), 8 * S) == []
+    assert core.handle(Tick(), 60 * S) == [End("max_duration")]
+
+
+def test_a_release_ends_a_held_listen_with_its_last_segment() -> None:
+    core = listening()
+    core.handle(Hold(), 0)
+    windows(core, [0] * 10 + [1] * 10)
+
+    assert core.handle(Stop("button"), 0) == [
+        Segment(0, start=320, end=10240, turn=False),
+        End("button"),
+    ]
+
+
+def test_a_click_ends_a_held_listen_and_discards_the_speech_going_on() -> None:
+    core = listening()
+    core.handle(Hold(), 0)
+    windows(core, [0] * 10 + [1] * 10)
+
+    assert core.handle(Stop("click"), 0) == [End("click")]

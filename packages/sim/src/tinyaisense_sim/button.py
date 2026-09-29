@@ -2,7 +2,10 @@
 
 import asyncio
 from collections.abc import Callable
+from dataclasses import dataclass
 from typing import Literal
+
+from tinyaisense_wire import AudioFormat
 
 type Edge = Literal["down", "up"]
 
@@ -12,6 +15,18 @@ DOUBLE_CLICK_GAP_MS = 100
 """How long `double_click` leaves between its clicks."""
 LONG_PRESS_MS = 1500
 """How long `long_press` holds the button down: past the hub's default 1 s."""
+FIRST_STREAM = 128
+LAST_STREAM = 255
+"""The device-range stream ids, which the Reflex opens mics on."""
+
+
+@dataclass(frozen=True, slots=True)
+class Reflex:
+    """What an armed button does on `down`, by itself: cut the `stop` speakers, then open the
+    `start` mic, in its format."""
+
+    stop: tuple[str, ...]
+    start: tuple[str, AudioFormat] | None
 
 
 class SimButton:

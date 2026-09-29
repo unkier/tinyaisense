@@ -13,6 +13,7 @@ from tinyaisense_wire import Capability, JsonObject
 from ..config import ConfigError, SpeechConfig, Timing, VoiceConfig
 from ..control import Control
 from ..errors import HubError
+from ..mic import Listener
 from ..resampler import RATES
 from ..session import Session, ThenListen, UtteranceOptIn
 from ..state import DeviceRecord
@@ -212,6 +213,13 @@ class Speech:
             listen.done.add_done_callback(lambda _: stopping.cancel())
         return await asyncio.shield(listen.done), listen.handle
 
+    def talk(self, session: Session, device: DeviceRecord, mic: Capability) -> Listener:
+        """Push-to-talk on `mic`, on a stream the Reflex opened: an Utterance for the Session,
+        which the release ends. Returns what hears the stream. Raises `HubError`."""
+        ears = self._ears(None) if self._stt else None
+        listen = self._listen(ears, session, device, mic, "button", None, session.utterances)
+        return listen.listener()
+
     async def session_ended(self, session: Session) -> None:
         """End the Session's listens, `disconnected`, and wait until they're delivered."""
         listens = list(session.listens)
@@ -250,7 +258,7 @@ class Speech:
 
     def _listen(
         self,
-        ears: Ears,
+        ears: Ears | None,
         session: Session,
         device: DeviceRecord,
         mic: Capability,

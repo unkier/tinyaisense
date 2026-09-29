@@ -122,6 +122,7 @@ async def test_a_press_held_for_1_s_is_a_long_press_while_it_is_held(
 ) -> None:
     kitchen = await paired(sim, owner)
     async with tinyaisense.connect(hub.agent_url, TOKEN) as agent:
+        await agent.reflex_set("kitchen", armed=False)  # else it's push-to-talk
         notifications = agent.notifications()
 
         kitchen.button.press()

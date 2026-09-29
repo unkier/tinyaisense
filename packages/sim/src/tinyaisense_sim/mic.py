@@ -30,7 +30,7 @@ class SimMic:
         changed: Callable[[], None],
     ) -> None:
         """`clock()` is the device clock in µs; `stalled()` whether sending is held up;
-        `changed()` is called whenever the mic starts or stops."""
+        `changed()` is called whenever the mic starts or stops, or has heard all it was fed."""
         self._clock = clock
         self._send = send
         self._stalled = stalled
@@ -49,6 +49,16 @@ class SimMic:
         """Frames the open stream's queue dropped so far."""
         return 0 if self._capture is None else self._capture.dropped
 
+    @property
+    def unheard(self) -> int:
+        """Bytes fed that the mic hasn't captured yet."""
+        return len(self._paced) + len(self._burst)
+
+    def forget(self) -> None:
+        """Drop what was fed and not yet captured."""
+        self._paced.clear()
+        self._burst.clear()
+
     def feed(self, pcm: bytes, *, burst: bool = False) -> None:
         """Queue audio for the mic to hear, in its format, e.g. from `sources`. It's captured
         while the mic streams, after what was fed before: in real time, or with `burst` at
@@ -61,7 +71,7 @@ class SimMic:
         """Open stream id `stream`. The caller checks that the mic is idle."""
         assert self._capture is None
         self._capture = _Capture(
-            stream, format, self._clock(), self._paced, self._send, self._stalled
+            stream, format, self._clock(), self._paced, self._send, self._stalled, self._changed
         )
         self._capture.burst(self._burst)
         self._changed()
@@ -99,7 +109,9 @@ class _Capture:
         paced: bytearray,
         send: SendFrame,
         stalled: Callable[[], bool],
+        heard: Callable[[], None],
     ) -> None:
+        """`heard()` is called when the capture runs out of fed audio."""
         self.stream = stream
         self.seq = 0
         """The next frame's seq."""
@@ -110,6 +122,7 @@ class _Capture:
         self._paced = paced
         self._send = send
         self._stalled = stalled
+        self._heard = heard
         self._queue: deque[tuple[int, int, bytes]] = deque()
         self._queue_frames = QUEUE_MS // format.frame_ms
         self._loop = asyncio.get_running_loop()
@@ -142,9 +155,12 @@ class _Capture:
         # Every frame whose period has ended, catching up on a late wakeup.
         due = int((self._loop.time() - self._start) / self._period)
         size = self._format.frame_bytes
+        fed = bool(self._paced)
         while self.seq < due:
             self._captured(bytes(self._paced[:size]))
             del self._paced[:size]
+        if fed and not self._paced:
+            self._heard()
         self._arm()
 
     def _captured(self, pcm: bytes) -> None:

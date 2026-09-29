@@ -137,7 +137,7 @@ A capability's Kind fixes its commands, events and streams: see the Kind contrac
 
 ### `reflex.set`
 
-`reflex.set{device, armed}` arms or disarms the Reflex on one device. The hub arms every device when the Session starts, keeps each device's setting for the Session, and re-applies it when the device reconnects. The Reflex targets come from the Manifest; agents can't change them.
+`reflex.set{device, armed}` arms or disarms the Reflex on one device. The hub arms every device when the Session starts, keeps each device's setting for the Session, and re-applies it when the device reconnects. The Reflex targets come from the Manifest; agents can't change them. A device that's offline takes its setting when it comes back. A device with no button gets `unsupported`.
 
 While a device is armed, a button press cuts its speaker and opens its mic on the device itself, and a release closes that mic: see [Button](kinds/button.md). A disarmed button only reports Events.
 
@@ -279,7 +279,7 @@ An **Utterance** is one span of human speech captured from a mic, delivered as a
 | `audio` | `false` | deliver the audio as binary frames |
 | `rate` | 16000 | the audio's rate: 16000, 24000 or 48000 |
 
-With no STT engine, Utterances carry no transcript, and `listen` gets `unsupported`.
+With no STT engine, Utterances carry no transcript, and `listen` gets `unsupported`. Push-to-talk still delivers them.
 
 **End reasons:**
 
@@ -296,5 +296,7 @@ With no STT engine, Utterances carry no transcript, and `listen` gets `unsupport
 **`listen{address, lang?, utterances?}`** opens the mic and replies with the `utterance.end` params, sent right after the notification.
 - Its audio, if the agent opted in, comes on the `handle` in `utterance.start`: a stream with no `stream.*` notifications, which ends with the Utterance.
 - A button press during a `listen` hands it to the human: the stream carries on without a restart, and the release ends it with `button`. The audio from before the press is kept.
-- **Push-to-talk:** a press on an armed device with no `listen` running always delivers an Utterance, with trigger `button`.
+- **Push-to-talk:** a press on an armed device with no `listen` running always delivers an Utterance, with trigger `button`, as the Session's `utterances` opt-in says.
+- While the button is held, neither the end of the turn nor `no_speech` ends the Utterance: the release does, or `max_duration`, or whatever ends any listen (a stop, a preempting mic start, a disconnect).
+- A `click` Utterance's transcript, if the agent opted in, is empty, with no `lang`.
 - With no Session, the Reflex is disarmed and a press only produces raw Events, which nobody receives.

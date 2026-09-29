@@ -12,7 +12,7 @@ Contract data: [`contracts/mic.json`](../../../packages/wire/src/tinyaisense_wir
 
 ### `started`
 
-`{stream, format}`: the Reflex opened the mic on a device-range stream id (128–255). The hub has usually opened the stream already, from its first frame; this event only confirms.
+`{stream, format}`: the Reflex opened the mic on a device-range stream id (128–255). The hub may have opened the stream already, from its first frame, but it passes the frames on only from this event, so the speaker cut before it reaches the agent first.
 
 ### `stopped`
 

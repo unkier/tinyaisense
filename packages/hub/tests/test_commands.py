@@ -407,15 +407,16 @@ async def test_a_press_during_the_bring_up_does_not_reach_the_agent_ahead_of_dev
         assert (await anext(notifications)).method == "button.down"
 
 
-async def test_the_status_and_the_led_claim_go_out_pipelined_after_welcome(
+async def test_the_status_the_reflex_and_the_led_claim_go_out_pipelined_after_welcome(
     start_hub: StartHub,
 ) -> None:
     hub = await start_hub(auto_approve=True, timing=NEVER_DEAD)
     async with tinyaisense.connect(hub.agent_url, TOKEN) as agent:
         notifications = agent.notifications()
         first, welcome = await welcomed(hub)
-        status = await command(first)
+        status, arm = await command(first), await command(first)
         first.send(Reply(status.id, {}))
+        first.send(Reply(arm.id, {}))
         assert (await anext(notifications)).method == "device.online"
         name = welcome.name
         led = asyncio.create_task(agent.command(f"{name}/led", "set", {"color": "#123456"}))
@@ -426,17 +427,20 @@ async def test_the_status_and_the_led_claim_go_out_pipelined_after_welcome(
         assert (await anext(notifications)).method == "device.offline"
 
         again, _ = await welcomed(hub, welcome.token)
-        # Both go out before either reply is in.
-        status, set_led = await command(again), await command(again)
+        # All go out before any reply is in.
+        status, arm, set_led = [await command(again) for _ in range(3)]
         again.send(Reply(set_led.id, {}))  # out of order across capabilities
+        again.send(Reply(arm.id, {}))
         again.send(Reply(status.id, {}))
 
         online = await anext(notifications)
         assert online.method == "device.online"
-        assert [(c.id, c.cap, c.name, c.args) for c in (status, set_led)] == [
-            (1, None, "status", {"state": "agent"}),
-            (2, "led", "set", {"color": "#123456"}),
+        assert [(c.id, c.cap, c.name) for c in (status, arm, set_led)] == [
+            (1, None, "status"),
+            (2, "button", "set_reflex"),
+            (3, "led", "set"),
         ]
+        assert set_led.args == {"color": "#123456"}
 
 
 async def test_an_op_on_a_device_waits_for_the_replies_to_the_one_before(
@@ -446,8 +450,9 @@ async def test_an_op_on_a_device_waits_for_the_replies_to_the_one_before(
     async with tinyaisense.connect(hub.agent_url, TOKEN) as agent:
         notifications = agent.notifications()
         device, welcome = await welcomed(hub)
-        status = await command(device)
+        status, arm = await command(device), await command(device)
         device.send(Reply(status.id, {}))
+        device.send(Reply(arm.id, {}))
         assert (await anext(notifications)).method == "device.online"
         led = f"{welcome.name}/led"
 

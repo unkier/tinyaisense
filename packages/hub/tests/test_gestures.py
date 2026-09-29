@@ -101,3 +101,24 @@ def test_a_press_that_comes_in_after_its_release_is_nothing() -> None:
     assert core.handle(Down(2000 * MS), 3100 * MS) == []
     assert core.next_deadline() is None
     assert core.handle(Tick(), 3100 * MS) == []
+
+
+def test_a_press_while_the_reflex_is_armed_is_never_a_long_press() -> None:
+    core = gestures()
+    core.handle(Down(0, armed=True), 0)
+
+    assert core.next_deadline() is None
+    assert core.handle(Tick(), 5000 * MS) == []
+    assert core.handle(Up(5000 * MS), 5001 * MS) == []
+
+
+def test_a_short_press_while_the_reflex_is_armed_is_a_click_and_may_double() -> None:
+    core = gestures()
+    core.handle(Down(0, armed=True), 0)
+    core.handle(Up(100 * MS), 100 * MS)
+    core.handle(Down(200 * MS, armed=True), 200 * MS)
+
+    assert core.handle(Up(300 * MS), 300 * MS) == [
+        Gesture("click", 300 * MS),
+        Gesture("double_click", 300 * MS),
+    ]
