@@ -1,9 +1,12 @@
 """The hub config (TOML, read at start) and where the hub keeps its files."""
 
+import json
 import os
+import re
 import secrets
 import tempfile
 import tomllib
+from collections.abc import Mapping
 from dataclasses import dataclass, field, fields
 from pathlib import Path
 from typing import Any, cast
@@ -152,13 +155,25 @@ class Config:
     speech: SpeechConfig = field(default_factory=SpeechConfig)
 
 
+LOCAL_SPEECH = SpeechConfig(
+    engines={
+        "silero_vad": EngineConfig("tinyaisense_hub.speech.local:SileroVad", {"threads": 1}),
+        "smart_turn": EngineConfig("tinyaisense_hub.speech.local:SmartTurn", {"threads": 4}),
+        "parakeet": EngineConfig("tinyaisense_hub.speech.local:ParakeetStt", {"threads": 4}),
+    },
+    stt={"en": "parakeet", "ru": "parakeet"},
+    vad="silero_vad",
+    turn="smart_turn",
+)
+"""The local engines, on the CPU, that a new config listens with."""
+
+
 def new_config() -> Config:
-    return Config(agent_token=secrets.token_urlsafe(32))
+    return Config(agent_token=secrets.token_urlsafe(32), speech=LOCAL_SPEECH)
 
 
 def render_config(config: Config) -> str:
     timing = "\n".join(f"{f.name} = {getattr(config.timing, f.name)}" for f in fields(Timing))
-    speech = config.speech
     return f"""\
 # tinyaisense hub config. The hub reads it at start: restart the hub to apply changes.
 
@@ -175,8 +190,16 @@ http = {config.http_port}
 [timing]
 {timing}
 
+{_render_speech(config.speech)}"""
+
+
+def _render_speech(speech: SpeechConfig) -> str:
+    roles = [(role, name) for role, name in (("vad", speech.vad), ("turn", speech.turn)) if name]
+    blocks = [
+        f"""\
 # Speech: the engines, and the Voices agents speak in. With no TTS engine, `say` is
-# unsupported; with no STT engine, `listen` is.
+# unsupported; with no STT engine, `listen` is. The local engines need the hub's [local]
+# extra, and their models: run `tinyaisense-hub models fetch`.
 [speech]
 # The language of text that doesn't show its own: en or ru.
 lang = "{speech.lang}"
@@ -184,38 +207,74 @@ lang = "{speech.lang}"
 say_ahead_ms = {speech.say_ahead_ms}
 # How long after the hub's schedule audio plays on a device, in ms.
 speaker_latency_ms = {speech.speaker_latency_ms}
-
-# Each engine is a Python class, `module:Class`, and the keyword arguments to make it with,
-# under a name of your choosing. For example:
-#
-# [speech.engines.my_tts]
-# class = "my_plugin:MyTts"
-# params = {{ model = "/path/to/model" }}
-#
-# The engine that speaks each language:
-#
-# [speech.tts]
-# en = "my_tts"
-#
-# The engines that hear each language, the one that tells speech from silence (which
-# listening needs), and the one that tells when the human has finished their turn (without
-# it, 1 s of silence does). They take 16 kHz audio.
-#
-# [speech]
-# vad = "my_vad"
-# turn = "my_turn"
-#
-# [speech.stt]
-# en = "my_stt"
-#
-# The Voices: agents pick one by `id`. The first of each language is its default.
+# The engine that tells speech from silence, which listening needs, and the one that tells
+# when the human has finished their turn (without it, 1 s of silence does). They take 16 kHz
+# audio, as do the engines that hear each language, in [speech.stt].
+{_toml_lines(dict(roles))}"""
+    ]
+    if speech.tts:
+        blocks.append(
+            "# The engine that speaks each language.\n[speech.tts]\n" + _toml_lines(speech.tts)
+        )
+    if speech.stt:
+        blocks.append(
+            "# The engine that hears each language.\n[speech.stt]\n" + _toml_lines(speech.stt)
+        )
+    engines = [
+        f'[speech.engines.{name}]\nclass = "{engine.cls}"\n'
+        + (f"params = {_toml(engine.params)}\n" if engine.params else "")
+        for name, engine in speech.engines.items()
+    ]
+    if engines:
+        engines[0] = (
+            "# Each engine is a Python class, `module:Class`, and the keyword arguments to make "
+            "it with,\n# under a name of your choosing. The local engines take the ORT "
+            "`threads` to run on, and\n# `model`: the dir of their model, if it isn't where "
+            "`models fetch` puts it.\n" + engines[0]
+        )
+    blocks += engines
+    blocks.append("""\
+# The Voices: agents pick one by `id`. The first of each language is its default, and
+# `engine_voice` is the TTS engine's own name for it, if not the `id`. For example:
 #
 # [[speech.voices]]
 # id = "amy"
 # lang = "en"
 # name = "Amy"
-# engine_voice = "en_US-amy"  # the engine's name for it; the id if left out
-"""
+# engine_voice = "en_US-amy"
+""")
+    blocks += [
+        "[[speech.voices]]\n"
+        + _toml_lines({"id": v.id, "lang": v.lang, "name": v.name, "engine_voice": v.engine_voice})
+        for v in speech.voices
+    ]
+    return "\n".join(blocks)
+
+
+def _toml_lines(table: Mapping[str, object]) -> str:
+    return "".join(f"{_toml_key(key)} = {_toml(value)}\n" for key, value in table.items())
+
+
+def _toml_key(key: str) -> str:
+    return key if re.fullmatch(r"[A-Za-z0-9_-]+", key) else _toml(key)
+
+
+def _toml(value: object) -> str:
+    """A TOML value, for what a TOML file parses to, less dates."""
+    match value:
+        case bool():
+            return "true" if value else "false"
+        case int() | float():
+            return repr(value)
+        case str():
+            return json.dumps(value, ensure_ascii=False)
+        case list():
+            return "[" + ", ".join(map(_toml, cast(list[object], value))) + "]"
+        case dict():
+            table = cast(dict[str, object], value).items()
+            return "{ " + ", ".join(f"{_toml_key(k)} = {_toml(v)}" for k, v in table) + " }"
+        case _:
+            raise TypeError(f"no TOML for {value!r}")
 
 
 def parse_config(text: str) -> Config:
@@ -314,6 +373,10 @@ def config_path() -> Path:
 
 def state_dir() -> Path:
     return _xdg("XDG_STATE_HOME", Path.home() / ".local" / "state") / APP
+
+
+def data_dir() -> Path:
+    return _xdg("XDG_DATA_HOME", Path.home() / ".local" / "share") / APP
 
 
 def runtime_dir() -> Path:

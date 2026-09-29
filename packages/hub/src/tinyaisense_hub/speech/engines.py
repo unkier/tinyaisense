@@ -61,8 +61,9 @@ class Stt(Engine, ABC):
 
     @abstractmethod
     def transcribe(self, pcm: bytes, lang: str | None) -> Transcript:
-        """The text of a segment of speech, in `lang` if given, else in the language the
-        engine hears."""
+        """The text of a segment of speech, and its language: `lang` if given, else the
+        language the engine hears. An engine that tells the language by itself may take `lang`
+        as a hint only, and give the language it heard."""
 
 
 class Tts(Engine, ABC):

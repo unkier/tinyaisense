@@ -17,8 +17,8 @@ dependencies = [
 tinyaisense-hub = "tinyaisense_hub.cli:main"
 
 [project.optional-dependencies]
-# Local speech engines: sherpa-onnx, piper-tts, torch (Silero RU only).
-local = []
+# Local speech engines. Piper and torch (Silero RU only) come with the local TTS.
+local = ["onnxruntime>=1.30", "sherpa-onnx>=1.13.8"]
 # polza.ai cloud speech plugin.
 polza = []
 

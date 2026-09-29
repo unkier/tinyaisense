@@ -25,11 +25,18 @@ def xdg(tmp_path: Path, runtime_dir: Path, monkeypatch: pytest.MonkeyPatch) -> d
     env = {
         "XDG_CONFIG_HOME": str(tmp_path / "config"),
         "XDG_STATE_HOME": str(tmp_path / "state"),
+        "XDG_DATA_HOME": str(tmp_path / "data"),
         "XDG_RUNTIME_DIR": str(runtime_dir),
     }
     for name, value in env.items():
         monkeypatch.setenv(name, value)
     return env
+
+
+def replace_speech(text: str, speech: str = "") -> str:
+    """A config `init` wrote, with `speech` in place of its [speech] section, and so of the
+    local engines, which need models."""
+    return re.split(r"^\[speech\]$", text, flags=re.M)[0] + speech
 
 
 def test_init_writes_a_config_with_a_random_agent_token(
@@ -61,7 +68,28 @@ def test_init_writes_a_config_with_a_random_agent_token(
         "double_click_ms": 300,
         "long_press_ms": 1000,
     }
-    assert config["speech"] == {"lang": "en", "say_ahead_ms": 3000, "speaker_latency_ms": 50}
+    assert config["speech"] == {
+        "lang": "en",
+        "say_ahead_ms": 3000,
+        "speaker_latency_ms": 50,
+        "vad": "silero_vad",
+        "turn": "smart_turn",
+        "stt": {"en": "parakeet", "ru": "parakeet"},
+        "engines": {
+            "silero_vad": {
+                "class": "tinyaisense_hub.speech.local:SileroVad",
+                "params": {"threads": 1},
+            },
+            "smart_turn": {
+                "class": "tinyaisense_hub.speech.local:SmartTurn",
+                "params": {"threads": 4},
+            },
+            "parakeet": {
+                "class": "tinyaisense_hub.speech.local:ParakeetStt",
+                "params": {"threads": 4},
+            },
+        },
+    }
     assert len(config["agent_token"]) >= 32
     assert stat.S_IMODE(path.stat().st_mode) == 0o600
 
@@ -159,7 +187,8 @@ async def served(xdg: dict[str, str], request: pytest.FixtureRequest) -> AsyncIt
         port, http = device_probe.getsockname()[1], http_probe.getsockname()[1]
     config = Path(xdg["XDG_CONFIG_HOME"]) / "tinyaisense" / "hub.toml"
     text = config.read_text().replace("device = 8420", f"device = {port}")
-    config.write_text(text.replace("http = 8421", f"http = {http}") + getattr(request, "param", ""))
+    text = text.replace("http = 8421", f"http = {http}")
+    config.write_text(replace_speech(text, getattr(request, "param", "")))
     hub = await asyncio.create_subprocess_exec(
         sys.executable, "-m", "tinyaisense_hub", "serve", "--no-mdns", env=os.environ | xdg
     )
@@ -348,12 +377,25 @@ def test_serve_refuses_listening_engines_that_dont_hold_together(
 ) -> None:
     main(["init"])
     config = Path(xdg["XDG_CONFIG_HOME"]) / "tinyaisense" / "hub.toml"
-    text = re.sub(r"^\[speech\]$", "[old_speech]", config.read_text(), flags=re.M)
-    config.write_text(text.split("[old_speech]")[0] + speech)
+    config.write_text(replace_speech(config.read_text(), speech))
 
     assert main(["serve"]) == 1
 
     assert error in capsys.readouterr().err
+
+
+def test_serve_refuses_to_start_without_the_models_of_its_engines(
+    xdg: dict[str, str], capsys: pytest.CaptureFixture[str]
+) -> None:
+    pytest.importorskip("sherpa_onnx", reason="the local engines need the [local] extra")
+    main(["init"])
+
+    assert main(["serve"]) == 1
+
+    err = capsys.readouterr().err
+    models = Path(xdg["XDG_DATA_HOME"]) / "tinyaisense" / "models"
+    assert f"speech engine 'silero_vad': no model at {models / 'silero-vad-v6.2.3'}" in err
+    assert "run `tinyaisense-hub models fetch`" in err
 
 
 def test_serve_refuses_a_turn_silence_within_the_segment_silence(
@@ -377,7 +419,8 @@ def test_serve_says_when_its_port_is_taken(
         taken.bind(("0.0.0.0", 0))
         taken.listen()
         port = taken.getsockname()[1]
-        config.write_text(config.read_text().replace("device = 8420", f"device = {port}"))
+        text = config.read_text().replace("device = 8420", f"device = {port}")
+        config.write_text(replace_speech(text))
 
         assert main(["serve"]) == 1
 

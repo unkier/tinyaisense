@@ -20,8 +20,9 @@ jobs:
         with:
           persist-credentials: false
       - uses: astral-sh/setup-uv@v10.2.0
-      # pyright needs the test deps too: it type-checks the tests.
-      - run: uv sync --locked --all-packages
+      # pyright needs the test deps too: it type-checks the tests. And the local speech
+      # engines, which it type-checks against typings/.
+      - run: uv sync --locked --all-packages --extra local
       - run: uv run --no-sync ruff check --output-format=github
       - run: uv run --no-sync ruff format --check
       - run: uv run --no-sync pyright
@@ -39,7 +40,9 @@ jobs:
         with:
           persist-credentials: false
       - uses: astral-sh/setup-uv@v10.2.0
-      - run: uv sync --locked --all-packages --no-default-groups --group test
+      # The local speech engines, without their models: their tests skip, bar the one that
+      # the hub refuses to start without them.
+      - run: uv sync --locked --all-packages --no-default-groups --group test --extra local
       - run: >-
           uv run --no-sync pytest --cov-report=term-missing
           --cov=tinyaisense_wire --cov=tinyaisense_hub --cov=tinyaisense_sim --cov=tinyaisense

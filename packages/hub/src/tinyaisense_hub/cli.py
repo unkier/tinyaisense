@@ -23,6 +23,7 @@ from .config import (
 )
 from .errors import HubError
 from .hub import Hub
+from .models import MODELS, ModelError, fetch, models_dir
 from .owner import SOCKET_NAME, OwnerClient
 from .state import StateError
 
@@ -36,7 +37,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         return args.run(args)
-    except (ConfigError, StateError, HubError, OSError) as e:
+    except (ConfigError, StateError, HubError, ModelError, OSError) as e:
         return _fail(str(e))
 
 
@@ -93,6 +94,13 @@ def _parser() -> argparse.ArgumentParser:
 
     stats = commands.add_parser("stats", help="show the button-to-agent latency histogram")
     stats.set_defaults(run=_stats)
+
+    models = commands.add_parser("models", help="the local speech engines' models")
+    models_commands = models.add_subparsers(required=True, metavar="command")
+    fetch = models_commands.add_parser(
+        "fetch", help="download the models the local engines run, checked by sha256"
+    )
+    fetch.set_defaults(run=_models_fetch)
     return parser
 
 
@@ -147,6 +155,13 @@ def run_hub[T](main: Coroutine[Any, Any, T]) -> T:
         return uvloop.run(main)
     finally:
         sys.setswitchinterval(previous)
+
+
+def _models_fetch(args: argparse.Namespace) -> int:
+    into = models_dir()
+    fetch(MODELS, into, report=print)
+    print(f"every model is in {into}")
+    return 0
 
 
 def _devices(args: argparse.Namespace) -> int:
