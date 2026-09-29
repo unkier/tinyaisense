@@ -2,10 +2,11 @@
 docs/protocol/agent.md#streaming-text."""
 
 import asyncio
+from dataclasses import replace
 
 import pytest
 import tinyaisense
-from tinyaisense_hub import Hub, OwnerClient
+from tinyaisense_hub import EngineConfig, Hub, OwnerClient
 from tinyaisense_hub.speech import fake
 from tinyaisense_sim import Simulator
 from tinyaisense_sim.pytest_plugin import SimulatorFactory
@@ -66,6 +67,29 @@ async def test_a_tail_of_four_words_is_spoken_once_no_text_has_come_for_500_ms(
         "interrupted": False,
         "heard_text": "Hi there you all. Bye.",
     }
+
+
+async def test_a_clause_at_an_odd_rate_plays_to_its_end_before_the_next_text_comes(
+    start_hub: StartHub, simulator: SimulatorFactory
+) -> None:
+    """One the FIR doesn't take, as Piper's 22.05 kHz isn't: 32 kHz here, at which each
+    symbol is whole frames. The resampler lets go of the end of each clause's audio at once,
+    rather than hold it until more comes."""
+    odd = EngineConfig("tinyaisense_hub.speech.fake:FakeTts", {"rate": 32000})
+    hub = await start_hub(speech=replace(SPEECH, engines={"fake": odd}))
+    sim = simulator(hub.device_address)
+    async with OwnerClient(hub.owner_socket) as owner:
+        kitchen = await paired(sim, owner)
+    async with tinyaisense.connect(hub.agent_url, TOKEN) as agent:
+        handle = await agent.say_open("kitchen/speaker")
+        await agent.say_append(handle, "One two three four,")
+        await kitchen.wait_for(lambda: len(kitchen.speaker.captured) >= 1)
+        await asyncio.sleep(0.4)
+        first = fake.decode(kitchen.speaker.pcm()).text
+        await agent.say_append(handle, " five.")
+        await agent.say_close(handle)
+
+    assert first == "One two three four,"
 
 
 async def test_a_say_queued_behind_an_open_one_follows_it_once_its_closed_with_no_gap(

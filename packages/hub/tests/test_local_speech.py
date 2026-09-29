@@ -1,4 +1,5 @@
-"""The local speech engines, on real speech: through the engine interface, and in `listen`.
+"""The local speech engines, on real speech: through the engine interface, and in `listen` and
+`say`. What the TTS engines say, Parakeet hears back.
 
 They need the `[local]` extra and the models, which `tinyaisense-hub models fetch` downloads;
 without them, these tests are skipped.
@@ -14,6 +15,8 @@ import tinyaisense
 from tinyaisense_hub import Hub, OwnerClient
 from tinyaisense_hub.config import LOCAL_SPEECH
 from tinyaisense_hub.models import MODELS, ModelError, model_dir
+from tinyaisense_hub.resampler import resampler_for
+from tinyaisense_hub.speech import Tts
 from tinyaisense_sim import Simulator, sources
 
 from .conftest import StartHub
@@ -35,7 +38,13 @@ def _missing() -> str:
 MISSING = _missing()
 pytestmark = pytest.mark.skipif(bool(MISSING), reason=MISSING)
 
-from tinyaisense_hub.speech.local import ParakeetStt, SileroVad, SmartTurn  # noqa: E402
+from tinyaisense_hub.speech.local import (  # noqa: E402
+    ParakeetStt,
+    PiperTts,
+    SileroTts,
+    SileroVad,
+    SmartTurn,
+)
 
 AUDIO = Path(__file__).parent / "audio"
 RATE = 16000
@@ -138,6 +147,61 @@ def test_parakeet_transcribes_speech_in_the_language_it_hears(
     assert transcript.lang == lang
 
 
+def spoken(tts: Tts, voice: str, text: str) -> bytes:
+    """What `tts` says, resampled to 16 kHz."""
+    resampler = resampler_for(tts.rate, RATE)
+    return b"".join(map(resampler.process, tts.synthesize(text, voice))) + resampler.flush()
+
+
+@pytest.fixture(scope="module")
+def piper() -> PiperTts:
+    piper = PiperTts()
+    piper.warm_up()
+    return piper
+
+
+@pytest.fixture(scope="module")
+def silero() -> SileroTts:
+    silero = SileroTts()
+    silero.warm_up()
+    return silero
+
+
+FOX = "The quick brown fox jumps over the lazy dog."
+FOX_SAID = "the quick brown fox jumps over the lazy dog"
+BULKI = "Съешь же ещё этих мягких французских булок, да выпей чаю."
+BULKI_SAID = "съешь же ещё этих мягких французских булок да выпей чаю"
+
+
+def test_piper_speaks_english(piper: PiperTts, stt: ParakeetStt) -> None:
+    transcript = stt.transcribe(spoken(piper, "en_US-lessac-medium", FOX), None)
+
+    assert heard(transcript.text, FOX_SAID)
+    assert transcript.lang == "en"
+
+
+def test_silero_speaks_russian(silero: SileroTts, stt: ParakeetStt) -> None:
+    transcript = stt.transcribe(spoken(silero, "xenia", BULKI), None)
+
+    assert heard(transcript.text, BULKI_SAID)
+    assert transcript.lang == "ru"
+
+
+def test_piper_gives_its_audio_a_sentence_at_a_time(piper: PiperTts, stt: ParakeetStt) -> None:
+    pieces = iter(piper.synthesize("Good morning. How are you? I am fine.", "en_US-lessac-medium"))
+    first = next(pieces)
+    resampler = resampler_for(piper.rate, RATE)
+
+    assert heard(
+        stt.transcribe(resampler.process(first) + resampler.flush(), None).text, "good morning"
+    )
+    assert len(list(pieces)) == 2
+
+
+def test_silero_says_nothing_for_text_with_no_russian_in_it(silero: SileroTts) -> None:
+    assert b"".join(silero.synthesize("OK, 42.", "xenia")) == b""
+
+
 @pytest.fixture
 async def hub(start_hub: StartHub) -> Hub:
     """With the local engines that `init` configures."""
@@ -155,3 +219,30 @@ async def test_listen_hears_what_the_human_says_in_their_language(
 
     assert (result["reason"], result["lang"]) == ("end_of_turn", lang)
     assert heard(result["transcript"], said)
+
+
+@pytest.mark.parametrize(
+    ("text", "said", "lang"),
+    [
+        (FOX, FOX_SAID, "en"),
+        (BULKI, BULKI_SAID, "ru"),
+    ],
+    ids=["en", "ru"],
+)
+async def test_say_speaks_in_the_default_voice_of_the_language_the_text_is_in(
+    hub: Hub,
+    sim: Simulator,
+    owner: OwnerClient,
+    stt: ParakeetStt,
+    text: str,
+    said: str,
+    lang: str,
+) -> None:
+    kitchen = await paired(sim, owner)
+    async with tinyaisense.connect(hub.agent_url, "agent-token") as agent:
+        result = await agent.say("kitchen/speaker", text)
+    transcript = stt.transcribe(kitchen.speaker.pcm(), None)
+
+    assert (result["reason"], result["heard_text"]) == ("drained", text)
+    assert heard(transcript.text, said)
+    assert transcript.lang == lang

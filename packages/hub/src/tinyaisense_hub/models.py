@@ -6,7 +6,7 @@ import os
 import urllib.request
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 from .config import data_dir
 
@@ -22,7 +22,7 @@ class ModelFile:
     name: str
     """Its path within its model's dir."""
     url: str
-    """Where to download it from: a URL that pins its content."""
+    """Where to download it from: a URL that pins its version, if not its content."""
     sha256: str
 
 
@@ -34,8 +34,10 @@ class Model:
     files: tuple[ModelFile, ...]
 
 
-def _hugging_face(repo: str, commit: str, name: str, sha256: str) -> ModelFile:
-    return ModelFile(name, f"https://huggingface.co/{repo}/resolve/{commit}/{name}", sha256)
+def _hugging_face(repo: str, commit: str, path: str, sha256: str) -> ModelFile:
+    """The file at `path` in a Hugging Face repo, as of `commit`, named as it is there."""
+    url = f"https://huggingface.co/{repo}/resolve/{commit}/{path}"
+    return ModelFile(PurePosixPath(path).name, url, sha256)
 
 
 SILERO_VAD = Model(
@@ -86,7 +88,40 @@ PARAKEET = Model(
         _parakeet("tokens.txt", "d58544679ea4bc6ac563d1f545eb7d474bd6cfa467f0a6e2c1dc1c7d37e3c35d"),
     ),
 )
-MODELS = (SILERO_VAD, SMART_TURN, PARAKEET)
+
+
+def _piper_voice(path: str, sha256: str) -> ModelFile:
+    return _hugging_face(
+        "rhasspy/piper-voices", "c10ece1aade47bb51c153c893d14e5bf8e5b7117", path, sha256
+    )
+
+
+PIPER_LESSAC = Model(
+    "piper-en_US-lessac-medium",
+    (
+        _piper_voice(
+            "en/en_US/lessac/medium/en_US-lessac-medium.onnx",
+            "5efe09e69902187827af646e1a6e9d269dee769f9877d17b16b1b46eeaaf019f",
+        ),
+        _piper_voice(
+            "en/en_US/lessac/medium/en_US-lessac-medium.onnx.json",
+            "efe19c417bed055f2d69908248c6ba650fa135bc868b0e6abb3da181dab690a0",
+        ),
+    ),
+)
+SILERO_TTS = Model(
+    "silero-tts-v5_5_ru",
+    (
+        # Silero names each version of its models, but serves no fixed revision of one: the
+        # sha256 pins it.
+        ModelFile(
+            "v5_5_ru.pt",
+            "https://models.silero.ai/models/tts/ru/v5_5_ru.pt",
+            "50081637b602126ee06cb3bc8a744d25651d2da149ee8864b9a379bfdd934437",
+        ),
+    ),
+)
+MODELS = (SILERO_VAD, SMART_TURN, PARAKEET, PIPER_LESSAC, SILERO_TTS)
 """Every model `models fetch` downloads."""
 
 

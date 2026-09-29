@@ -1,10 +1,11 @@
-"""The hub's resampler, between the device's 16 kHz and an agent's 16, 24 or 48 kHz."""
+"""The hub's resampler, between the device's 16 kHz and an agent's 16, 24 or 48 kHz, and from
+whatever rate a TTS engine speaks at."""
 
 import itertools
 
 import numpy as np
 import pytest
-from tinyaisense_hub.resampler import Resampler
+from tinyaisense_hub.resampler import Resampler, SoxrResampler, resampler_for
 
 from .signals import db, pcm, samples, snr, steady, tone, vhq
 
@@ -91,18 +92,30 @@ def test_upsampling_adds_nothing_above_the_source_nyquist_as_soxr_vhq_adds_nothi
     assert above(steady(out, target), target, source / 2) < -80
 
 
-@pytest.mark.parametrize(("source", "target"), PAIRS)
-def test_the_output_doesnt_depend_on_how_the_input_is_cut(source: int, target: int) -> None:
-    audio = pcm(tone(source, 1000, 200))
-    whole = Resampler(source, target)
-    expected = whole.process(audio) + whole.flush()
-
-    resampler = Resampler(source, target)
+def cut_up(resampler: Resampler | SoxrResampler, audio: bytes) -> bytes:
+    """`audio` through `resampler` in pieces of odd sizes, flushed."""
     out, at = b"", 0
     for count in itertools.cycle([1, 0, 7, 333, 1000]):
         out += resampler.process(audio[at : at + 2 * count])
         at += 2 * count
         if at >= len(audio):
             break
+    return out + resampler.flush()
 
-    assert out + resampler.flush() == expected
+
+@pytest.mark.parametrize(("source", "target"), PAIRS)
+def test_the_output_doesnt_depend_on_how_the_input_is_cut(source: int, target: int) -> None:
+    audio = pcm(tone(source, 1000, 200))
+    whole = Resampler(source, target)
+    expected = whole.process(audio) + whole.flush()
+
+    assert cut_up(Resampler(source, target), audio) == expected
+
+
+def test_an_engines_odd_rate_is_resampled_too_however_its_audio_is_cut() -> None:
+    """E.g. Piper's 22.05 kHz, which soxr HQ resamples: it holds some of the audio back, until
+    it's flushed."""
+    out = cut_up(resampler_for(22050, 16000), pcm(tone(22050, 1000, 500)))
+
+    assert len(out) == 2 * 8000
+    assert snr(samples(out), tone(16000, 1000, 500), 16000) > 70

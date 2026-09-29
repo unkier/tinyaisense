@@ -1,7 +1,7 @@
 """Test signals, and soxr VHQ as the reference for resampled audio."""
 
 import numpy as np
-import soxr  # pyright: ignore[reportMissingTypeStubs]
+import soxr
 
 
 def tone(rate: int, hz: float, ms: int, amplitude: float = 16000) -> np.ndarray:

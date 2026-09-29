@@ -14,7 +14,6 @@ from ..config import ConfigError, SpeechConfig, Timing, VoiceConfig
 from ..control import Control
 from ..errors import HubError
 from ..mic import Listener
-from ..resampler import RATES
 from ..session import Session, ThenListen, UtteranceOptIn
 from ..state import DeviceRecord
 from ..streams import FORMAT
@@ -63,11 +62,6 @@ class Speech:
         for lang, name in self._config.tts.items():
             if name not in engines:
                 engines[name] = await self._load(name, Tts)
-                if engines[name].rate not in RATES:
-                    raise ConfigError(
-                        f"speech engine {name!r} speaks at {engines[name].rate} Hz: the hub "
-                        f"resamples from {', '.join(map(str, RATES))} Hz only"
-                    )
             engine = self._tts[lang] = engines[name]
             if engine.languages and lang not in engine.languages:
                 raise ConfigError(

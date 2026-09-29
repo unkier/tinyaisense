@@ -1,18 +1,24 @@
-"""The local speech engines, which run on the hub's CPU: Silero VAD, Smart Turn and Parakeet.
-They need the `[local]` extra, and their models, which `models fetch` downloads."""
+"""The local speech engines, which run on the hub's CPU: Silero VAD, Smart Turn, Parakeet, Piper
+and Silero TTS. They need the `[local]` extra, and their models, which `models fetch`
+downloads."""
 
+import json
+import warnings
+from collections.abc import Iterator
 from dataclasses import dataclass
+from typing import Any
 
 import numpy as np
 
 try:
     import onnxruntime as ort
+    import piper
     import sherpa_onnx
 except ImportError as e:
     raise ImportError(f"{e}: the local speech engines need tinyaisense-hub[local]") from e
 
-from ..models import PARAKEET, SILERO_VAD, SMART_TURN, model_dir
-from .engines import Stt, Transcript, Turn, Vad
+from ..models import PARAKEET, PIPER_LESSAC, SILERO_TTS, SILERO_VAD, SMART_TURN, model_dir
+from .engines import Stt, Transcript, Tts, Turn, Vad
 from .text import language
 
 
@@ -126,6 +132,75 @@ class ParakeetStt(Stt):
         self._recognizer.decode_stream(stream)
         text = stream.result.text.strip()
         return Transcript(text, language(text) or lang or self.languages[0])
+
+
+_LESSAC = "en_US-lessac-medium"
+
+
+class PiperTts(Tts):
+    """Piper, on ONNX Runtime: English, in its voice `en_US-lessac-medium`, at 22.05 kHz. It
+    gives the audio a sentence at a time."""
+
+    languages = ("en",)
+    voices = (_LESSAC,)
+
+    def __init__(self, *, threads: int = 4, model: str | None = None) -> None:
+        """`model` is the dir of the model, if it isn't where `models fetch` puts it."""
+        path = model_dir(PIPER_LESSAC, model) / f"{_LESSAC}.onnx"
+        config = piper.PiperConfig.from_dict(json.loads(path.with_suffix(".onnx.json").read_text()))
+        self._voice = piper.PiperVoice(_onnx(str(path), threads), config)
+        self.rate = config.sample_rate
+
+    def warm_up(self) -> None:
+        for _ in self.synthesize("Hello.", _LESSAC):
+            pass
+
+    def synthesize(self, text: str, voice: str) -> Iterator[bytes]:
+        for chunk in self._voice.synthesize(text):
+            yield chunk.audio_int16_bytes
+
+
+class SileroTts(Tts):
+    """Silero TTS v5 (`v5_5_ru`), on torch: Russian, in its voices `xenia`, `baya`, `kseniya`,
+    `aidar` and `eugene`, at 48 kHz, its fastest. It gives the audio all at once. It reads no
+    digits or Latin letters, and gives no audio for text with no Russian letters in it."""
+
+    languages = ("ru",)
+    rate = 48000
+    voices = ("xenia", "baya", "kseniya", "aidar", "eugene")
+
+    _LETTERS = frozenset("абвгдеёжзийклмнопрстуфхцчшщъыьэюя")
+
+    def __init__(self, *, threads: int = 4, model: str | None = None) -> None:
+        """`model` is the dir of the model, if it isn't where `models fetch` puts it. `threads`
+        is torch's, for the whole hub: only Silero runs on it."""
+        # Slow to import, and only Silero needs it.
+        try:
+            import torch
+            from torch.package.package_importer import PackageImporter
+        except ImportError as e:
+            raise ImportError(f"{e}: Silero TTS needs tinyaisense-hub[local]") from e
+
+        self._torch = torch
+        path = model_dir(SILERO_TTS, model) / "v5_5_ru.pt"
+        torch.set_num_threads(threads)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", SyntaxWarning)  # in the model's own code
+            importer = PackageImporter(path)
+            self._model: Any = importer.load_pickle(  # pyright: ignore[reportUnknownMemberType]
+                "tts_models", "model"
+            )
+
+    def warm_up(self) -> None:
+        for _ in self.synthesize("Привет.", "xenia"):
+            pass
+
+    def synthesize(self, text: str, voice: str) -> Iterator[bytes]:
+        if self._LETTERS.isdisjoint(text.lower()):
+            return
+        with self._torch.inference_mode():
+            audio = self._model.apply_tts(text=text, speaker=voice, sample_rate=self.rate)
+        yield (audio.clamp(-1, 1) * 32767).round().to(self._torch.int16).numpy().tobytes()
 
 
 _N_FFT = 400

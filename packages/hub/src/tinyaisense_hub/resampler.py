@@ -5,9 +5,12 @@ Kaiser-windowed sinc. Of the lower Nyquist, it's flat to 0.8, and ~86 dB down fr
 nothing folds back or images below 0.875: 7 kHz at 16 kHz. The filter is causal and
 linear-phase, so the audio comes out 1 ms late, and whatever comes in comes out at once: 10 ms
 in gives 10 ms out.
+
+A TTS engine may speak at any other rate, e.g. Piper at 22.05 kHz: soxr HQ resamples that.
 """
 
 import numpy as np
+import soxr
 from numpy.lib.stride_tricks import sliding_window_view
 
 RATES = (16000, 24000, 48000)
@@ -66,6 +69,31 @@ class Resampler:
     def flush(self) -> bytes:
         """The last 1 ms of the input, which the filter still holds: no more input follows."""
         return self.process(bytes(self._source // 1000 * 2))
+
+
+class SoxrResampler:
+    """s16le mono PCM from any rate to any other, by soxr HQ, any number of samples at a time.
+    It holds some of the audio back until it has enough to filter: ~20 ms from 22.05 to 16 kHz.
+    """
+
+    def __init__(self, source: int, target: int) -> None:
+        self._stream = soxr.ResampleStream(source, target, 1, dtype="int16", quality="HQ")
+
+    def process(self, pcm: bytes) -> bytes:
+        """Take input, and return what output it can."""
+        return self._stream.resample_chunk(np.frombuffer(pcm, "<i2")).tobytes()
+
+    def flush(self) -> bytes:
+        """The output it still holds: no more input follows."""
+        return self._stream.resample_chunk(np.zeros(0, "<i2"), last=True).tobytes()
+
+
+def resampler_for(source: int, target: int) -> Resampler | SoxrResampler:
+    """s16le mono PCM from rate `source` to `target`: by the FIR between 16, 24 and 48 kHz,
+    else by soxr."""
+    if source in RATES and target in RATES:
+        return Resampler(source, target)
+    return SoxrResampler(source, target)
 
 
 def _lowpass(cutoff: float) -> np.ndarray:

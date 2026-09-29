@@ -74,6 +74,7 @@ def test_init_writes_a_config_with_a_random_agent_token(
         "speaker_latency_ms": 50,
         "vad": "silero_vad",
         "turn": "smart_turn",
+        "tts": {"en": "piper", "ru": "silero_tts"},
         "stt": {"en": "parakeet", "ru": "parakeet"},
         "engines": {
             "silero_vad": {
@@ -88,7 +89,19 @@ def test_init_writes_a_config_with_a_random_agent_token(
                 "class": "tinyaisense_hub.speech.local:ParakeetStt",
                 "params": {"threads": 4},
             },
+            "piper": {
+                "class": "tinyaisense_hub.speech.local:PiperTts",
+                "params": {"threads": 4},
+            },
+            "silero_tts": {
+                "class": "tinyaisense_hub.speech.local:SileroTts",
+                "params": {"threads": 4},
+            },
         },
+        "voices": [
+            {"id": "lessac", "lang": "en", "name": "Lessac", "engine_voice": "en_US-lessac-medium"},
+            {"id": "xenia", "lang": "ru", "name": "Xenia", "engine_voice": "xenia"},
+        ],
     }
     assert len(config["agent_token"]) >= 32
     assert stat.S_IMODE(path.stat().st_mode) == 0o600
@@ -173,7 +186,7 @@ id = "masha"
 lang = "ru"
 name = "Маша"
 """
-"""What `init` wrote, plus the fake TTS and two Voices."""
+"""The fake TTS and two Voices, in place of what `init` wrote in [speech]."""
 
 
 @pytest.fixture
@@ -313,7 +326,7 @@ def test_serve_refuses_a_speech_config_that_doesnt_hold_together(
 ) -> None:
     main(["init"])
     config = Path(xdg["XDG_CONFIG_HOME"]) / "tinyaisense" / "hub.toml"
-    config.write_text(config.read_text() + speech)
+    config.write_text(replace_speech(config.read_text(), speech))
 
     assert main(["serve"]) == 1
 
@@ -325,8 +338,7 @@ def test_serve_refuses_a_default_language_no_voice_speaks(
 ) -> None:
     main(["init"])
     config = Path(xdg["XDG_CONFIG_HOME"]) / "tinyaisense" / "hub.toml"
-    text = config.read_text().replace('lang = "en"', 'lang = "de"')
-    config.write_text(text + SPEECH)
+    config.write_text(replace_speech(config.read_text(), '[speech]\nlang = "de"\n' + SPEECH))
 
     assert main(["serve"]) == 1
 
@@ -394,7 +406,7 @@ def test_serve_refuses_to_start_without_the_models_of_its_engines(
 
     err = capsys.readouterr().err
     models = Path(xdg["XDG_DATA_HOME"]) / "tinyaisense" / "models"
-    assert f"speech engine 'silero_vad': no model at {models / 'silero-vad-v6.2.3'}" in err
+    assert f"speech engine 'piper': no model at {models / 'piper-en_US-lessac-medium'}" in err
     assert "run `tinyaisense-hub models fetch`" in err
 
 

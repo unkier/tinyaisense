@@ -14,7 +14,6 @@ import pytest
 import tinyaisense
 import websockets
 from tinyaisense_hub import (
-    ConfigError,
     EngineConfig,
     Hub,
     OwnerClient,
@@ -378,16 +377,25 @@ async def test_a_tts_at_24_khz_is_resampled_to_the_devices_16_khz(
         result = await agent.say("kitchen/speaker", "Hello there.")
 
     assert fake.decode(kitchen.speaker.pcm()).text == "Hello there."
-    assert result["played_ms"] == 120
+    assert result["played_ms"] == 120 + 1  # and the resampler's filter, 1 ms behind
 
 
-async def test_a_tts_at_a_rate_the_hub_cant_resample_fails_the_hub_start(
-    start_hub: StartHub,
+async def test_a_tts_at_an_odd_rate_is_resampled_to_the_devices_16_khz_and_timed_as_heard(
+    start_hub: StartHub, simulator: SimulatorFactory
 ) -> None:
+    """E.g. Piper's 22.05 kHz, which the resampler holds some of back until the say's end: it
+    played all of it all the same, 12 symbols of 220 samples."""
     odd = EngineConfig("tinyaisense_hub.speech.fake:FakeTts", {"rate": 22050})
+    hub = await start_hub(speech=replace(SPEECH, engines={"fake": odd}))
+    sim = simulator(hub.device_address)
+    async with OwnerClient(hub.owner_socket) as owner:
+        kitchen = await paired(sim, owner)
+    async with tinyaisense.connect(hub.agent_url, TOKEN) as agent:
+        result = await agent.say("kitchen/speaker", "Hello there.")
 
-    with pytest.raises(ConfigError, match="22050"):
-        await start_hub(speech=replace(SPEECH, engines={"fake": odd}))
+    # Each symbol is a hair short of 10 ms: the last one is padded out to a whole one.
+    assert fake.decode(kitchen.speaker.pcm() + bytes(2 * 10)).text == "Hello there."
+    assert result["played_ms"] == 12 * 220 * 1000 // 22050
 
 
 async def test_a_say_is_synthesized_3_s_ahead_of_playback_and_no_further_once_cut(

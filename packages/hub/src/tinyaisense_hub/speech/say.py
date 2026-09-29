@@ -14,7 +14,7 @@ from ..alarm import now_us
 from ..config import SpeechConfig
 from ..control import Control
 from ..errors import HubError
-from ..resampler import Resampler
+from ..resampler import Resampler, SoxrResampler, resampler_for
 from ..session import Session
 from ..speaker import SpeakerStream
 from ..state import DeviceRecord
@@ -142,10 +142,6 @@ class Run:
         """Set when a `say` joins, or the stream starves."""
         self._fed = 0
         """Bytes fed to the stream so far."""
-        self._rate = FORMAT.rate
-        """The rate of the audio being fed."""
-        self._resampler: Resampler | None = None
-        """From `_rate` to the device's; None if they're the same."""
         self._timers: list[asyncio.TimerHandle] = []
         self._feeding: asyncio.Future[None] | None = None
 
@@ -249,7 +245,8 @@ class Run:
                     if pcm is None:
                         break
                     stream = await starting
-                    self._feed_pcm(stream, pcm, voice.engine.rate)
+                    self._control.speaker_feed(stream, pcm)
+                    self._fed += len(pcm)
                     await self._keep_ahead(stream)
             finally:
                 synthesis.close()
@@ -264,23 +261,6 @@ class Run:
         """Whether the stream is stopping, or over: its audio goes nowhere."""
         return self._stream is not None and not self._stream.open
 
-    def _feed_pcm(self, stream: SpeakerStream, pcm: bytes, rate: int) -> None:
-        if rate != self._rate:
-            self._flush(stream)
-            self._rate = rate
-            self._resampler = None if rate == FORMAT.rate else Resampler(rate, FORMAT.rate)
-        if self._resampler is not None:
-            pcm = self._resampler.process(pcm)
-        self._control.speaker_feed(stream, pcm)
-        self._fed += len(pcm)
-
-    def _flush(self, stream: SpeakerStream) -> None:
-        """Feed the audio the resampler still holds."""
-        if self._resampler is not None:
-            tail = self._resampler.flush()
-            self._control.speaker_feed(stream, tail)
-            self._fed += len(tail)
-
     async def _keep_ahead(self, stream: SpeakerStream) -> None:
         """Wait until the stream holds no more than `say_ahead_ms` of audio unsent. It sends
         in real time, so that's a known wait."""
@@ -290,7 +270,6 @@ class Run:
 
     def _drain(self, stream: SpeakerStream) -> None:
         self._closed = True
-        self._flush(stream)
         self._control.speaker_drain(stream)
 
     def _schedule(self, say: Say, stream: SpeakerStream) -> None:
@@ -337,7 +316,9 @@ async def _clause(say: Say, index: int) -> Clause | None:
 
 
 class _Synthesis:
-    """A text being synthesized on the TTS thread, a piece at a time."""
+    """A text being synthesized on the TTS thread, a piece at a time, and resampled there to
+    the device's rate. The resampler lets go of the end of the text's audio once it's all
+    made: then the next text starts afresh."""
 
     def __init__(self, executor: ThreadPoolExecutor, engine: Tts, text: str, voice: str) -> None:
         self._executor = executor
@@ -345,9 +326,13 @@ class _Synthesis:
         self._text = text
         self._voice = voice
         self._pieces: Iterator[bytes] | None = None
+        self._resampler: Resampler | SoxrResampler | None = None
+        """From the engine's rate; None if it's the device's, or once flushed."""
+        if engine.rate != FORMAT.rate:
+            self._resampler = resampler_for(engine.rate, FORMAT.rate)
 
     async def next(self) -> bytes | None:
-        """The next piece of audio; None once there's no more."""
+        """The next piece of audio, at the device's rate; None once there's no more."""
         loop = asyncio.get_running_loop()
         pieces = self._pieces
         if pieces is None:
@@ -355,7 +340,17 @@ class _Synthesis:
                 self._executor, lambda: iter(self._engine.synthesize(self._text, self._voice))
             )
             self._pieces = pieces
-        return await loop.run_in_executor(self._executor, next, pieces, None)
+        return await loop.run_in_executor(self._executor, self._next, pieces)
+
+    def _next(self, pieces: Iterator[bytes]) -> bytes | None:
+        """On the TTS thread."""
+        pcm = next(pieces, None)
+        if self._resampler is None:
+            return pcm
+        if pcm is None:
+            pcm, self._resampler = self._resampler.flush(), None
+            return pcm
+        return self._resampler.process(pcm)
 
     def close(self) -> None:
         """Stop it, on the TTS thread once that's free: engines only ever run there."""

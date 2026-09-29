@@ -160,12 +160,19 @@ LOCAL_SPEECH = SpeechConfig(
         "silero_vad": EngineConfig("tinyaisense_hub.speech.local:SileroVad", {"threads": 1}),
         "smart_turn": EngineConfig("tinyaisense_hub.speech.local:SmartTurn", {"threads": 4}),
         "parakeet": EngineConfig("tinyaisense_hub.speech.local:ParakeetStt", {"threads": 4}),
+        "piper": EngineConfig("tinyaisense_hub.speech.local:PiperTts", {"threads": 4}),
+        "silero_tts": EngineConfig("tinyaisense_hub.speech.local:SileroTts", {"threads": 4}),
     },
+    tts={"en": "piper", "ru": "silero_tts"},
     stt={"en": "parakeet", "ru": "parakeet"},
     vad="silero_vad",
     turn="smart_turn",
+    voices=(
+        VoiceConfig("lessac", "en", "Lessac", "en_US-lessac-medium"),
+        VoiceConfig("xenia", "ru", "Xenia"),
+    ),
 )
-"""The local engines, on the CPU, that a new config listens with."""
+"""The local engines, on the CPU, that a new config speaks and listens with."""
 
 
 def new_config() -> Config:
@@ -228,20 +235,20 @@ speaker_latency_ms = {speech.speaker_latency_ms}
     if engines:
         engines[0] = (
             "# Each engine is a Python class, `module:Class`, and the keyword arguments to make "
-            "it with,\n# under a name of your choosing. The local engines take the ORT "
+            "it with,\n# under a name of your choosing. The local engines take the "
             "`threads` to run on, and\n# `model`: the dir of their model, if it isn't where "
             "`models fetch` puts it.\n" + engines[0]
         )
     blocks += engines
     blocks.append("""\
 # The Voices: agents pick one by `id`. The first of each language is its default, and
-# `engine_voice` is the TTS engine's own name for it, if not the `id`. For example:
+# `engine_voice` is the TTS engine's own name for it, if not the `id`. Silero also speaks
+# Russian as baya, kseniya, aidar and eugene. For example:
 #
 # [[speech.voices]]
-# id = "amy"
-# lang = "en"
-# name = "Amy"
-# engine_voice = "en_US-amy"
+# id = "aidar"
+# lang = "ru"
+# name = "Aidar"
 """)
     blocks += [
         "[[speech.voices]]\n"

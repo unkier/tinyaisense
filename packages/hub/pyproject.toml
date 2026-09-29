@@ -5,6 +5,7 @@ description = "tinyaisense hub and owner CLI"
 requires-python = ">=3.14"
 dependencies = [
     "numpy>=2.3",
+    "soxr>=1.0",
     "starlette>=1.7",
     "tinyaisense-wire",
     "uvicorn>=0.54.0,<0.55",
@@ -17,13 +18,15 @@ dependencies = [
 tinyaisense-hub = "tinyaisense_hub.cli:main"
 
 [project.optional-dependencies]
-# Local speech engines. Piper and torch (Silero RU only) come with the local TTS.
-local = ["onnxruntime>=1.30", "sherpa-onnx>=1.13.8"]
+# Local speech engines. torch runs Silero's Russian TTS only.
+local = ["onnxruntime>=1.30", "piper-tts>=1.8", "sherpa-onnx>=1.13.8", "torch>=2.14"]
 # polza.ai cloud speech plugin.
 polza = []
 
 [tool.uv.sources]
 tinyaisense-wire = { workspace = true }
+# PyPI's torch for Linux pulls in CUDA, GBs of it: the hub runs it on the CPU.
+torch = { index = "pytorch-cpu" }
 
 [build-system]
 requires = ["uv_build>=0.10.0,<0.11"]
