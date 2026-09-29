@@ -112,6 +112,10 @@ class Session:
         """Every paired device: `{name, online, manifest}`."""
         return cast(list[JsonObject], (await self.call("devices"))["devices"])
 
+    async def voices(self) -> list[JsonObject]:
+        """The Voices the hub speaks with: `{id, lang, name}`. Pass an `id` to `say`."""
+        return cast(list[JsonObject], (await self.call("voices"))["voices"])
+
     async def command(self, address: str, name: str, args: JsonObject | None = None) -> JsonObject:
         """Send a Kind command to the capability at `address`, e.g. `kitchen/led`, and return
         its result. An `led` command claims the device's LED from its Status."""
@@ -155,6 +159,32 @@ class Session:
     async def stream_drain(self, handle: int) -> JsonObject:
         """End a speaker stream once what was sent has played. Returns `{reason, stats}`."""
         return await self.call("stream.drain", handle=handle)
+
+    async def say(
+        self,
+        address: str,
+        text: str,
+        *,
+        voice: str | None = None,
+        lang: str | None = None,
+        replace: bool = False,
+    ) -> JsonObject:
+        """Speak `text` on the speaker at `address`, e.g. `kitchen/speaker`. Returns once it
+        has played, or been cut: `{reason, played_ms, interrupted, heard_text}`, where
+        `heard_text` is what the human heard of it.
+
+        A `say` queued on a speaker plays right after the ones before it; with `replace`, it
+        cuts them off instead, and they end `preempted`. `voice` is a Voice id from `voices`.
+        Without one, the hub speaks in its default Voice for `lang`, or for the language the
+        text is written in."""
+        params: JsonObject = {"address": address, "text": text}
+        if voice is not None:
+            params["voice"] = voice
+        if lang is not None:
+            params["lang"] = lang
+        if replace:
+            params["replace"] = True
+        return await self.call("say", **params)
 
     async def audio(self, handle: int) -> AsyncIterator[HubAudio]:
         """A mic stream's frames, in order, until the stream ends: 10 ms of PCM each (s16le

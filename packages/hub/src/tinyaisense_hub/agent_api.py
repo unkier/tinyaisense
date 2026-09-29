@@ -97,6 +97,18 @@ _HANDLE: Schema = {
     "additionalProperties": False,
     "properties": {"handle": {"type": "integer", "minimum": 0, "maximum": 65535}},
 }
+_SAY: Schema = {
+    "type": "object",
+    "required": ["address", "text"],
+    "additionalProperties": False,
+    "properties": {
+        "address": {"type": "string"},
+        "text": {"type": "string"},
+        "voice": {"type": "string"},
+        "lang": {"type": "string"},
+        "replace": {"type": "boolean"},
+    },
+}
 _log = logging.getLogger("tinyaisense_hub.agent_api")
 
 
@@ -139,11 +151,13 @@ class AgentLink:
         self._requests: set[asyncio.Task[None]] = set()
         self._methods: dict[str, tuple[Schema, _Method]] = {
             "devices": (_NO_PARAMS, self._devices),
+            "voices": (_NO_PARAMS, self._voices),
             "command": (_COMMAND, self._command),
             "led.release": (_DEVICE, self._led_release),
             "stream.start": (_STREAM_START, self._stream_start),
             "stream.stop": (_HANDLE, self._stream_stop),
             "stream.drain": (_HANDLE, self._stream_drain),
+            "say": (_SAY, self._say),
         }
 
     async def run(self) -> None:
@@ -323,6 +337,9 @@ class AgentLink:
     async def _devices(self, params: JsonObject) -> JsonObject:
         return {"devices": self._core.devices()}
 
+    async def _voices(self, params: JsonObject) -> JsonObject:
+        return {"voices": self._core.voices()}
+
     async def _command(self, params: JsonObject) -> JsonObject:
         assert self._session is not None
         return await self._core.command(
@@ -348,6 +365,17 @@ class AgentLink:
     async def _stream_drain(self, params: JsonObject) -> JsonObject:
         assert self._session is not None
         return await self._core.stream_drain(self._session, params["handle"])
+
+    async def _say(self, params: JsonObject) -> JsonObject:
+        assert self._session is not None
+        return await self._core.say(
+            self._session,
+            params["address"],
+            params["text"],
+            voice=params.get("voice"),
+            lang=params.get("lang"),
+            replace=params.get("replace", False),
+        )
 
     # Writing.
 

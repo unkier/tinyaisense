@@ -12,15 +12,22 @@ from .control import Control
 from .devices import Registry
 from .errors import HubError
 from .session import Holder, Session, Sessions, SessionSink, UtteranceOptIn
+from .speech.layer import Speech
 
 
 class Core:
     def __init__(
-        self, registry: Registry, sessions: Sessions, control: Control, agent_token: str
+        self,
+        registry: Registry,
+        sessions: Sessions,
+        control: Control,
+        speech: Speech,
+        agent_token: str,
     ) -> None:
         self._registry = registry
         self._sessions = sessions
         self._control = control
+        self._speech = speech
         self._agent_token = agent_token.encode()
 
     async def open_session(
@@ -47,6 +54,9 @@ class Core:
 
     def devices(self) -> list[JsonObject]:
         return self._registry.paired()
+
+    def voices(self) -> list[JsonObject]:
+        return self._speech.voices()
 
     async def command(
         self, session: Session, address: str, name: str, args: JsonObject
@@ -79,3 +89,22 @@ class Core:
         """End a speaker stream once what the agent sent has played. Returns its `reason` and
         `stats`. Raises `HubError`, `unsupported` for a mic stream."""
         return (await self._control.stream_drain(session, handle)).to_json()
+
+    async def say(
+        self,
+        session: Session,
+        address: str,
+        text: str,
+        *,
+        voice: str | None,
+        lang: str | None,
+        replace: bool,
+    ) -> JsonObject:
+        """Speak `text` on the speaker at `address`, after what's queued on it, or cutting it
+        off if `replace`. Returns how it went once it has played. Raises `HubError`."""
+        device, capability = self._registry.resolve(address)
+        if capability.kind != "speaker":
+            raise HubError("unsupported", f"{address} isn't a speaker")
+        return await self._speech.say(
+            session, device, capability, text, voice=voice, lang=lang, replace=replace
+        )

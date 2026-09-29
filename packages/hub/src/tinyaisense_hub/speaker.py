@@ -10,9 +10,9 @@ from .alarm import Alarm, now_us
 from .config import Timing
 from .devices import DeviceConnection
 from .keepalive import Tick
-from .pacer import Close, Drain, Feed, Open, Overflow, Pacer, Remove, Send
+from .pacer import Close, Drain, Feed, Open, Overflow, Pacer, Remove, Send, Starved
 from .resampler import Resampler
-from .streams import FORMAT, Stream
+from .streams import FORMAT, Stream, StreamEnd
 
 if TYPE_CHECKING:
     from .session import Session  # it holds its streams
@@ -28,10 +28,14 @@ class SpeakerStream(Stream):
     sent_bytes = 0
     first_sent: int | None = None
     """When the first frame went out, in µs on the hub's monotonic clock."""
+    on_starved: Callable[[], None] | None = None
+    """Called when the stream has sent every whole frame it was fed, and isn't draining."""
+    on_end: Callable[[StreamEnd], None] | None = None
+    """Called as the stream ends, before anything else hears of it."""
 
     def __init__(
         self,
-        handle: int,
+        handle: int | None,
         session: Session,
         conn: DeviceConnection,
         cap: str,
@@ -39,7 +43,7 @@ class SpeakerStream(Stream):
         address: str,
         rate: int,
     ) -> None:
-        super().__init__(handle, session, conn, cap, stream_id, address)
+        super().__init__(handle, session, conn, cap, stream_id, address, rate)
         self._resampler = None if rate == FORMAT.rate else Resampler(rate, FORMAT.rate)
         """From the agent's rate to the device's; None if they're the same."""
 
@@ -100,6 +104,19 @@ class Speakers:
     def remove(self, stream: SpeakerStream) -> None:
         self._run(Remove(stream))
 
+    def unsent(self, stream: SpeakerStream) -> int:
+        """The bytes of the stream's audio not sent yet, at the device's rate."""
+        return self._pacer.unsent(stream)
+
+    def starved(self, stream: SpeakerStream) -> bool:
+        """Whether the stream is open, and has sent every whole frame it was fed."""
+        return self._pacer.starved(stream)
+
+    def due(self, stream: SpeakerStream, position: int) -> int | None:
+        """When the audio `position` bytes into the stream is due to play, in µs on the
+        hub's monotonic clock; None before its first frame went out."""
+        return self._pacer.due(stream, position)
+
     def close(self) -> None:
         self._alarm.cancel()
 
@@ -128,5 +145,8 @@ class Speakers:
                     self._drain(stream, last_seq)
                 case Overflow():
                     overflowed = True
+                case Starved(stream):
+                    if stream.on_starved is not None:
+                        stream.on_starved()
         self._alarm.set(self._pacer.next_deadline(), now)
         return overflowed

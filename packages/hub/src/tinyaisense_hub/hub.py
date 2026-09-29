@@ -16,6 +16,7 @@ from .devices import Datagrams, Registry
 from .discovery import Advertiser
 from .owner import OwnerServer
 from .session import Sessions
+from .speech.layer import Speech
 from .state import StateStore
 from .web import HttpServer
 
@@ -47,6 +48,7 @@ class Hub:
         self._tcp: asyncio.Server | None = None
         self._registry: Registry | None = None
         self._control: Control | None = None
+        self._speech: Speech | None = None
         self._core: Core | None = None
         self._http: HttpServer | None = None
         self._owner: OwnerServer | None = None
@@ -91,7 +93,8 @@ class Hub:
         return self._owner.path
 
     async def start(self) -> None:
-        """Raises `HubError`, `StateError` or `OSError`, having released what it took."""
+        """Raises `ConfigError`, `HubError`, `StateError` or `OSError`, having released what
+        it took."""
         try:
             await self._start()
         except BaseException:
@@ -100,6 +103,10 @@ class Hub:
 
     async def _start(self) -> None:
         loop = asyncio.get_running_loop()
+        self._control = Control(self.config.timing)
+        # First: a bad engine fails the start before anything is served.
+        self._speech = Speech(self.config.speech, self._control)
+        await self._speech.start()
         port = self.config.device_port
         dual_stack = self._host is None and socket.has_dualstack_ipv6()
         if dual_stack:
@@ -116,7 +123,6 @@ class Hub:
             self._udp, datagrams = await loop.create_datagram_endpoint(
                 Datagrams, local_addr=(self._host or "0.0.0.0", port)
             )
-        self._control = Control(self.config.timing)
         sessions = Sessions(self._control)
         self._registry = Registry(
             StateStore(self._state_dir),
@@ -126,7 +132,9 @@ class Hub:
             observer=self._control,
         )
         datagrams.received = self._registry.datagram
-        self._core = Core(self._registry, sessions, self._control, self.config.agent_token)
+        self._core = Core(
+            self._registry, sessions, self._control, self._speech, self.config.agent_token
+        )
         if dual_stack:
             # One socket, so that both families get the same port even when it's ephemeral.
             sock = socket.create_server(("", port), family=socket.AF_INET6, dualstack_ipv6=True)
@@ -149,9 +157,9 @@ class Hub:
     async def close(self) -> None:
         advertiser, owner, tcp = self._advertiser, self._owner, self._tcp
         udp, registry, core, http = self._udp, self._registry, self._core, self._http
-        control = self._control
+        control, speech = self._control, self._speech
         self._advertiser = self._owner = self._tcp = self._udp = self._registry = None
-        self._control = self._core = self._http = None
+        self._control = self._speech = self._core = self._http = None
         if advertiser is not None:
             await advertiser.close()
         if owner is not None:
@@ -170,5 +178,7 @@ class Hub:
             await registry.close()
         if control is not None:
             await control.close()
+        if speech is not None:
+            speech.close()
         if tcp is not None:
             await tcp.wait_closed()

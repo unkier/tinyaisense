@@ -27,24 +27,29 @@ class StreamEnd:
 
 
 class Stream:
-    """One agent stream, from the device's `start` reply to its end."""
+    """One stream of a Session, from the device's `start` reply to its end."""
 
     def __init__(
         self,
-        handle: int,
+        handle: int | None,
         session: Session,
         conn: DeviceConnection,
         cap: str,
         stream_id: int,
         address: str,
+        rate: int,
     ) -> None:
         self.handle = handle
+        """What the agent calls it; None if the hub runs it for the agent, as for a `say`,
+        and the agent doesn't see it."""
         self.session = session
         self.conn = conn
         self.cap = cap
         self.stream_id = stream_id
         """The device stream id, 1-127."""
         self.address = address
+        self.rate = rate
+        """The rate on the agent's side."""
         self.ended: asyncio.Future[StreamEnd] = asyncio.get_running_loop().create_future()
         self.stopping = False
         """A stop is on its way."""

@@ -1,7 +1,17 @@
 """The speaker pacer core, driven with a fake `now` in µs."""
 
 from tinyaisense_hub.keepalive import Tick
-from tinyaisense_hub.pacer import Close, Drain, Feed, Open, Overflow, Pacer, Remove, Send
+from tinyaisense_hub.pacer import (
+    Close,
+    Drain,
+    Feed,
+    Open,
+    Overflow,
+    Pacer,
+    Remove,
+    Send,
+    Starved,
+)
 
 MS = 1000
 """One millisecond in µs."""
@@ -20,7 +30,7 @@ def pacer(cap_ms: int = 5000) -> Pacer[str]:
     return core
 
 
-def seqs(actions: list[Send[str] | Drain[str] | Overflow[str]]) -> list[int]:
+def seqs(actions: list[Send[str] | Drain[str] | Overflow[str] | Starved[str]]) -> list[int]:
     return [a.seq for a in actions if isinstance(a, Send)]
 
 
@@ -148,3 +158,57 @@ def test_streams_share_the_ticks_and_each_keeps_its_own_schedule() -> None:
         Send("a", 7, pcm(100)[7 * FRAME : 8 * FRAME]),
         Send("b", 6, pcm(100)[6 * FRAME : 7 * FRAME]),
     ]
+
+
+def test_a_stream_starves_once_it_has_sent_every_whole_frame_it_has() -> None:
+    core = pacer()
+    assert core.starved("a")  # nothing yet
+
+    actions = core.handle(Feed("a", pcm(2.5)), 0)
+    assert seqs(actions) == [0, 1]
+    assert actions[-1] == Starved("a")
+    assert core.starved("a")
+    assert core.handle(Feed("a", pcm(0.25)), 0) == []  # still short of a whole frame
+
+    assert seqs(core.handle(Feed("a", pcm(0.25)), 0)) == [2]  # a whole frame again
+    assert core.handle(Feed("a", pcm(8)), 0)[-1] != Starved("a")  # more than the lead
+    assert not core.starved("a")
+
+
+def test_a_stream_starves_on_the_tick_that_sends_its_last_whole_frame() -> None:
+    core = pacer()
+    core.handle(Feed("a", pcm(8)), 0)
+
+    assert core.handle(Tick(), 10 * MS) == [Send("a", 6, pcm(8)[6 * FRAME : 7 * FRAME])]
+    assert core.handle(Tick(), 20 * MS) == [
+        Send("a", 7, pcm(8)[7 * FRAME :]),
+        Starved("a"),
+    ]
+
+
+def test_a_closed_stream_never_starves() -> None:
+    core = pacer()
+    core.handle(Feed("a", pcm(2.5)), 0)
+
+    assert Starved("a") not in core.handle(Close("a"), 0)
+    assert not core.starved("a")
+
+
+def test_unsent_is_the_audio_the_pacer_holds_back_for_later() -> None:
+    core = pacer()
+    core.handle(Feed("a", pcm(8.5)), 0)
+
+    assert core.unsent("a") == round(2.5 * FRAME)
+
+
+def test_due_is_when_a_position_on_the_stream_plays_by_the_schedule() -> None:
+    core = pacer()
+    assert core.due("a", 0) is None  # no schedule before the first frame goes out
+
+    core.handle(Feed("a", pcm(6)), 3 * MS)
+    assert core.due("a", 5 * FRAME) == 53 * MS
+    assert core.due("a", FRAME // 2) == 8 * MS
+
+    # Frame 6 fell due at 63 ms, and the device ran dry: the schedule starts afresh.
+    core.handle(Feed("a", pcm(20)), 500 * MS)
+    assert core.due("a", 6 * FRAME) == 500 * MS

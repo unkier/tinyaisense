@@ -6,7 +6,7 @@ from typing import Protocol
 
 import pytest
 import uvloop
-from tinyaisense_hub import Config, Hub, OwnerClient, Timing
+from tinyaisense_hub import Config, Hub, OwnerClient, SpeechConfig, Timing
 from tinyaisense_sim import Simulator
 from tinyaisense_sim.pytest_plugin import SimulatorFactory
 
@@ -17,6 +17,7 @@ FAST_TIMING = Timing(
     agent_ping_interval_ms=100,
     agent_dead_after_ms=800,
 )
+NO_SPEECH = SpeechConfig()
 
 
 def pytest_asyncio_loop_factories(
@@ -38,6 +39,7 @@ class StartHub(Protocol):
         device_port: int = 0,
         mdns: str | None = None,
         host: str | None = "127.0.0.1",
+        speech: SpeechConfig = ...,
     ) -> Awaitable[Hub]: ...
 
 
@@ -60,7 +62,8 @@ async def start_hub(tmp_path: Path, runtime_dir: Path) -> AsyncIterator[StartHub
     """Start an in-process hub on ephemeral ports, on loopback unless given a host (None: every
     address). Every hub shares one state dir.
 
-    It advertises over mDNS only if given a service type to advertise.
+    It advertises over mDNS only if given a service type to advertise, and has no speech
+    engines unless given some.
     """
     hubs: list[Hub] = []
 
@@ -71,9 +74,14 @@ async def start_hub(tmp_path: Path, runtime_dir: Path) -> AsyncIterator[StartHub
         device_port: int = 0,
         mdns: str | None = None,
         host: str | None = "127.0.0.1",
+        speech: SpeechConfig = NO_SPEECH,
     ) -> Hub:
         config = Config(
-            agent_token="agent-token", device_port=device_port, http_port=0, timing=timing
+            agent_token="agent-token",
+            device_port=device_port,
+            http_port=0,
+            timing=timing,
+            speech=speech,
         )
         hub = Hub(
             config,

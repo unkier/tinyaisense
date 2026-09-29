@@ -39,7 +39,8 @@ class MicStream(Stream):
         *,
         tail: int,
     ) -> None:
-        super().__init__(handle, session, conn, cap, stream_id, address)
+        super().__init__(handle, session, conn, cap, stream_id, address, rate)
+        self._handle = handle
         self.dropped = 0
         """Frames the device dropped from its queue, from its `stop` reply."""
         self.finished: asyncio.Future[None] = asyncio.get_running_loop().create_future()
@@ -55,7 +56,7 @@ class MicStream(Stream):
         """The device replied to `start`: the agent gets the timeline from now on."""
         waiting, self._waiting = self._waiting, None
         for frame in waiting or []:
-            self.session.audio(self.handle, frame.index, frame.pcm)
+            self.session.audio(self._handle, frame.index, frame.pcm)
 
     def frame(self, frame: StreamFrame, now: int) -> None:
         self._run(Frame(frame.seq, frame.payload), now)
@@ -116,7 +117,7 @@ class MicStream(Stream):
                     if self._waiting is not None:
                         self._waiting.append(action)
                     else:
-                        self.session.audio(self.handle, action.index, action.pcm)
+                        self.session.audio(self._handle, action.index, action.pcm)
                 case Finished():
                     self.close()
                     return

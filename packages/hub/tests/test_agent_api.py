@@ -8,12 +8,13 @@ from pathlib import Path
 import pytest
 import tinyaisense
 import websockets
-from tinyaisense_hub import Hub, OwnerClient, Timing
+from tinyaisense_hub import Hub, OwnerClient, SpeechConfig, Timing
 from tinyaisense_hub.control import Control
 from tinyaisense_hub.core import Core
 from tinyaisense_hub.devices import Registry
 from tinyaisense_hub.errors import HubError
 from tinyaisense_hub.session import EndReason, Sessions, UtteranceOptIn
+from tinyaisense_hub.speech.layer import Speech
 from tinyaisense_hub.state import StateStore
 from tinyaisense_sim import SimDevice, Simulator
 from tinyaisense_wire import JsonObject
@@ -108,7 +109,7 @@ async def test_no_session_starts_once_the_hub_is_shutting_down(tmp_path: Path) -
     registry = Registry(
         StateStore(tmp_path), udp=udp, timing=Timing(), auto_approve=False, observer=control
     )
-    core = Core(registry, sessions, control, TOKEN)
+    core = Core(registry, sessions, control, Speech(SpeechConfig(), control), TOKEN)
 
     await core.shutdown()
     udp.close()

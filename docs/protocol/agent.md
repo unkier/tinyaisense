@@ -188,7 +188,7 @@ A **stream** carries raw audio between the agent and a capability. `stream.start
 - `rate` is 16000 (the default), 24000 or 48000. The hub resamples both ways, so e.g. OpenAI Realtime's 24 kHz passes straight through.
   - Resampled audio runs 1 ms late. Each mic frame still holds 10 ms, from 1 ms before its place on the timeline, so a mic stream's last 1 ms never arrives. A drained speaker stream plays 1 ms longer than what was sent. At 16000, nothing is resampled.
 - `prefill_ms` (speaker only, `invalid_args` on a mic; default 40, at most 200) is how much audio the device buffers before it starts playing.
-- It replies `{handle}` once the device has started. A u16 **handle** names the stream within the Session; the hub also announces every stream, including those it opens itself, with `stream.started`.
+- It replies `{handle}` once the device has started. A u16 **handle** names the stream within the Session; the hub also announces every stream, including the raw ones it opens itself for the agent, with `stream.started`. A `say`'s speech isn't a stream to agents: it has no handle and no `stream.*` notifications, and ends with `say.ended`.
 
 **Ending.** `stream.stop{handle}` ends a stream at once: a mic stream once its last frames are in, which takes at most 30 ms more. `stream.drain{handle}` ends a speaker stream after everything sent so far has played; a mic stream can't be drained (`unsupported`). Both reply with `{reason, stats}`, as does the `stream.ended` notification every stream gets:
 

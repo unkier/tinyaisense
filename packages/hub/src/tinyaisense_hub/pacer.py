@@ -67,6 +67,14 @@ class Overflow[K]:
     key: K
 
 
+@dataclass(frozen=True, slots=True)
+class Starved[K]:
+    """The stream sent every whole frame it had, and isn't closed: it needs audio, or a
+    `Close`."""
+
+    key: K
+
+
 @dataclass(slots=True)
 class _Stream:
     frame_bytes: int
@@ -106,8 +114,8 @@ class Pacer[K: Hashable]:
 
     def handle(
         self, input: Open[K] | Feed[K] | Close[K] | Remove[K] | Tick, now: int
-    ) -> list[Send[K] | Drain[K] | Overflow[K]]:
-        actions: list[Send[K] | Drain[K] | Overflow[K]] = []
+    ) -> list[Send[K] | Drain[K] | Overflow[K] | Starved[K]]:
+        actions: list[Send[K] | Drain[K] | Overflow[K] | Starved[K]] = []
         match input:
             case Open(key, frame_bytes):
                 self._streams[key] = _Stream(frame_bytes)
@@ -138,11 +146,29 @@ class Pacer[K: Hashable]:
         """When to `handle(Tick())` next; None while there's nothing to send."""
         return self._next_tick
 
+    def starved(self, key: K) -> bool:
+        """Whether the stream is open, and has sent every whole frame it had."""
+        stream = self._streams.get(key)
+        return stream is not None and not stream.closed and not stream.next_frame()
+
+    def unsent(self, key: K) -> int:
+        """The bytes of audio the stream holds, not sent yet."""
+        stream = self._streams.get(key)
+        return len(stream.source) if stream is not None else 0
+
+    def due(self, key: K, position: int) -> int | None:
+        """When the audio `position` bytes into the stream plays, by its schedule so far;
+        None before its first frame went out."""
+        stream = self._streams.get(key)
+        if stream is None or stream.anchor is None:
+            return None
+        return stream.anchor + position * self._frame // stream.frame_bytes
+
     def _cap_bytes(self, stream: _Stream) -> int:
         return self._cap * stream.frame_bytes // self._frame
 
-    def _send_due(self, key: K, stream: _Stream, now: int) -> list[Send[K] | Drain[K]]:
-        sent: list[Send[K] | Drain[K]] = []
+    def _send_due(self, key: K, stream: _Stream, now: int) -> list[Send[K] | Drain[K] | Starved[K]]:
+        sent: list[Send[K] | Drain[K] | Starved[K]] = []
         while size := stream.next_frame():
             n = stream.sent
             # Behind schedule, the device has played out what it had: start the schedule
@@ -159,4 +185,6 @@ class Pacer[K: Hashable]:
         if stream.closed and not stream.source and not stream.drained:
             stream.drained = True
             sent.append(Drain(key, stream.sent - 1 if stream.sent else None))
+        elif sent and not stream.next_frame() and not stream.closed:
+            sent.append(Starved(key))
         return sent

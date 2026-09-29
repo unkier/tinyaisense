@@ -52,6 +52,7 @@ def test_init_writes_a_config_with_a_random_agent_token(
         "mic_tail_ms": 30,
         "agent_audio_ms": 2000,
     }
+    assert config["speech"] == {"lang": "en", "say_ahead_ms": 3000, "speaker_latency_ms": 50}
     assert len(config["agent_token"]) >= 32
     assert stat.S_IMODE(path.stat().st_mode) == 0o600
 
@@ -116,9 +117,32 @@ class Served:
     agent_token: str
 
 
+SPEECH = """
+[speech.tts]
+en = "fake"
+ru = "fake"
+
+[speech.engines.fake]
+class = "tinyaisense_hub.speech.fake:FakeTts"
+params = { voices = { alto = 0, masha = 2 } }
+
+[[speech.voices]]
+id = "alto"
+lang = "en"
+name = "Alto"
+
+[[speech.voices]]
+id = "masha"
+lang = "ru"
+name = "Маша"
+"""
+"""What `init` wrote, plus the fake TTS and two Voices."""
+
+
 @pytest.fixture
-async def served(xdg: dict[str, str]) -> AsyncIterator[Served]:
-    """`tinyaisense-hub serve` in a child process, on free ports."""
+async def served(xdg: dict[str, str], request: pytest.FixtureRequest) -> AsyncIterator[Served]:
+    """`tinyaisense-hub serve` in a child process, on free ports. Parametrize it indirectly
+    with more config to append."""
     main(["init"])
     with socket.socket() as device_probe, socket.socket() as http_probe:
         device_probe.bind(("127.0.0.1", 0))
@@ -126,7 +150,7 @@ async def served(xdg: dict[str, str]) -> AsyncIterator[Served]:
         port, http = device_probe.getsockname()[1], http_probe.getsockname()[1]
     config = Path(xdg["XDG_CONFIG_HOME"]) / "tinyaisense" / "hub.toml"
     text = config.read_text().replace("device = 8420", f"device = {port}")
-    config.write_text(text.replace("http = 8421", f"http = {http}"))
+    config.write_text(text.replace("http = 8421", f"http = {http}") + getattr(request, "param", ""))
     hub = await asyncio.create_subprocess_exec(
         sys.executable, "-m", "tinyaisense_hub", "serve", "--no-mdns", env=os.environ | xdg
     )
@@ -183,6 +207,62 @@ async def test_the_owner_identifies_diagnoses_and_sets_the_volume_from_the_cli(
 async def test_serve_serves_the_agent_api(served: Served) -> None:
     async with tinyaisense.connect(served.agent_url, served.agent_token) as agent:
         assert await agent.devices() == []
+
+
+@pytest.mark.parametrize("served", [SPEECH], indirect=True)
+async def test_serve_speaks_in_the_voices_of_its_config(served: Served) -> None:
+    async with tinyaisense.connect(served.agent_url, served.agent_token) as agent:
+        assert await agent.voices() == [
+            {"id": "alto", "lang": "en", "name": "Alto"},
+            {"id": "masha", "lang": "ru", "name": "Маша"},
+        ]
+
+
+@pytest.mark.parametrize(
+    ("speech", "error"),
+    [
+        (SPEECH.replace('ru = "fake"', 'ru = "piper"'), "speech.tts.ru: no engine 'piper'"),
+        (SPEECH.replace('lang = "ru"', 'lang = "de"'), "Voice 'masha' speaks de, which no"),
+        (SPEECH.replace('ru = "fake"', ""), "Voice 'masha' speaks ru, which no"),
+        (SPEECH.replace('ru = "fake"', 'ru = "fake"\nde = "fake"'), "speech.tts.de: no Voice"),
+        (SPEECH + 'de = "fake"', "unknown keys: speech.voices[1].de"),
+        (SPEECH.replace('id = "masha"', 'id = "alto"'), "two Voices have the id 'alto'"),
+        (SPEECH.replace("fake:FakeTts", "fake:Nope"), "speech engine 'fake': can't import"),
+        (SPEECH.replace("fake:FakeTts", "fake:decode"), "fake:decode isn't a Tts"),
+        (
+            SPEECH.replace("params = {", 'params = { languages = ["en"],'),
+            "speech engine 'fake' doesn't speak ru",
+        ),
+        (
+            SPEECH + 'engine_voice = "natasha"',
+            "Voice 'masha': speech engine 'fake' has no voice 'natasha'",
+        ),
+        (SPEECH.replace("name = ", "title = ", 1), "speech.voices[0].name must be"),
+    ],
+)
+def test_serve_refuses_a_speech_config_that_doesnt_hold_together(
+    speech: str, error: str, xdg: dict[str, str], capsys: pytest.CaptureFixture[str]
+) -> None:
+    main(["init"])
+    config = Path(xdg["XDG_CONFIG_HOME"]) / "tinyaisense" / "hub.toml"
+    config.write_text(config.read_text() + speech)
+
+    assert main(["serve"]) == 1
+
+    assert error in capsys.readouterr().err
+
+
+def test_serve_refuses_a_default_language_no_voice_speaks(
+    xdg: dict[str, str], capsys: pytest.CaptureFixture[str]
+) -> None:
+    main(["init"])
+    config = Path(xdg["XDG_CONFIG_HOME"]) / "tinyaisense" / "hub.toml"
+    text = config.read_text().replace('lang = "en"', 'lang = "de"')
+    config.write_text(text + SPEECH)
+
+    assert main(["serve"]) == 1
+
+    assert "speech.lang: no Voice speaks de" in capsys.readouterr().err
 
 
 def test_serve_says_when_its_port_is_taken(
