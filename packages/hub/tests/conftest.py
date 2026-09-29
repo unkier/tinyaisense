@@ -37,7 +37,15 @@ class StartHub(Protocol):
         timing: Timing = FAST_TIMING,
         device_port: int = 0,
         mdns: str | None = None,
+        host: str | None = "127.0.0.1",
     ) -> Awaitable[Hub]: ...
+
+
+@pytest.fixture(autouse=True)
+def no_proxy(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Agents connect straight to the hub, whatever proxy this machine has."""
+    for name in ("no_proxy", "NO_PROXY"):
+        monkeypatch.setenv(name, "*")
 
 
 @pytest.fixture
@@ -49,7 +57,8 @@ def runtime_dir() -> Iterator[Path]:
 
 @pytest.fixture
 async def start_hub(tmp_path: Path, runtime_dir: Path) -> AsyncIterator[StartHub]:
-    """Start an in-process hub on ephemeral ports. Every hub shares one state dir.
+    """Start an in-process hub on ephemeral ports, on loopback unless given a host (None: every
+    address). Every hub shares one state dir.
 
     It advertises over mDNS only if given a service type to advertise.
     """
@@ -61,6 +70,7 @@ async def start_hub(tmp_path: Path, runtime_dir: Path) -> AsyncIterator[StartHub
         timing: Timing = FAST_TIMING,
         device_port: int = 0,
         mdns: str | None = None,
+        host: str | None = "127.0.0.1",
     ) -> Hub:
         config = Config(
             agent_token="agent-token", device_port=device_port, http_port=0, timing=timing
@@ -70,7 +80,7 @@ async def start_hub(tmp_path: Path, runtime_dir: Path) -> AsyncIterator[StartHub
             state_dir=tmp_path / "state",
             runtime_dir=runtime_dir,
             auto_approve=auto_approve,
-            host="127.0.0.1",
+            host=host,
             mdns=mdns,
         )
         await hub.start()

@@ -1,6 +1,7 @@
 """The hub process: the device ports, the HTTP port, the owner socket and the state behind them."""
 
 import asyncio
+import socket
 from pathlib import Path
 from types import TracebackType
 from typing import Self, cast
@@ -11,7 +12,7 @@ from .agent_api import agent_app
 from .config import Config
 from .control import Control
 from .core import Core
-from .devices import Registry
+from .devices import Datagrams, Registry
 from .discovery import Advertiser
 from .owner import OwnerServer
 from .session import Sessions
@@ -79,7 +80,10 @@ class Hub:
     def agent_url(self) -> str:
         """The agent API's WebSocket URL, on this machine."""
         assert self._http is not None, "the hub isn't running"
-        return f"ws://{self._host or 'localhost'}:{self._http.address[1]}/agent"
+        host = self._host or "localhost"
+        if ":" in host:
+            host = f"[{host}]"  # an IPv6 address
+        return f"ws://{host}:{self._http.address[1]}/agent"
 
     @property
     def owner_socket(self) -> Path:
@@ -97,9 +101,21 @@ class Hub:
     async def _start(self) -> None:
         loop = asyncio.get_running_loop()
         port = self.config.device_port
-        self._udp, _ = await loop.create_datagram_endpoint(
-            asyncio.DatagramProtocol, local_addr=(self._host or "0.0.0.0", port)
-        )
+        dual_stack = self._host is None and socket.has_dualstack_ipv6()
+        if dual_stack:
+            # One socket for devices on either family, as for TCP.
+            sock = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
+            try:
+                sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+                sock.bind(("::", port))
+            except BaseException:
+                sock.close()
+                raise
+            self._udp, datagrams = await loop.create_datagram_endpoint(Datagrams, sock=sock)
+        else:
+            self._udp, datagrams = await loop.create_datagram_endpoint(
+                Datagrams, local_addr=(self._host or "0.0.0.0", port)
+            )
         self._control = Control(self.config.timing)
         sessions = Sessions(self._control)
         self._registry = Registry(
@@ -109,8 +125,14 @@ class Hub:
             auto_approve=self._auto_approve,
             observer=self._control,
         )
+        datagrams.received = self._registry.datagram
         self._core = Core(self._registry, sessions, self._control, self.config.agent_token)
-        self._tcp = await loop.create_server(self._registry.connection, self._host, port)
+        if dual_stack:
+            # One socket, so that both families get the same port even when it's ephemeral.
+            sock = socket.create_server(("", port), family=socket.AF_INET6, dualstack_ipv6=True)
+            self._tcp = await loop.create_server(self._registry.connection, sock=sock)
+        else:
+            self._tcp = await loop.create_server(self._registry.connection, self._host, port)
         self._http = HttpServer(
             agent_app(self._core, self.config.timing),
             host=self._host,

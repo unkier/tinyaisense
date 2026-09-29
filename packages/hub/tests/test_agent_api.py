@@ -91,6 +91,12 @@ class NullSink:
     def ended(self, reason: EndReason) -> None:
         pass
 
+    def audio(self, handle: int, index: int, pcm: bytes) -> None:
+        pass
+
+    def audio_ended(self, handle: int) -> int:
+        return 0
+
 
 async def test_no_session_starts_once_the_hub_is_shutting_down(tmp_path: Path) -> None:
     # The Session ends before the links close, so a hello can land in between.

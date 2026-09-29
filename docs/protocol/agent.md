@@ -174,7 +174,7 @@ The cancelled request still gets its reply. Cancelling a request that has finish
 - **Cause before effect:** `button.down`, then the cut `say` result or `stream.ended` with reason `reflex`, then `utterance.start`.
 - Across devices, in the order the hub received them.
 - A stream's binary frames come after its `stream.start` reply or `stream.started`, and before its `stream.ended`. An Utterance's frames come after its `utterance.start` and before its `utterance.end`.
-- JSON messages never wait behind audio frames: the hub sends every pending JSON message before the next audio frame.
+- JSON messages never wait behind audio frames: the hub sends every pending JSON message before the next audio frame. The one exception is a stream's `stream.ended`, which waits for that stream's own last frames, so other messages may overtake it.
 
 ### The Interrupt contract
 
@@ -186,10 +186,10 @@ The cancelled request still gets its reply. Cancelling a request that has finish
 
 A **stream** carries raw audio between the agent and a capability. `stream.start{address, rate}` opens one on a mic (device → agent) or a speaker (agent → device):
 - `rate` is 16000 (the default), 24000 or 48000. The hub resamples both ways, so e.g. OpenAI Realtime's 24 kHz passes straight through.
-- `prefill_ms` (speaker only; default 40, at most 200) is how much audio the device buffers before it starts playing.
+- `prefill_ms` (speaker only, `invalid_args` on a mic; default 40, at most 200) is how much audio the device buffers before it starts playing.
 - It replies `{handle}` once the device has started. A u16 **handle** names the stream within the Session; the hub also announces every stream, including those it opens itself, with `stream.started`.
 
-**Ending.** `stream.stop{handle}` ends a stream at once. `stream.drain{handle}` ends a speaker stream after everything sent so far has played. Both reply with `{reason, stats}`, as does the `stream.ended` notification every stream gets:
+**Ending.** `stream.stop{handle}` ends a stream at once: a mic stream once its last frames are in, which takes at most 30 ms more. `stream.drain{handle}` ends a speaker stream after everything sent so far has played; a mic stream can't be drained (`unsupported`). Both reply with `{reason, stats}`, as does the `stream.ended` notification every stream gets:
 
 | `reason` | Why |
 |---|---|
@@ -201,7 +201,7 @@ A **stream** carries raw audio between the agent and a capability. `stream.start
 | `overflow` | the agent sent more than 5 min ahead of playback |
 
 - Speaker `stats`: `{played_ms, lost, underruns, underrun_ms}`. `played_ms` is the stream position reached: frames lost on the network count toward it, pauses don't. When a device drops, it can't report them: the hub estimates `played_ms` as the audio it sent, capped by the time since it started sending, and reports the rest as 0.
-- Mic `stats`: `{frames, lost, dropped, skipped}`: frames delivered, frames the hub zero-filled for network loss, frames the device dropped from its queue, and frames the hub skipped because the agent read too slowly.
+- Mic `stats`: `{frames, lost, dropped, skipped}`: frames delivered, zero-filled ones included; frames the hub zero-filled for network loss; frames the device dropped from its queue, which the hub zero-fills too; and frames the hub skipped because the agent read too slowly.
 
 **Speaker audio from agents.** The agent sends as fast as it gets audio. The hub buffers up to 5 min per stream and paces it to the device; there are no progress Events. Frames on a handle that has ended are dropped silently.
 
@@ -218,7 +218,7 @@ One binary WebSocket frame is one audio frame, all integers little-endian:
 
 - PCM is signed 16-bit little-endian, mono, at the stream's `rate`.
 - A frame shorter than its header (`truncated`), or whose PCM isn't a whole number of samples (`partial_sample`), is dropped. So is a frame on a handle that doesn't name an open speaker stream of the Session. The link stays up either way.
-- **Mic timeline.** `index` counts 10 ms frames from 0 at the start of the stream. The hub zero-fills audio lost on the network, so the timeline has no holes. If the agent reads too slowly and more than 2 s of audio waits for its socket, the hub drops the oldest frames: those, and only those, show up as gaps in `index`, and are counted in `skipped`.
+- **Mic timeline.** `index` counts 10 ms frames from 0 at the start of the stream. The hub zero-fills audio lost on the network, so the timeline has no holes. If the agent reads too slowly and more than 2 s of a stream's audio waits for its socket, the hub drops the oldest frames: those, and only those, show up as gaps in `index`, and are counted in `skipped`.
 
 ### Overlap and exclusive groups
 

@@ -2,12 +2,14 @@
 
 import asyncio
 import hashlib
+import ipaddress
 import logging
 import re
 import secrets
 import socket
 import time
-from collections.abc import Coroutine
+from collections import Counter, deque
+from collections.abc import Callable, Coroutine
 from typing import Any, Literal, Protocol, cast
 
 from tinyaisense_wire import (
@@ -33,6 +35,7 @@ from tinyaisense_wire import (
     StreamFrame,
     Welcome,
     WireError,
+    decode_datagram,
     encode_control,
     encode_datagram,
     validate,
@@ -73,15 +76,27 @@ class DeviceObserver(Protocol):
     def device_offline(self, conn: DeviceConnection) -> None: ...
 
 
+class FrameReceiver(Protocol):
+    """Takes the frames of one stream the device sends."""
+
+    def frame(self, frame: StreamFrame, now: int) -> None:
+        """`now` is when the frame came in, in µs on the hub's monotonic clock."""
+        ...
+
+
 class StreamIds:
     """A Connection's hub-range stream ids, 1-127: docs/protocol/audio.md#stream-ids."""
 
     FIRST = 1
     LAST = 127
+    REMEMBERED = 16
+    """How many closed ids a Connection remembers, to drop their late frames silently."""
 
     def __init__(self) -> None:
         self._last = self.LAST
         self._open: set[int] = set()
+        self.closed: deque[int] = deque(maxlen=self.REMEMBERED)
+        """The ids closed last, oldest first."""
 
     def open(self) -> int:
         """The next id after the last one used, round-robin, skipping open ones. Raises
@@ -91,11 +106,15 @@ class StreamIds:
             if stream not in self._open:
                 self._last = stream
                 self._open.add(stream)
+                if stream in self.closed:
+                    self.closed.remove(stream)
                 return stream
         raise HubError("busy", "every stream id is open")
 
     def close(self, stream: int) -> None:
-        self._open.discard(stream)
+        if stream in self._open:
+            self._open.discard(stream)
+            self.closed.append(stream)
 
 
 class DeviceConnection(asyncio.Protocol):
@@ -111,6 +130,8 @@ class DeviceConnection(asyncio.Protocol):
         self.clock = ClockSync(window=timing.clock_window_ms * 1000)
         """The device clock, from its pongs."""
         self.stream_ids = StreamIds()
+        self.receivers: dict[int, FrameReceiver] = {}
+        """Stream id → what takes the frames the device sends on it."""
         self._registry = registry
         self._udp = udp
         self._timing = timing
@@ -125,8 +146,11 @@ class DeviceConnection(asyncio.Protocol):
         self._in_flight: dict[int, asyncio.Future[JsonObject]] = {}
         self._next_command_id = 1
         self._peer = "?"
-        self._peer_ip: str | None = None
-        """Where its datagrams go: None if the hub's UDP socket can't reach it."""
+        self._peer_ip: _Ip | None = None
+        """The TCP peer IP: datagrams come from there, and go there."""
+        self._udp_to: tuple[str, int] | None = None
+        """Where its datagrams go, as `(host, scope_id)` for the hub's UDP socket, without the
+        port: None if that socket can't reach it."""
 
     def __str__(self) -> str:
         return self._peer if self.hello is None else self.manifest.device_id
@@ -148,14 +172,32 @@ class DeviceConnection(asyncio.Protocol):
 
     def send_frame(self, stream: int, seq: int, payload: bytes) -> None:
         """Send one stream frame over UDP, to the TCP peer IP at the device's UDP port."""
-        if self.state != "online" or self._peer_ip is None:
+        if self.state != "online" or self._udp_to is None:
             return
         assert self.hello is not None
+        host, scope_id = self._udp_to
+        to = (
+            (host, self.hello.udp_port)
+            if not scope_id
+            else (host, self.hello.udp_port, 0, scope_id)
+        )
         datagram = encode_datagram(StreamFrame(self.conn_id, stream, seq, 0, payload))
         try:
-            self._udp.sendto(datagram, (self._peer_ip, self.hello.udp_port))
+            self._udp.sendto(datagram, to)
         except OSError as e:
             _log.debug("%s: UDP send failed: %s", self.name, e)
+
+    def from_peer(self, host: str) -> bool:
+        """Whether a datagram from `host` came from the TCP peer IP."""
+        return self._peer_ip is not None and _ip(host) == self._peer_ip
+
+    def stream_frame(self, frame: StreamFrame, now: int) -> None:
+        """A stream frame from the device, checked to be of this Connection."""
+        receiver = self.receivers.get(frame.stream)
+        if receiver is not None:
+            receiver.frame(frame, now)
+        elif frame.stream not in self.stream_ids.closed:  # else a late frame: silent
+            self._registry.udp_drops["unknown_stream"] += 1
 
     def command(self, cap: str | None, name: str, args: JsonObject) -> asyncio.Future[JsonObject]:
         """Send a command to capability `cap`, or to the device itself if None, at once.
@@ -200,14 +242,17 @@ class DeviceConnection(asyncio.Protocol):
     def connection_made(self, transport: asyncio.BaseTransport) -> None:
         self._transport = cast(asyncio.Transport, transport)
         # None if the socket was gone by the time asyncio asked for it.
-        peer = cast(tuple[str, int] | None, transport.get_extra_info("peername"))
+        peer = cast(tuple[Any, ...] | None, transport.get_extra_info("peername"))
         self._peer = str(peer)
         if peer is not None:
+            self._peer_ip = ip = _ip(peer[0])
             udp = cast(socket.socket, self._udp.get_extra_info("socket"))
-            if udp.family == socket.AF_INET and ":" in peer[0]:
+            if udp.family == socket.AF_INET and ip.version == 6:
                 _log.warning("%s: an IPv6 peer, but the hub's UDP is IPv4: no audio", self)
+            elif udp.family == socket.AF_INET6 and ip.version == 4:
+                self._udp_to = (f"::ffff:{ip}", 0)  # the dual-stack socket's IPv4-mapped form
             else:
-                self._peer_ip = peer[0]
+                self._udp_to = (str(ip), peer[3] if len(peer) == 4 else 0)
         sock = cast(socket.socket, transport.get_extra_info("socket"))
         sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         self._hello_timer = asyncio.get_running_loop().call_later(
@@ -350,6 +395,11 @@ class Registry:
         self._records = store.load()
         self._live: dict[str, DeviceConnection] = {}
         """device_id → its pending or online Connection."""
+        self._welcomed: dict[int, DeviceConnection] = {}
+        """conn_id → its online Connection."""
+        self.udp_drops: Counter[str] = Counter()
+        """Datagrams dropped, by why: `bad_conn_id`, `bad_source`, `unknown_stream`, or a
+        datagram check's error code."""
         self._connections: set[DeviceConnection] = set()
         """Every open Connection, from accept on."""
         self._udp = udp
@@ -550,6 +600,24 @@ class Registry:
     def event(self, conn: DeviceConnection, event: Event) -> None:
         self._observer.device_event(conn, event)
 
+    def datagram(self, data: bytes, source: tuple[Any, ...]) -> None:
+        """Take a datagram in, or drop it: UDP junk never closes a Connection."""
+        now = now_us()
+        try:
+            datagram = decode_datagram(data)
+        except WireError as e:
+            self.udp_drops[e.code] += 1
+            return
+        if datagram is None:
+            return  # an unknown kind
+        conn = self._welcomed.get(datagram.conn_id)
+        if conn is None:
+            self.udp_drops["bad_conn_id"] += 1
+        elif not conn.from_peer(source[0]):
+            self.udp_drops["bad_source"] += 1
+        elif isinstance(datagram, StreamFrame):
+            conn.stream_frame(datagram, now)
+
     def detach(self, conn: DeviceConnection) -> None:
         self._connections.discard(conn)
         if conn.hello is None:
@@ -559,6 +627,7 @@ class Registry:
             del self._live[device_id]
         if not conn.conn_id:
             return  # never welcomed
+        self._welcomed.pop(conn.conn_id, None)
         if (record := self._records.get(device_id)) is not None:
             record.last_seen = conn.last_seen
             self._spawn(self._save())
@@ -595,10 +664,10 @@ class Registry:
     def _welcome(
         self, conn: DeviceConnection, record: DeviceRecord, token: str | None = None
     ) -> None:
-        used = {c.conn_id for c in self._live.values()}
-        while (conn_id := secrets.randbits(32)) == 0 or conn_id in used:
+        while (conn_id := secrets.randbits(32)) == 0 or conn_id in self._welcomed:
             pass
         conn.conn_id = conn_id
+        self._welcomed[conn_id] = conn
         conn.name = record.name
         conn.state = "online"
         conn.send(Welcome(record.name, conn_id, self._udp_port, token))
@@ -665,6 +734,20 @@ class Registry:
             _log.error("background task failed", exc_info=e)
 
 
+class Datagrams(asyncio.DatagramProtocol):
+    """The hub's UDP socket. Its datagrams go to `received`, once set."""
+
+    def __init__(self) -> None:
+        self.received: Callable[[bytes, tuple[Any, ...]], None] | None = None
+
+    def datagram_received(self, data: bytes, addr: tuple[Any, ...]) -> None:
+        if self.received is not None:
+            self.received(data, addr)
+
+    def error_received(self, exc: Exception) -> None:
+        _log.debug("UDP: %s", exc)  # e.g. an ICMP unreachable for a device that went away
+
+
 def volume_commands(manifest: Manifest, level: int) -> list[CommandSpec]:
     """The commands that set the volume: `set_volume` on each speaker, as `(cap, name, args)`."""
     return [
@@ -690,6 +773,17 @@ def _resolve(future: asyncio.Future[JsonObject], result: JsonObject) -> None:
 def _fail(future: asyncio.Future[JsonObject], error: HubError) -> None:
     if not future.done():
         future.set_exception(error)
+
+
+type _Ip = ipaddress.IPv4Address | ipaddress.IPv6Address
+
+
+def _ip(host: str) -> _Ip:
+    """An IPv4-mapped IPv6 address as the IPv4 one, so both socket families compare."""
+    ip = ipaddress.ip_address(host.partition("%")[0])
+    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
+        return ip.ipv4_mapped
+    return ip
 
 
 def _sha256(token: str) -> str:

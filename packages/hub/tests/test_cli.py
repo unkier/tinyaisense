@@ -49,6 +49,8 @@ def test_init_writes_a_config_with_a_random_agent_token(
         "agent_ping_interval_ms": 2000,
         "agent_dead_after_ms": 6000,
         "speaker_buffer_ms": 300000,
+        "mic_tail_ms": 30,
+        "agent_audio_ms": 2000,
     }
     assert len(config["agent_token"]) >= 32
     assert stat.S_IMODE(path.stat().st_mode) == 0o600

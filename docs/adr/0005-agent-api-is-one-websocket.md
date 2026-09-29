@@ -15,6 +15,6 @@ Agents talk to the hub over one WebSocket (`/agent`). JSON-RPC 2.0 goes in text 
 
 ## Consequences
 
-- **Tuning is part of the spec, not an afterthought:** `compression=None`, a low `write_limit` and TCP_NODELAY.
+- **Tuning is part of the spec, not an afterthought:** `compression=None`, a low `write_limit`, a small kernel send buffer and TCP_NODELAY, so that the hub's own lanes, where JSON goes before audio, hold any backlog.
 - **The hub never applies TCP backpressure to agents:** it always reads agent sockets eagerly and buffers speaker audio itself (capped at 5 min per stream), so a `stop` never queues behind unread audio.
 - **Auth goes in the first message** (`hello`), because browsers can't set WebSocket headers.

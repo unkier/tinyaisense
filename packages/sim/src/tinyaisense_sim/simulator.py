@@ -42,6 +42,7 @@ from tinyaisense_wire import (
     Welcome,
     WireError,
     decode_datagram,
+    encode_datagram,
     validate,
 )
 
@@ -49,6 +50,7 @@ from .backoff import Backoff
 from .discovery import Mdns, Resolve
 from .faults import ConnectionSocket, Faults
 from .led import Light, SimLed
+from .mic import SimMic
 from .profiles import PROFILES, Board
 from .speaker import SimSpeaker
 from .status import Status, StatusLayers
@@ -130,6 +132,7 @@ class Simulator:
             # Its own streams, so that one device's randomness doesn't shift another's.
             random.Random(f"{self._seed}:{name}"),
             random.Random(f"{self._seed}:{name}:udp"),
+            random.Random(f"{self._seed}:{name}:udp-up"),
             self._dead_after,
             self._output_latency_ms,
             self._devices.remove,
@@ -159,6 +162,7 @@ class SimDevice:
         tokens: _Tokens,
         rng: random.Random,
         udp_rng: random.Random,
+        udp_up_rng: random.Random,
         dead_after: float,
         output_latency_ms: int,
         on_close: Callable[[SimDevice], None],
@@ -174,7 +178,7 @@ class SimDevice:
         """From `welcome`, while the Connection lasts."""
         self.reconnects = 0
         """Connections the hub answered, after the first."""
-        self.faults = Faults(udp_rng)
+        self.faults = Faults(udp_rng, udp_up_rng, self._mic_tx_resumed)
         self.stats: Counter[str] = Counter()
         """Datagrams dropped, by why: `bad_source`, `bad_conn_id`, `unknown_stream`, or a
         datagram or frame check's error code. Closed streams' late frames aren't counted."""
@@ -191,6 +195,9 @@ class SimDevice:
         self._conn: ConnectionSocket | None = None
         self._hub_ip: ipaddress.IPv4Address | ipaddress.IPv6Address | None = None
         """The TCP peer IP of the Connection: datagrams come from there."""
+        self._hub_udp: tuple[str, int] | None = None
+        """Where datagrams go: the TCP peer IP, at the hub's UDP port from `welcome`."""
+        self._hub_host = ""
         self._event_seq = 0
         self._closed_streams: deque[int] = deque(maxlen=_CLOSED_STREAMS)
         self._task: asyncio.Task[None] | None = None
@@ -214,6 +221,13 @@ class SimDevice:
             cap.id: self._speaker(cap.id, board.default_volume, output_latency_ms)
             for cap in manifest.capabilities
             if cap.kind == "speaker"
+        }
+        self._mics = {
+            cap.id: SimMic(
+                self._clock, self._send_frame, lambda: self.faults.mic_tx_stall, self._mic_changed
+            )
+            for cap in manifest.capabilities
+            if cap.kind == "mic"
         }
 
     @property
@@ -239,6 +253,12 @@ class SimDevice:
         """The speaker capability, on a Board with one."""
         [speaker] = self._speakers.values()
         return speaker
+
+    @property
+    def mic(self) -> SimMic:
+        """The mic capability, on a Board with one."""
+        [mic] = self._mics.values()
+        return mic
 
     def lights(self, cap: str = "led") -> tuple[Light, ...]:
         """What each LED of the led capability `cap` shows now, the Status included."""
@@ -315,7 +335,8 @@ class SimDevice:
         try:
             self.faults.connection = connection
             self._conn = connection
-            self._hub_ip = _ip(cast(tuple[str, int], connection.raw.getpeername())[0])
+            self._hub_host = cast(tuple[str, int], connection.raw.getpeername())[0]
+            self._hub_ip = _ip(self._hub_host)
             self._event_seq = 0
             self._closed_streams.clear()
             connection.raw.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
@@ -345,6 +366,7 @@ class SimDevice:
         finally:
             self._conn = None
             self._hub_ip = None
+            self._hub_udp = None
             self._connections_lost += 1
             if connection.vanished:
                 self._vanished.append(connection)
@@ -371,6 +393,7 @@ class SimDevice:
                     self._tokens.set(self.device_id, message.token)
                 self.name = message.name
                 self.conn_id = message.conn_id
+                self._hub_udp = (self._hub_host, message.udp_port)
                 self._backoff.welcomed()
                 self._layers.hub = "no_agent"
                 self._set_state("online")
@@ -396,6 +419,8 @@ class SimDevice:
             led.release()
         for speaker in self._speakers.values():
             speaker.cut()
+        for mic in self._mics.values():
+            mic.cut()
         self._layers.claimed = False
 
     def _emit(self, cap: str, name: str, data: JsonObject) -> None:
@@ -436,6 +461,49 @@ class SimDevice:
         except WireError as e:
             self.stats[e.code] += 1
 
+    def _send_frame(self, stream: int, seq: int, ts: int, payload: bytes) -> None:
+        """Send a stream frame to the hub, through the network's faults."""
+        if self._udp is None or self._hub_udp is None or self.conn_id is None:
+            return
+        udp, to = self._udp, self._hub_udp
+        datagram = encode_datagram(StreamFrame(self.conn_id, stream, seq, ts, payload))
+        self.faults.udp_up.apply(datagram, lambda data: udp.sendto(data, to))
+
+    # The mic.
+
+    def _mic_changed(self) -> None:
+        self._layers.listening = any(m.stream is not None for m in self._mics.values())
+        self._changed_now()
+
+    def _mic_tx_resumed(self) -> None:
+        for mic in self._mics.values():
+            mic.resume()
+
+    def _mic_start(self, cap: Capability, args: JsonObject) -> JsonObject:
+        """Raises `_Refused`."""
+        mic = self._mics[cap.id]
+        if mic.stream is not None:
+            raise _Refused("busy", "the mic is streaming")
+        self._check_exclusive(cap.id)
+        format = AudioFormat.from_json(args["format"])
+        if not format.offered(cap.params):
+            raise _Refused("invalid_args", f"the mic doesn't capture {args['format']}")
+        mic.start(args["stream"], format)
+        return {"format": format.to_json()}
+
+    def _check_exclusive(self, cap: str) -> None:
+        """Raises `_Refused`: `busy` if a peer of `cap` in an exclusive group is active."""
+        for group in self.manifest.exclusive:
+            if cap in group:
+                for peer in group:
+                    if peer != cap and self._active(peer):
+                        raise _Refused("busy", f"its exclusive peer {peer!r} is active")
+
+    def _active(self, cap: str) -> bool:
+        if (speaker := self._speakers.get(cap)) is not None and speaker.stream is not None:
+            return True
+        return (mic := self._mics.get(cap)) is not None and mic.stream is not None
+
     # The speaker.
 
     def _speaker(self, cap: str, level: int, output_latency_ms: int) -> SimSpeaker:
@@ -454,6 +522,7 @@ class SimDevice:
         speaker = self._speakers[cap.id]
         if speaker.stream is not None:
             raise _Refused("busy", "the speaker is playing")
+        self._check_exclusive(cap.id)
         stream: int = args["stream"]
         if not 1 <= stream <= 127:
             raise _Refused("invalid_args", f"stream {stream} isn't a hub-range id")
@@ -515,6 +584,12 @@ class SimDevice:
             case "speaker", "stop":
                 assert command.cap is not None
                 result = self._speaker_stop(command.cap)
+            case "mic", "start":
+                assert cap is not None
+                result = self._mic_start(cap, args)
+            case "mic", "stop":
+                assert command.cap is not None
+                result = self._mics[command.cap].stop()
             case "speaker", "drain":
                 assert command.cap is not None
                 self._speakers[command.cap].drain(args["last_seq"])

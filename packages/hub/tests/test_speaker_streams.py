@@ -13,7 +13,7 @@ import pytest
 import tinyaisense
 import websockets
 from tinyaisense_hub import Hub, OwnerClient, Timing
-from tinyaisense_hub.speaker import FORMAT
+from tinyaisense_hub.streams import FORMAT
 from tinyaisense_sim import GilbertElliott, SimDevice, Simulator
 from tinyaisense_sim.pytest_plugin import SimulatorFactory
 from tinyaisense_wire import (
@@ -305,7 +305,8 @@ async def test_malformed_binary_frames_are_dropped_and_the_link_stays_up(hub: Hu
 @pytest.mark.parametrize(
     ("params", "code"),
     [
-        ({"address": "kitchen/mic"}, "unsupported"),
+        ({"address": "kitchen/mic", "prefill_ms": 40}, "invalid_args"),
+        ({"address": "kitchen/mic", "rate": 24000}, "unsupported"),
         ({"address": "kitchen/led"}, "unsupported"),
         ({"address": "kitchen/speaker", "rate": 24000}, "unsupported"),
         ({"address": "kitchen/speaker", "rate": 8000}, "invalid_args"),

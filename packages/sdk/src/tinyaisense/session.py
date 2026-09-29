@@ -11,7 +11,14 @@ from dataclasses import dataclass
 from types import TracebackType
 from typing import Any, cast
 
-from tinyaisense_wire import AgentAudio, JsonObject, encode_agent_audio
+from tinyaisense_wire import (
+    AgentAudio,
+    HubAudio,
+    JsonObject,
+    WireError,
+    decode_hub_audio,
+    encode_agent_audio,
+)
 from websockets.asyncio.client import ClientConnection
 from websockets.asyncio.client import connect as ws_connect
 from websockets.exceptions import ConnectionClosed
@@ -70,6 +77,9 @@ class Session:
         self._ids = itertools.count(1)
         self._pending: dict[int, asyncio.Future[JsonObject]] = {}
         self._notifications: asyncio.Queue[Notification | None] = asyncio.Queue()
+        self._audio: dict[int, asyncio.Queue[HubAudio | None]] = {}
+        """Each stream's frames, by handle, from `stream.started` until read. None ends a
+        stream's."""
         self._reader = asyncio.create_task(self._read())
 
     async def __aenter__(self) -> Session:
@@ -146,6 +156,22 @@ class Session:
         """End a speaker stream once what was sent has played. Returns `{reason, stats}`."""
         return await self.call("stream.drain", handle=handle)
 
+    async def audio(self, handle: int) -> AsyncIterator[HubAudio]:
+        """A mic stream's frames, in order, until the stream ends: 10 ms of PCM each (s16le
+        mono, at the stream's rate), with its `index` on the stream's timeline. The hub
+        zero-fills audio lost on the network, so a gap in `index` means that the hub skipped
+        frames because they weren't read in time. Read each stream's frames once: they queue
+        up until they are."""
+        queue = self._audio.get(handle)
+        if queue is None:
+            return  # it has ended, and its frames were read
+        try:
+            while (frame := await queue.get()) is not None:
+                yield frame
+        finally:
+            if self._audio.get(handle) is queue:
+                del self._audio[handle]
+
     async def notifications(self) -> AsyncIterator[Notification]:
         """The Session's notifications, in order, until it ends. `session.ended`, if the hub
         sends it, comes last. Only one consumer gets each notification."""
@@ -163,6 +189,8 @@ class Session:
             async for message in self._ws:
                 if isinstance(message, str):
                     self._receive(cast(JsonObject, json.loads(message)))
+                else:
+                    self._receive_audio(message)
         except ConnectionClosed:
             pass
         finally:
@@ -171,12 +199,31 @@ class Session:
                 if not reply.done():
                     reply.set_exception(SessionEnded(self.ended))
             self._notifications.put_nowait(None)
+            for queue in self._audio.values():
+                queue.put_nowait(None)
+
+    def _receive_audio(self, data: bytes) -> None:
+        try:
+            frame = decode_hub_audio(data)
+        except WireError:
+            return
+        # The hub sends a stream's frames after its `stream.started`, and before its end.
+        if (queue := self._audio.get(frame.handle)) is not None:
+            queue.put_nowait(frame)
 
     def _receive(self, message: JsonObject) -> None:
         if "method" in message:
             notification = Notification(message["method"], message.get("params", {}))
             if notification.method == "session.ended":
                 self.ended = notification.params["reason"]
+            elif notification.method == "stream.started":
+                self._audio[notification.params["handle"]] = asyncio.Queue()
+            elif notification.method == "stream.ended":
+                handle = notification.params["handle"]
+                if (queue := self._audio.pop(handle, None)) is not None:
+                    if not queue.empty():
+                        self._audio[handle] = queue  # for the reader still to come
+                    queue.put_nowait(None)
             self._notifications.put_nowait(notification)
             return
         reply = self._pending.get(message.get("id", -1))

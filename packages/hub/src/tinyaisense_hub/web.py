@@ -25,6 +25,10 @@ WRITE_HIGH = 4096
 WRITE_LOW = 1024
 """Transport write-buffer limits: the writer waits once 4 KB is queued in the transport, so
 that the hub's own lanes, where JSON goes before audio, hold the backlog instead."""
+SEND_BUFFER = 16 * 1024
+"""The kernel's send buffer for an agent socket, for the same reason: left to itself, Linux
+grows it to megabytes, minutes of audio for JSON to wait behind. Linux doubles it, to 1 s of
+one 16 kHz stream, which still passes 600 KB/s at a 50 ms RTT."""
 
 _log = logging.getLogger("tinyaisense_hub.web")
 
@@ -32,7 +36,7 @@ _log = logging.getLogger("tinyaisense_hub.web")
 class AgentWebSocketProtocol(WebSocketsSansIOProtocol):
     """uvicorn's sans-IO WebSocket protocol, tuned for agents (ADR 0005).
 
-    - Small transport write limits and TCP_NODELAY.
+    - Small transport write limits, a small kernel send buffer, and TCP_NODELAY.
     - Reads eagerly: uvicorn pauses reading until the app takes each message, which would
       push back on an agent streaming speaker audio.
     - Keepalive by the hub's own `Keepalive`: a ping every `ws_ping_interval` s, and the link
@@ -55,6 +59,7 @@ class AgentWebSocketProtocol(WebSocketsSansIOProtocol):
         sock = cast(socket.socket | None, transport.get_extra_info("socket"))
         if sock is not None:
             sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, SEND_BUFFER)
 
     def data_received(self, data: bytes) -> None:
         if self._keepalive is not None:
@@ -120,8 +125,13 @@ class HttpServer:
             self._socket = socket.create_server(
                 ("", self._port), family=socket.AF_INET6, dualstack_ipv6=True
             )
-        else:
-            self._socket = socket.create_server((self._host or "", self._port))
+        elif self._host is None:
+            self._socket = socket.create_server(("", self._port))
+        else:  # of the host's family: an IPv6 one needs an AF_INET6 socket
+            family = socket.getaddrinfo(
+                self._host, self._port, type=socket.SOCK_STREAM, flags=socket.AI_PASSIVE
+            )[0][0]
+            self._socket = socket.create_server((self._host, self._port), family=family)
         config = uvicorn.Config(
             self._app,
             ws=AgentWebSocketProtocol,

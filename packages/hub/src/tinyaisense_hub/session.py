@@ -10,7 +10,7 @@ from typing import Literal, Protocol
 from tinyaisense_wire import JsonObject
 
 from .errors import HubError
-from .speaker import SpeakerStream
+from .streams import Stream
 
 type Holder = Literal["agent_api", "mcp"]
 """Which front-end claimed the Session."""
@@ -25,9 +25,19 @@ _log = logging.getLogger("tinyaisense_hub.session")
 
 
 class SessionSink(Protocol):
-    """Where a Session's notifications go: its agent-API link. Neither method may block."""
+    """Where a Session's notifications and audio go: its agent-API link. No method may
+    block."""
 
     def notify(self, method: str, params: JsonObject) -> None: ...
+
+    def audio(self, handle: int, index: int, pcm: bytes) -> None:
+        """Frame `index` of stream `handle`'s timeline."""
+        ...
+
+    def audio_ended(self, handle: int) -> int:
+        """No more audio follows on `handle`: what's queued of it goes out before whatever is
+        sent next. Returns how many of its frames were skipped, unread."""
+        ...
 
     def ended(self, reason: EndReason) -> None:
         """The Session is over. Called once, after its last notification."""
@@ -51,13 +61,19 @@ class Session:
     id: str = field(default_factory=lambda: secrets.token_urlsafe(16))
     since: int = field(default_factory=lambda: _now_ms())
     """Epoch ms."""
-    streams: dict[int, SpeakerStream] = field(default_factory=dict[int, SpeakerStream])
+    streams: dict[int, Stream] = field(default_factory=dict[int, Stream])
     """The handle table: the Session's open streams, by handle."""
     _last_handle: int = field(default=0, init=False)
 
     def notify(self, method: str, params: JsonObject) -> None:
         """Send a notification, stamped with `t`: now."""
         self.sink.notify(method, params | {"t": _now_ms()})
+
+    def audio(self, handle: int, index: int, pcm: bytes) -> None:
+        self.sink.audio(handle, index, pcm)
+
+    def audio_ended(self, handle: int) -> int:
+        return self.sink.audio_ended(handle)
 
     def new_handle(self) -> int:
         """The next u16 handle after the last one used, round-robin from 1, skipping open

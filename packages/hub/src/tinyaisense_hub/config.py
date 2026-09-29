@@ -36,6 +36,12 @@ class Timing:
     speaker_buffer_ms: int = 300_000
     """How far ahead of playback an agent may send speaker audio. Past it, the stream ends
     with `overflow`."""
+    mic_tail_ms: int = 30
+    """After a mic's `stop` reply, how long its missing tail frames get to arrive before
+    they're zero-filled."""
+    agent_audio_ms: int = 2000
+    """How much audio may wait for an agent's socket. Past it, the oldest frames are
+    skipped."""
 
 
 @dataclass(frozen=True, slots=True)

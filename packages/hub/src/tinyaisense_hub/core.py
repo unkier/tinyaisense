@@ -12,7 +12,7 @@ from .control import Control
 from .devices import Registry
 from .errors import HubError
 from .session import Holder, Session, Sessions, SessionSink, UtteranceOptIn
-from .speaker import FORMAT
+from .streams import FORMAT
 
 
 class Core:
@@ -61,13 +61,11 @@ class Core:
         await self._control.led_release(session, self._registry.named(device))
 
     async def stream_start(
-        self, session: Session, address: str, rate: int | None, prefill_ms: int
+        self, session: Session, address: str, rate: int | None, prefill_ms: int | None
     ) -> int:
-        """Open a speaker stream to the capability at `address`. Returns its handle. Raises
-        `HubError`."""
+        """Open a stream to the speaker, or from the mic, at `address`. Returns its handle.
+        Raises `HubError`."""
         device, capability = self._registry.resolve(address)
-        if capability.kind == "mic":
-            raise HubError("unsupported", "mic streams aren't there yet")
         if rate is not None and rate != FORMAT.rate:
             raise HubError("unsupported", f"the hub streams at {FORMAT.rate} Hz only, for now")
         return await self._control.stream_start(session, device, capability, prefill_ms)
@@ -82,5 +80,5 @@ class Core:
 
     async def stream_drain(self, session: Session, handle: int) -> JsonObject:
         """End a speaker stream once what the agent sent has played. Returns its `reason` and
-        `stats`. Raises `HubError`."""
+        `stats`. Raises `HubError`, `unsupported` for a mic stream."""
         return (await self._control.stream_drain(session, handle)).to_json()

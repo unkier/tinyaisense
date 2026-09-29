@@ -1,70 +1,27 @@
 """Agent speaker streams, paced to their devices: docs/protocol/audio.md#speaker-stream."""
 
-import asyncio
 import logging
 from collections.abc import Callable
-from dataclasses import dataclass
-from typing import TYPE_CHECKING, Literal
 
-from tinyaisense_wire import KINDS, AudioFormat, JsonObject, Schema, SchemaError, validate
+from tinyaisense_wire import KINDS, JsonObject, Schema, SchemaError, validate
 
 from .alarm import Alarm, now_us
 from .config import Timing
-from .devices import DeviceConnection
 from .keepalive import Tick
 from .pacer import Close, Drain, Feed, Open, Overflow, Pacer, Remove, Send
+from .streams import FORMAT, Stream
 
-if TYPE_CHECKING:
-    from .session import Session  # it holds its streams
-
-type EndReason = Literal["drained", "stopped", "preempted", "reflex", "disconnected", "overflow"]
-
-FORMAT = AudioFormat("pcm_s16le", 16000, 1, 10)
-"""What the hub streams to every speaker: 10 ms frames of 16 kHz mono PCM."""
 STATS = ("played_ms", "lost", "underruns", "underrun_ms")
 
 _log = logging.getLogger("tinyaisense_hub.speaker")
 
 
-@dataclass(frozen=True, slots=True)
-class StreamEnd:
-    reason: EndReason
-    stats: JsonObject
+class SpeakerStream(Stream):
+    """One agent speaker stream. It takes the agent's audio while it's `open`."""
 
-    def to_json(self) -> JsonObject:
-        return {"reason": self.reason, "stats": self.stats}
-
-
-class SpeakerStream:
-    """One agent speaker stream, from the device's `start` reply to its end."""
-
-    def __init__(
-        self,
-        handle: int,
-        session: Session,
-        conn: DeviceConnection,
-        cap: str,
-        stream_id: int,
-        address: str,
-    ) -> None:
-        self.handle = handle
-        self.session = session
-        self.conn = conn
-        self.cap = cap
-        self.stream_id = stream_id
-        """The device stream id, 1-127."""
-        self.address = address
-        self.ended: asyncio.Future[StreamEnd] = asyncio.get_running_loop().create_future()
-        self.stopping = False
-        """A stop is on its way: the agent's audio is dropped."""
-        self.sent_bytes = 0
-        self.first_sent: int | None = None
-        """When the first frame went out, in µs on the hub's monotonic clock."""
-
-    @property
-    def open(self) -> bool:
-        """Whether the stream takes the agent's audio."""
-        return not self.stopping and not self.ended.done()
+    sent_bytes = 0
+    first_sent: int | None = None
+    """When the first frame went out, in µs on the hub's monotonic clock."""
 
     def estimate(self, now: int) -> JsonObject:
         """The stats, when the device can't report them: `played_ms` is the audio sent,

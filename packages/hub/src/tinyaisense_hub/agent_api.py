@@ -7,7 +7,7 @@ facade: it parses and checks requests, calls the core, and writes replies and no
 import asyncio
 import json
 import logging
-from collections import deque
+from collections import Counter, deque
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any, cast
@@ -16,11 +16,13 @@ from starlette.applications import Starlette
 from starlette.routing import WebSocketRoute
 from starlette.websockets import WebSocket, WebSocketDisconnect
 from tinyaisense_wire import (
+    HubAudio,
     JsonObject,
     Schema,
     SchemaError,
     WireError,
     decode_agent_audio,
+    encode_hub_audio,
     validate,
 )
 
@@ -94,8 +96,6 @@ _HANDLE: Schema = {
     "additionalProperties": False,
     "properties": {"handle": {"type": "integer", "minimum": 0, "maximum": 65535}},
 }
-_PREFILL_MS = 40
-
 _log = logging.getLogger("tinyaisense_hub.agent_api")
 
 
@@ -124,11 +124,17 @@ class AgentLink:
         self._core = core
         self._timing = timing
         self._session: Session | None = None
-        self._control: deque[str] = deque()
-        """JSON messages waiting for the socket."""
+        self._control: deque[str | bytes] = deque()
+        """The control lane: JSON messages waiting for the socket, ahead of any audio."""
+        self._lanes: dict[int, deque[str | bytes]] = {}
+        """The audio lane: each stream's frames waiting for the socket, as the streams take
+        turns. An ended stream's frames are followed by its `stream.ended`."""
+        self._audio_frames = max(1, timing.agent_audio_ms // 10)
+        """How many frames the audio lane holds per stream before it skips the oldest."""
+        self._skipped: Counter[int] = Counter()
         self._wake = asyncio.Event()
         self._close_code: int | None = None
-        """Once set, the writer closes the link after the lane is sent."""
+        """Once set, the writer closes the link after the control lane is sent."""
         self._requests: set[asyncio.Task[None]] = set()
         self._methods: dict[str, tuple[Schema, _Method]] = {
             "devices": (_NO_PARAMS, self._devices),
@@ -156,10 +162,36 @@ class AgentLink:
     # SessionSink.
 
     def notify(self, method: str, params: JsonObject) -> None:
-        self._send({"jsonrpc": "2.0", "method": method, "params": params})
+        message: JsonObject = {"jsonrpc": "2.0", "method": method, "params": params}
+        if method == "stream.ended" and (lane := self._lanes.get(params["handle"])):
+            # After the stream's own last frames, which nothing else waits behind.
+            lane.append(_encode(message))
+            return
+        if method == "session.ended":
+            # Nothing follows it: the streams' last frames and ends go first.
+            for lane in self._lanes.values():
+                self._control.extend(lane)
+            self._lanes.clear()
+        self._send(message)
 
     def ended(self, reason: EndReason) -> None:
         self._finish(_GOING_AWAY if reason == "shutdown" else _NORMAL)
+
+    def audio(self, handle: int, index: int, pcm: bytes) -> None:
+        if self._close_code is not None:
+            return
+        lane = self._lanes.get(handle)
+        if lane is None:
+            lane = self._lanes[handle] = deque(maxlen=self._audio_frames)
+        elif len(lane) == lane.maxlen:
+            self._skipped[handle] += 1  # the append drops the oldest
+        lane.append(encode_hub_audio(HubAudio(handle, index, pcm)))
+        self._wake.set()
+
+    def audio_ended(self, handle: int) -> int:
+        if (lane := self._lanes.get(handle)) is not None:
+            self._lanes[handle] = deque(lane)  # uncapped: its last frames are no longer skipped
+        return self._skipped.pop(handle, 0)
 
     # Reading.
 
@@ -304,10 +336,7 @@ class AgentLink:
     async def _stream_start(self, params: JsonObject) -> JsonObject:
         assert self._session is not None
         handle = await self._core.stream_start(
-            self._session,
-            params["address"],
-            params.get("rate"),
-            params.get("prefill_ms", _PREFILL_MS),
+            self._session, params["address"], params.get("rate"), params.get("prefill_ms")
         )
         return {"handle": handle}
 
@@ -337,24 +366,46 @@ class AgentLink:
 
     def _send(self, message: JsonObject) -> None:
         if self._close_code is None:
-            self._control.append(json.dumps(message, separators=(",", ":"), ensure_ascii=False))
+            self._control.append(_encode(message))
             self._wake.set()
 
     def _finish(self, code: int) -> None:
-        """Close the link once what's queued has gone out. Nothing more is queued."""
+        """Close the link once the control lane has gone out. Nothing more is queued, and the
+        audio lane is dropped."""
         if self._close_code is None:
             self._close_code = code
+            self._lanes.clear()
             self._wake.set()
+
+    def _next(self) -> str | bytes | None:
+        """What the socket takes next: the control lane first, then the audio lane's next
+        message, from the stream whose turn it is."""
+        if self._control:
+            return self._control.popleft()
+        for handle, lane in self._lanes.items():
+            message = lane.popleft()
+            del self._lanes[handle]
+            if lane:
+                self._lanes[handle] = lane  # to the back of the turns
+            return message
+        return None
 
     async def _write(self) -> None:
         try:
             while True:
                 await self._wake.wait()
                 self._wake.clear()
-                while self._control:
-                    await self._ws.send_text(self._control.popleft())
+                while (message := self._next()) is not None:
+                    if isinstance(message, str):
+                        await self._ws.send_text(message)
+                    else:
+                        await self._ws.send_bytes(message)
                 if self._close_code is not None:
                     await self._ws.close(self._close_code)
                     return
         except WebSocketDisconnect, RuntimeError:
             pass  # the agent is gone
+
+
+def _encode(message: JsonObject) -> str:
+    return json.dumps(message, separators=(",", ":"), ensure_ascii=False)

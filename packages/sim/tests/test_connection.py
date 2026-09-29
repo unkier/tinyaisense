@@ -1,88 +1,14 @@
 """The device side of a Connection, driven by a hand-rolled hub that can misbehave."""
 
 import asyncio
-from collections.abc import AsyncIterator
-from typing import cast
 
-import pytest
 from tinyaisense_sim.pytest_plugin import SimulatorFactory
 from tinyaisense_sim.simulator import DEAD_AFTER_MS
-from tinyaisense_wire import ControlDecoder, Hello, Message, Pending, Ping, Pong, encode_control
+from tinyaisense_wire import Pending, Ping, Pong
+
+from .raw_hub import RawConnection, RawHub
 
 ECHO = "m5stack-atom-echo"
-
-
-class RawConnection:
-    """The hub's end of one device Connection."""
-
-    def __init__(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
-        self._reader = reader
-        self._writer = writer
-        self._decoder = ControlDecoder()
-        self._inbox: list[Message] = []
-
-    def send(self, message: Message) -> None:
-        self._writer.write(encode_control(message))
-
-    async def receive(self) -> Message:
-        while not self._inbox:
-            data = await self._reader.read(65536)
-            assert data, "the device closed the Connection"
-            self._inbox.extend(self._decoder.feed(data))
-        return self._inbox.pop(0)
-
-    async def until_closed(self) -> list[Message]:
-        """Everything the device sends until it closes the Connection."""
-        while data := await self._reader.read(65536):
-            self._inbox.extend(self._decoder.feed(data))
-        messages, self._inbox = self._inbox, []
-        return messages
-
-    def close(self) -> None:
-        self._writer.close()
-
-
-class RawHub:
-    """A hub's TCP side that does only what the test tells it to."""
-
-    def __init__(self) -> None:
-        self._server: asyncio.Server | None = None
-        self._connections: asyncio.Queue[RawConnection] = asyncio.Queue()
-        self._all: list[RawConnection] = []
-
-    async def start(self) -> None:
-        self._server = await asyncio.start_server(self._connected, "127.0.0.1", 0)
-
-    @property
-    def address(self) -> tuple[str, int]:
-        assert self._server is not None
-        return cast(tuple[str, int], self._server.sockets[0].getsockname()[:2])
-
-    async def accept(self) -> RawConnection:
-        """The next device Connection, once its `hello` is in."""
-        connection = await self._connections.get()
-        assert isinstance(await connection.receive(), Hello)
-        return connection
-
-    async def close(self) -> None:
-        for connection in self._all:
-            connection.close()
-        if self._server is not None:
-            self._server.close()
-            await self._server.wait_closed()
-
-    def _connected(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
-        connection = RawConnection(reader, writer)
-        self._all.append(connection)
-        self._connections.put_nowait(connection)
-
-
-@pytest.fixture
-async def raw_hub() -> AsyncIterator[RawHub]:
-    hub = RawHub()
-    await hub.start()
-    yield hub
-    await hub.close()
 
 
 async def pending_device(

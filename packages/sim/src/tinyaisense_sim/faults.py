@@ -155,12 +155,22 @@ def _frame_in(data: bytes, drops: dict[int | None, set[int]]) -> bool:
 
 class Faults:
     """A device's faults: on its TCP Connection, where they act on the Connection of the
-    moment, and on the datagrams it receives."""
+    moment, on its datagrams each way, and on its mic."""
 
-    def __init__(self, rng: random.Random) -> None:
-        """`rng` drives the UDP faults."""
-        self.udp_down = UdpFaults(rng)
+    def __init__(
+        self,
+        down_rng: random.Random,
+        up_rng: random.Random,
+        mic_tx_resumed: Callable[[], None] = lambda: None,
+    ) -> None:
+        """`down_rng` and `up_rng` drive the UDP faults each way. `mic_tx_resumed()` is
+        called when `mic_tx_stall` clears."""
+        self.udp_down = UdpFaults(down_rng)
         """Faults on the datagrams from the hub."""
+        self.udp_up = UdpFaults(up_rng)
+        """Faults on the datagrams to the hub."""
+        self._mic_tx_stall = False
+        self._mic_tx_resumed = mic_tx_resumed
         self._connection: ConnectionSocket | None = None
         self._stall_reads = False
         self._reads_resumed = asyncio.Event()
@@ -216,6 +226,20 @@ class Faults:
             self._reads_resumed.set()
             if self._connection is not None:
                 self._connection.resume_reading()
+
+    @property
+    def mic_tx_stall(self) -> bool:
+        """While set, the mic sends nothing, as if its UDP send task were stuck. Capture goes
+        on into each stream's 200 ms queue, which drops its oldest frames on overflow and
+        counts them in `dropped`. Clearing it sends what the queue holds, at once. A `stop`
+        during a stall drops what's queued."""
+        return self._mic_tx_stall
+
+    @mic_tx_stall.setter
+    def mic_tx_stall(self, stall: bool) -> None:
+        self._mic_tx_stall = stall
+        if not stall:
+            self._mic_tx_resumed()
 
     def fail_next(self, code: str = "failed") -> None:
         """Fail the next command with error `code`, without doing it. Each call fails one more."""

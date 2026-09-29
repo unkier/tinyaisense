@@ -58,7 +58,7 @@ Conditioning runs on the device, so the wire carries clean, speech-level PCM and
 - `stop` replies `{last_seq, dropped}` after the final frame has gone out.
 - **Loss, on the hub:**
   - There's no reorder wait. A gap counts as loss as soon as a later frame arrives, and it's zero-filled so consumers see a continuous timeline.
-  - Late frames and duplicates are dropped.
+  - Late frames and duplicates are dropped, as are frames past `last_seq` and frames more than 60 s ahead of both the timeline and the time since the stream's first frame arrived (`bad_seq`), which would zero-fill minutes.
   - After the `last_seq` reply, the hub waits at most 30 ms for missing tail frames, then zero-fills and finalizes.
 
 ## Speaker stream
