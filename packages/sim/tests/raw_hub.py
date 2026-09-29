@@ -3,16 +3,29 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import dataclass
 from typing import cast
 
+from tinyaisense_sim import SimDevice
 from tinyaisense_wire import (
+    Command,
     ControlDecoder,
+    Event,
+    EventMirror,
+    FailedReply,
     Hello,
+    JsonObject,
     Message,
+    Ping,
+    Pong,
+    Reply,
     StreamFrame,
     decode_datagram,
     encode_control,
 )
+
+CONN_ID = 7
+"""The `conn_id` the raw hub welcomes a device with."""
 
 
 class RawConnection:
@@ -33,6 +46,11 @@ class RawConnection:
             assert data, "the device closed the Connection"
             self._inbox.extend(self._decoder.feed(data))
         return self._inbox.pop(0)
+
+    async def event(self) -> Event:
+        message = await self.receive()
+        assert isinstance(message, Event), message
+        return message
 
     async def until_closed(self) -> list[Message]:
         """Everything the device sends until it closes the Connection."""
@@ -110,6 +128,11 @@ class RawUdp(asyncio.DatagramProtocol):
         assert isinstance(datagram, StreamFrame)
         return datagram
 
+    async def mirror(self) -> EventMirror:
+        datagram = decode_datagram(await self._datagrams.get())
+        assert isinstance(datagram, EventMirror)
+        return datagram
+
     async def frames(self, count: int) -> list[StreamFrame]:
         return [await self.frame() for _ in range(count)]
 
@@ -125,3 +148,35 @@ class RawUdp(asyncio.DatagramProtocol):
     def close(self) -> None:
         if self._transport is not None:
             self._transport.close()
+
+
+@dataclass
+class Online:
+    """A simulated device the raw hub has welcomed, and the raw hub's UDP socket."""
+
+    connection: RawConnection
+    udp: RawUdp
+    device: SimDevice
+    next_id: int = 1
+
+    async def command(
+        self, cap: str | None, name: str, args: JsonObject | None = None
+    ) -> Reply | FailedReply:
+        command_id, self.next_id = self.next_id, self.next_id + 1
+        self.connection.send(Command(command_id, cap, name, args or {}))
+        while True:
+            message = await self.connection.receive()
+            if isinstance(message, Reply | FailedReply) and message.id == command_id:
+                return message
+
+    async def ok(self, cap: str | None, name: str, args: JsonObject | None = None) -> JsonObject:
+        reply = await self.command(cap, name, args)
+        assert isinstance(reply, Reply), reply
+        return reply.result
+
+    async def clock(self) -> int:
+        """The device clock now, from a pong."""
+        self.connection.send(Ping(0))
+        while not isinstance(message := await self.connection.receive(), Pong):
+            pass
+        return message.ts

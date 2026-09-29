@@ -53,6 +53,16 @@ class Timing:
     """A listen ends with `max_duration` after this long."""
     thinking_ms: int = 60000
     """A device shows `thinking` for at most this long after an Utterance is delivered."""
+    event_hold_ms: int = 30
+    """A device Event that comes in ahead of a gap in `seq` order waits this long for it.
+    Raw button edges don't wait."""
+    click_ms: int = 250
+    """A button press shorter than this is a `click`."""
+    double_click_ms: int = 300
+    """A second click whose press starts within this long of the first one's release is also
+    a `double_click`."""
+    long_press_ms: int = 1000
+    """A button held down this long is a `long_press`."""
 
 
 @dataclass(frozen=True, slots=True)

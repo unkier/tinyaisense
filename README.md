@@ -11,6 +11,7 @@ uv run tinyaisense-hub rename kitchen den
 uv run tinyaisense-hub identify den 10  # blinks it white for 10 s (default 5), to tell it apart
 uv run tinyaisense-hub diag den      # uptime, reset reason, heap, RSSI, reconnects, stack high-water marks
 uv run tinyaisense-hub volume den 60 # 0 (mute) to 100; the hub re-applies it on every reconnect
+uv run tinyaisense-hub stats         # the histogram of button press to agent socket, over the last 10,000 edges
 uv run tinyaisense-hub forget den
 ```
 

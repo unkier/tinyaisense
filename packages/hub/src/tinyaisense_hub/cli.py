@@ -90,6 +90,9 @@ def _parser() -> argparse.ArgumentParser:
     volume.add_argument("device", help="its name or device_id")
     volume.add_argument("level", type=int, help="0 (mute) to 100")
     volume.set_defaults(run=_volume)
+
+    stats = commands.add_parser("stats", help="show the button-to-agent latency histogram")
+    stats.set_defaults(run=_stats)
     return parser
 
 
@@ -220,6 +223,34 @@ def _volume(args: argparse.Namespace) -> int:
         print(f"{volume['name']}: volume {args.level}")
     else:
         print(f"{volume['name']} is offline; it gets volume {args.level} when it's back")
+    return 0
+
+
+_BAR = 40
+"""The width of the histogram's longest bar."""
+
+
+def _stats(args: argparse.Namespace) -> int:
+    latency = _owner(lambda owner: owner.stats())["button_latency"]
+    if not latency["count"]:
+        print("button to agent socket: no edges yet")
+        return 0
+    print(
+        f"button to agent socket: {latency['count']} edges, p50 {latency['p50_ms']} ms, "
+        f"p99 {latency['p99_ms']} ms, max {latency['max_ms']} ms"
+    )
+    buckets = latency["buckets"]
+    used = [i for i, bucket in enumerate(buckets) if bucket["count"]]
+    labels = [
+        f">{buckets[i - 1]['le_ms']}" if bucket["le_ms"] is None else f"<={bucket['le_ms']}"
+        for i, bucket in enumerate(buckets)
+    ]
+    width = max(len(label) for label in labels[used[0] : used[-1] + 1])
+    most = max(bucket["count"] for bucket in buckets)
+    for i in range(used[0], used[-1] + 1):
+        count = buckets[i]["count"]
+        bar = "#" * round(count / most * _BAR)
+        print(f"{labels[i].rjust(width)} ms  {bar.ljust(_BAR)}  {count}")
     return 0
 
 

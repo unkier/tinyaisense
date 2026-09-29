@@ -1,70 +1,14 @@
 """The mic Kind on a simulated device, driven by a hand-rolled hub: docs/protocol/kinds/mic.md."""
 
 import asyncio
-from collections.abc import AsyncIterator
-from dataclasses import dataclass
 
 import pytest
-from tinyaisense_sim import SimDevice, sources
-from tinyaisense_sim.pytest_plugin import SimulatorFactory
-from tinyaisense_wire import (
-    Command,
-    FailedReply,
-    JsonObject,
-    Ping,
-    Pong,
-    Reply,
-    Welcome,
-)
+from tinyaisense_sim import sources
+from tinyaisense_wire import Command, FailedReply, Reply
 
-from .raw_hub import RawConnection, RawHub, RawUdp
+from .raw_hub import CONN_ID, Online
 
-ECHO = "m5stack-atom-echo"
-CONN_ID = 7
 FORMAT = {"codec": "pcm_s16le", "rate": 16000, "channels": 1, "frame_ms": 10}
-
-
-@dataclass
-class Online:
-    connection: RawConnection
-    udp: RawUdp
-    device: SimDevice
-    next_id: int = 1
-
-    async def command(
-        self, cap: str | None, name: str, args: JsonObject | None = None
-    ) -> Reply | FailedReply:
-        command_id, self.next_id = self.next_id, self.next_id + 1
-        self.connection.send(Command(command_id, cap, name, args or {}))
-        while True:
-            message = await self.connection.receive()
-            if isinstance(message, Reply | FailedReply) and message.id == command_id:
-                return message
-
-    async def ok(self, cap: str | None, name: str, args: JsonObject | None = None) -> JsonObject:
-        reply = await self.command(cap, name, args)
-        assert isinstance(reply, Reply), reply
-        return reply.result
-
-    async def clock(self) -> int:
-        """The device clock now, from a pong."""
-        self.connection.send(Ping(0))
-        while not isinstance(message := await self.connection.receive(), Pong):
-            pass
-        return message.ts
-
-
-@pytest.fixture
-async def online(raw_hub: RawHub, simulator: SimulatorFactory) -> AsyncIterator[Online]:
-    """A simulated Echo, welcomed by the raw hub, with the hub's UDP socket."""
-    udp = await RawUdp.open()
-    sim = simulator(raw_hub.address)
-    added = asyncio.create_task(sim.add(ECHO, "kitchen"))
-    connection = await raw_hub.accept()
-    connection.send(Welcome("kitchen", CONN_ID, udp.port))
-    device = await added
-    yield Online(connection, udp, device)
-    udp.close()
 
 
 def frames_of(pcm: bytes) -> list[bytes]:

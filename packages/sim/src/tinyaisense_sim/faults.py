@@ -20,6 +20,9 @@ class ConnectionSocket:
         self.writer = writer
         self.vanished = False
         """Nothing goes out or comes in any more, and the device never closes it."""
+        self._later: deque[tuple[float, Message]] = deque()
+        """What `send_later` holds, in the order it goes out, with when."""
+        self._later_timer: asyncio.TimerHandle | None = None
 
     @property
     def raw(self) -> socket.socket:
@@ -28,6 +31,27 @@ class ConnectionSocket:
     def send(self, message: Message) -> None:
         if not self.vanished and not self.writer.is_closing():
             self.writer.write(encode_control(message))
+
+    def send_later(self, message: Message, delay: float) -> None:
+        """Send `message` `delay` s from now, but never ahead of one sent this way before."""
+        loop = asyncio.get_running_loop()
+        due = loop.time() + delay
+        if not self._later and delay <= 0:
+            self.send(message)
+            return
+        if self._later:
+            due = max(due, self._later[-1][0])
+        self._later.append((due, message))
+        if self._later_timer is None:
+            self._later_timer = loop.call_at(self._later[0][0], self._send_due)
+
+    def _send_due(self) -> None:
+        self._later_timer = None
+        loop = asyncio.get_running_loop()
+        while self._later and self._later[0][0] <= loop.time():
+            self.send(self._later.popleft()[1])
+        if self._later:
+            self._later_timer = loop.call_at(self._later[0][0], self._send_due)
 
     def reset(self) -> None:
         """Close with an RST."""
@@ -177,6 +201,9 @@ class Faults:
         self._reads_resumed.set()
         self.delay_replies_ms = 0
         """The device holds each command's reply this long. It does the command at once."""
+        self.delay_events_ms = 0
+        """The device holds each Event's TCP copy this long, as a stalled TCP send would,
+        keeping their order. The UDP mirrors of button Events go out at once."""
         self._failures: list[str] = []
 
     @property

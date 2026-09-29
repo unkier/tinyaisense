@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Literal, Protocol
 
 from tinyaisense_wire import JsonObject
 
+from .alarm import epoch_ms
 from .errors import HubError
 from .streams import Stream
 
@@ -32,9 +33,17 @@ class SessionSink(Protocol):
     """Where a Session's notifications and audio go: its agent-API link. No method may
     block."""
 
-    def notify(self, method: str, params: JsonObject, after: int | None = None) -> None:
+    def notify(
+        self,
+        method: str,
+        params: JsonObject,
+        after: int | None = None,
+        latency_from: int | None = None,
+    ) -> None:
         """Send a notification; `after` a stream handle, behind the frames of it queued so
-        far."""
+        far. Given `latency_from`, a time on the hub's monotonic clock in µs, the time from
+        then until the notification is written to the socket counts toward the button latency
+        stats."""
         ...
 
     def audio(self, handle: int, index: int, pcm: bytes) -> None:
@@ -93,6 +102,15 @@ class Session:
         """Send a notification, stamped with `t`: now. `after` a stream handle, it follows
         the frames of it queued so far."""
         self.sink.notify(method, params | {"t": _now_ms()}, after)
+
+    def device_event(
+        self, method: str, params: JsonObject, at: int | None, *, edge: bool = False
+    ) -> None:
+        """Send a device Event, stamped with `t`: `at`, when it happened on the hub's
+        monotonic clock in µs; now if None. A raw button `edge` counts toward the button
+        latency stats."""
+        t = _now_ms() if at is None else epoch_ms(at)
+        self.sink.notify(method, params | {"t": t}, latency_from=at if edge else None)
 
     def audio(self, handle: int, index: int, pcm: bytes) -> None:
         self.sink.audio(handle, index, pcm)

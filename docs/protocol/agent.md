@@ -165,12 +165,12 @@ The cancelled request still gets its reply. Cancelling a request that has finish
 | `session.ended` | `reason` |
 
 - **Presence.** `device.online` goes out when a paired device connects, with the Manifest of that Connection, once the hub has brought it up to date (volume, Status, Reflex, LED claim). `device.offline` goes out when the Connection drops. A device the owner renames drops and comes back, so agents see it go offline under the old name and online under the new one.
-- **Device Events.** There are no subscriptions: the Session gets every Event from every device. The method is the Kind and the Event name, and `data` is the Event's data. Button Events are `button.down`, `button.up`, and the hub-derived `button.click`, `button.double_click` and `button.long_press` (no `long_press` while armed). Mic and speaker Events don't reach agents as such: they surface as `stream.*`, `say.*` and `utterance.*`.
+- **Device Events.** There are no subscriptions: the Session gets every Event from every device. The method is the Kind and the Event name, and `data` is the Event's data. Button Events are `button.down`, `button.up`, and the hub-derived `button.click`, `button.double_click` and `button.long_press` (no `long_press` while armed), whose `data` is `{}` and whose `t` is when the press became the gesture: see [Button](kinds/button.md#events). Mic and speaker Events don't reach agents as such: they surface as `stream.*`, `say.*` and `utterance.*`.
 - Events of a new Kind follow the same pattern, so a new Kind needs no API change.
 
 ### Ordering
 
-- Per device, Events arrive in the device's order (its event `seq`).
+- Per device, Events arrive in the device's order (its event `seq`). Raw `button.down` and `button.up` go out as soon as the hub has them, even ahead of an Event still on its way. Others wait up to 30 ms for such an Event, then go on without it; it follows when it arrives.
 - **Cause before effect:** `button.down`, then the cut `say` result or `stream.ended` with reason `reflex`, then `utterance.start`.
 - Across devices, in the order the hub received them.
 - A stream's binary frames come after its `stream.start` reply or `stream.started`, and before its `stream.ended`. An Utterance's frames come after its `utterance.start` and before its `utterance.end`.

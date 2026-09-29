@@ -17,6 +17,7 @@ from tinyaisense_wire import JsonObject
 
 from .devices import Registry
 from .errors import HubError, HubErrorCode
+from .stats import Latency
 
 SOCKET_NAME = "owner.sock"
 
@@ -32,9 +33,10 @@ _log = logging.getLogger("tinyaisense_hub.owner")
 
 
 class OwnerServer:
-    def __init__(self, registry: Registry, runtime_dir: Path) -> None:
+    def __init__(self, registry: Registry, runtime_dir: Path, button_latency: Latency) -> None:
         self.path = runtime_dir / SOCKET_NAME
         self._registry = registry
+        self._button_latency = button_latency
         self._server: asyncio.Server | None = None
         self._clients: set[asyncio.StreamWriter] = set()
         self._methods: dict[str, Callable[[_Params], Awaitable[Any]]] = {
@@ -45,6 +47,7 @@ class OwnerServer:
             "identify": self._identify,
             "diag": self._diag,
             "set_volume": self._set_volume,
+            "stats": self._stats,
         }
 
     async def start(self) -> None:
@@ -152,6 +155,10 @@ class OwnerServer:
         params.done()
         return await self._registry.set_volume(device, level)
 
+    async def _stats(self, params: _Params) -> JsonObject:
+        params.done()
+        return {"button_latency": self._button_latency.to_json()}
+
 
 class OwnerClient:
     """The owner's side of the socket. Refusals raise `HubError`."""
@@ -219,6 +226,11 @@ class OwnerClient:
         """Set the device's speaker volume, 0 to 100, now if it's online and after every
         `welcome`. `applied` in the result says whether the device has it yet."""
         return await self.call("set_volume", device=device, level=level)
+
+    async def stats(self) -> JsonObject:
+        """The hub's stats. `button_latency` is the histogram of the time from each raw button
+        edge on a device, by its `ts`, to its write on the agent's socket: see `Latency`."""
+        return await self.call("stats")
 
 
 def _error(request_id: object, code: int, message: str, hub_code: str) -> JsonObject:

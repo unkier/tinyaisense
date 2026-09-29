@@ -170,6 +170,7 @@ An Event is `event{seq, cap, name, ts, data}`.
 - `ts` is the device clock when the thing happened. For a button, it's the first edge.
 - Events go out on TCP in `seq` order.
 - **Event mirror:** button events are also sent as UDP datagrams of kind 2, twice, about 5 ms apart. The hub acts on the first copy to arrive, whichever path it came by, and drops later copies by `seq`. The hub accepts a mirror of any event.
+- **Reorder hold.** The hub takes a Connection's events in `seq` order. A mirror can arrive ahead of an event still on its way by TCP: it then waits for it, up to 30 ms (`[timing] event_hold_ms`). After that the hub gives up on the gap, and an event from it is taken as it arrives. Raw button `down` and `up` never wait: the hub delivers them to the agent as soon as their first copy arrives.
 
 ## UDP datagrams
 

@@ -56,6 +56,10 @@ def test_init_writes_a_config_with_a_random_agent_token(
         "no_speech_ms": 8000,
         "listen_max_ms": 60000,
         "thinking_ms": 60000,
+        "event_hold_ms": 30,
+        "click_ms": 250,
+        "double_click_ms": 300,
+        "long_press_ms": 1000,
     }
     assert config["speech"] == {"lang": "en", "say_ahead_ms": 3000, "speaker_latency_ms": 50}
     assert len(config["agent_token"]) >= 32
@@ -207,6 +211,36 @@ async def test_the_owner_identifies_diagnoses_and_sets_the_volume_from_the_cli(
     assert "ctrl=" in diag["stack_hwm"]
     assert device.speaker.level == 35
     assert volume.strip() == "kitchen: volume 35"
+
+
+async def test_the_owner_sees_the_button_latency_histogram_from_the_cli(
+    served: Served, xdg: dict[str, str], simulator: SimulatorFactory
+) -> None:
+    none_yet = await cli(xdg, "stats")
+    device = await simulator(served.device).add("m5stack-atom-echo", "kitchen")
+    await cli(xdg, "approve", device.device_id, "as", "kitchen")
+    await device.wait_for(lambda: device.state == "online")
+    async with tinyaisense.connect(served.agent_url, served.agent_token) as agent:
+        notifications = agent.notifications()
+        for _ in range(3):
+            await device.button.click(ms=20)
+            await asyncio.sleep(0.02)
+        edges = 0
+        async with asyncio.timeout(2):
+            async for notification in notifications:
+                edges += notification.method in ("button.down", "button.up")
+                if edges == 6:
+                    break
+            while "6 edges" not in (stats := await cli(xdg, "stats")):
+                pass
+
+    assert none_yet.strip() == "button to agent socket: no edges yet"
+    [summary, *buckets] = stats.splitlines()
+    assert re.fullmatch(
+        r"button to agent socket: 6 edges, p50 [\d.]+ ms, p99 [\d.]+ ms, max [\d.]+ ms", summary
+    )
+    assert sum(int(line.split()[-1]) for line in buckets) == 6
+    assert all(re.fullmatch(r" *(<=\d+|>\d+) ms  #* *\d+", line) for line in buckets)
 
 
 async def test_serve_serves_the_agent_api(served: Served) -> None:

@@ -41,10 +41,11 @@ from tinyaisense_wire import (
     validate,
 )
 
-from .alarm import Alarm, now_us
+from .alarm import Alarm, epoch_ms, now_us
 from .commands import Answered, CommandTimeouts, Replied, Sent, TimedOut
 from .config import Timing
 from .errors import HubError, HubErrorCode
+from .events import EventOrder, Ordered, Raw
 from .keepalive import ClockSync, Dead, Inbound, Keepalive, SendPing, Tick
 from .state import DeviceRecord, StateStore
 
@@ -71,7 +72,13 @@ class DeviceObserver(Protocol):
 
     def device_online(self, conn: DeviceConnection, record: DeviceRecord) -> None: ...
 
-    def device_event(self, conn: DeviceConnection, event: Event) -> None: ...
+    def device_edge(self, conn: DeviceConnection, event: Event) -> None:
+        """A raw button edge, as its first copy came in: perhaps ahead of `seq` order."""
+        ...
+
+    def device_event(self, conn: DeviceConnection, event: Event) -> None:
+        """An Event, in `seq` order: raw button edges again, in their turn."""
+        ...
 
     def device_offline(self, conn: DeviceConnection) -> None: ...
 
@@ -143,6 +150,9 @@ class DeviceConnection(asyncio.Protocol):
         self._keepalive_alarm = Alarm(self._run_keepalive)
         self._timeouts = CommandTimeouts()
         self._timeouts_alarm = Alarm(self._run_timeouts)
+        self._events: EventOrder | None = None
+        """Set by `hello`."""
+        self._events_alarm = Alarm(self._run_events)
         self._in_flight: dict[int, asyncio.Future[JsonObject]] = {}
         self._next_command_id = 1
         self._peer = "?"
@@ -164,7 +174,7 @@ class DeviceConnection(asyncio.Protocol):
     def last_seen(self) -> int:
         """Epoch ms of the last inbound frame, from the `hello` on."""
         assert self._keepalive is not None
-        return _now_ms() - (now_us() - self._keepalive.last_inbound) // 1000
+        return epoch_ms(self._keepalive.last_inbound)
 
     def send(self, message: Message) -> None:
         if self._transport is not None and self.state != "closed":
@@ -296,6 +306,8 @@ class DeviceConnection(asyncio.Protocol):
                     ping_interval=self._timing.ping_interval_ms * 1000,
                     dead_after=self._timing.dead_after_ms * 1000,
                 )
+                buttons = {c.id for c in message.manifest.capabilities if c.kind == "button"}
+                self._events = EventOrder(hold=self._timing.event_hold_ms * 1000, buttons=buttons)
                 self._registry.hello(self)
                 self._run_keepalive(now)
             case Hello():
@@ -305,9 +317,31 @@ class DeviceConnection(asyncio.Protocol):
             case Reply() | FailedReply():
                 self._reply(message, now)
             case Event():
-                self._registry.event(self, message)
+                self.event(message, now)
             case _:
                 pass
+
+    def event(self, event: Event, now: int) -> None:
+        """An Event from the device, by TCP or by a UDP mirror: each copy of it comes here."""
+        assert self._events is not None
+        self._events_due(self._events.handle(event, now), now)
+
+    def _run_events(self, now: int) -> None:
+        assert self._events is not None
+        self._events_due(self._events.handle(Tick(), now), now)
+
+    def _events_due(self, actions: list[Raw | Ordered], now: int) -> None:
+        assert self._events is not None
+        for action in actions:
+            if self.state == "closed":
+                return
+            match action:
+                case Raw(event):
+                    self._registry.edge(self, event)
+                case Ordered(event):
+                    self._registry.event(self, event)
+        if self.state != "closed":
+            self._events_alarm.set(self._events.next_deadline(), now)
 
     def _reply(self, reply: Reply | FailedReply, now: int) -> None:
         for action in self._timeouts.handle(Replied(reply.id), now):
@@ -361,6 +395,7 @@ class DeviceConnection(asyncio.Protocol):
         self._hello_timer = None
         self._keepalive_alarm.cancel()
         self._timeouts_alarm.cancel()
+        self._events_alarm.cancel()
         in_flight, self._in_flight = self._in_flight, {}
         for future in in_flight.values():
             _fail(future, HubError("disconnected", f"{self.name} dropped: {reason}"))
@@ -597,6 +632,9 @@ class Registry:
             conn.send(Pending())
             _log.info("%s: pending, board %s", conn, conn.manifest.board)
 
+    def edge(self, conn: DeviceConnection, event: Event) -> None:
+        self._observer.device_edge(conn, event)
+
     def event(self, conn: DeviceConnection, event: Event) -> None:
         self._observer.device_event(conn, event)
 
@@ -617,6 +655,8 @@ class Registry:
             self.udp_drops["bad_source"] += 1
         elif isinstance(datagram, StreamFrame):
             conn.stream_frame(datagram, now)
+        else:
+            conn.event(datagram.event, now)
 
     def detach(self, conn: DeviceConnection) -> None:
         self._connections.discard(conn)

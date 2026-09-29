@@ -1,6 +1,7 @@
 from importlib.metadata import version
 
 from . import sources
+from .button import SimButton
 from .faults import Faults, GilbertElliott, UdpFaults
 from .led import Light
 from .mic import SimMic
@@ -22,6 +23,7 @@ __all__ = [
     "Health",
     "HubStatus",
     "Light",
+    "SimButton",
     "SimDevice",
     "SimMic",
     "SimSpeaker",

@@ -20,7 +20,12 @@ The button went down.
 
 The button went up.
 
-**Hub-derived gestures.** The hub derives `click`, `double_click` and `long_press` from the raw edges and delivers them to agents. They never cross the device wire. While the Reflex is armed, a press under 250 ms is a `click`, meaning "stop talking", and there's no `long_press`.
+**Hub-derived gestures.** The hub derives `click`, `double_click` and `long_press` from the raw edges and delivers them to agents. They never cross the device wire. It times them by the edges' `ts`, so network delay doesn't stretch a press. Every threshold is in the hub's `[timing]`.
+- `click`: a press under 250 ms. It goes out as the button goes up, right after `up`. It never waits to see whether a double click follows.
+- `double_click`: a second click whose press starts within 300 ms of the first one's release. It goes out right after the second `click`, so a double click is `click`, `click`, `double_click`. A third quick click starts over.
+- `long_press`: a press held for 1 s. It goes out while the button is still down, and its release is no `click`.
+
+While the Reflex is armed, a press under 250 ms is a `click`, meaning "stop talking", and there's no `long_press`.
 
 ## Commands
 

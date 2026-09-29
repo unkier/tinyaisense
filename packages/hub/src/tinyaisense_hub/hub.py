@@ -18,6 +18,7 @@ from .owner import OwnerServer
 from .session import Sessions
 from .speech.layer import Speech
 from .state import StateStore
+from .stats import Latency
 from .web import HttpServer
 
 
@@ -53,6 +54,8 @@ class Hub:
         self._http: HttpServer | None = None
         self._owner: OwnerServer | None = None
         self._advertiser: Advertiser | None = None
+        self.button_latency = Latency()
+        """From each raw button edge on a device to its write on the agent's socket."""
 
     async def __aenter__(self) -> Self:
         await self.start()
@@ -142,13 +145,13 @@ class Hub:
         else:
             self._tcp = await loop.create_server(self._registry.connection, self._host, port)
         self._http = HttpServer(
-            agent_app(self._core, self.config.timing),
+            agent_app(self._core, self.config.timing, self.button_latency),
             host=self._host,
             port=self.config.http_port,
             timing=self.config.timing,
         )
         await self._http.start()
-        self._owner = OwnerServer(self._registry, self._runtime_dir)
+        self._owner = OwnerServer(self._registry, self._runtime_dir, self.button_latency)
         await self._owner.start()
         if self._mdns is not None:
             self._advertiser = Advertiser(self._mdns, self._host, self.device_address[1])

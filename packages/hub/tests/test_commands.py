@@ -7,7 +7,7 @@ import pytest
 import tinyaisense
 from tinyaisense_hub import Hub, OwnerClient, Timing
 from tinyaisense_sim import Light, SimDevice, Simulator
-from tinyaisense_wire import Command, Hello, JsonObject, Reply, Welcome
+from tinyaisense_wire import Command, Event, Hello, JsonObject, Reply, Welcome
 
 from .raw_device import RawDevice, echo_manifest
 
@@ -388,6 +388,23 @@ async def test_device_online_waits_for_the_replies_to_the_bring_up(start_hub: St
         device.close()  # before it replies
 
         assert (await anext(notifications)).method == "device.offline"
+
+
+async def test_a_press_during_the_bring_up_does_not_reach_the_agent_ahead_of_device_online(
+    start_hub: StartHub,
+) -> None:
+    hub = await start_hub(auto_approve=True, timing=NEVER_DEAD)
+    async with tinyaisense.connect(hub.agent_url, TOKEN) as agent:
+        notifications = agent.notifications()
+        device, _ = await welcomed(hub)
+        status = await command(device)
+        device.send(Event(0, "button", "down", 1_000, {}))
+        device.send(Event(1, "button", "up", 2_000, {}))
+        device.send(Reply(status.id, {}))
+        assert (await anext(notifications)).method == "device.online"
+
+        device.send(Event(2, "button", "down", 3_000, {}))
+        assert (await anext(notifications)).method == "button.down"
 
 
 async def test_the_status_and_the_led_claim_go_out_pipelined_after_welcome(

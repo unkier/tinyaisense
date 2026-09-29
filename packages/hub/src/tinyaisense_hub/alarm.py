@@ -38,3 +38,8 @@ class Alarm:
 def now_us() -> int:
     """The hub's monotonic clock, as `ping.t` carries it."""
     return time.monotonic_ns() // 1000
+
+
+def epoch_ms(at: int) -> int:
+    """A time on the hub's monotonic clock, in µs, as wall-clock epoch ms."""
+    return (time.time_ns() // 1000 - (now_us() - at)) // 1000

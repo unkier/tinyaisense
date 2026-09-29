@@ -19,6 +19,7 @@ from .alarm import Alarm, now_us
 from .config import Timing
 from .devices import CommandSpec, DeviceConnection, check_args, volume_commands
 from .errors import HubError
+from .gestures import Down, Gestures, Up
 from .keepalive import Tick
 from .mic import MicStream
 from .session import Session
@@ -47,13 +48,20 @@ class Controller:
         workers: set[asyncio.Task[None]],
         thinking: Thinking,
         think: Callable[[Controller, Tick, int], None],
+        gestures: dict[str, Gestures],
+        gesture: Callable[[Controller, Tick, int], None],
     ) -> None:
         """`workers` collects the task that runs the ops, while it runs. `think` runs the
-        `thinking` core when its deadline is due."""
+        `thinking` core when its deadline is due, and `gesture` the `gestures` when one is."""
         self.conn = conn
+        self.up_to_date = False
+        """Whether the bring-up is done: the Session hears of the device from then on."""
         self.thinking = thinking
         """Whether the device shows `thinking`, for the Session."""
         self.thinking_alarm = Alarm(lambda now: think(self, Tick(), now))
+        self.gestures = gestures
+        """Button capability id → its gestures."""
+        self.gestures_alarm = Alarm(lambda now: gesture(self, Tick(), now))
         self._queue: deque[tuple[_Op[Any], asyncio.Future[Any]]] = deque()
         self._worker: asyncio.Task[None] | None = None
         self._workers = workers
@@ -134,14 +142,37 @@ class Control:
 
     def device_online(self, conn: DeviceConnection, record: DeviceRecord) -> None:
         """Bring the device up to date, then tell the Session it's online."""
-        controller = Controller(conn, self._workers, self._thinking(), self._think)
+        timing = self._timing
+        gestures = {
+            cap.id: Gestures(
+                click=timing.click_ms * 1000,
+                double_click=timing.double_click_ms * 1000,
+                long_press=timing.long_press_ms * 1000,
+            )
+            for cap in conn.manifest.capabilities
+            if cap.kind == "button"
+        }
+        controller = Controller(
+            conn, self._workers, self._thinking(), self._think, gestures, self._gestures
+        )
         self._controllers[conn.manifest.device_id] = controller
         _log_failure(controller.submit(lambda: self._bring_up(conn, record)))
 
+    def device_edge(self, conn: DeviceConnection, event: Event) -> None:
+        """A raw button edge goes to the Session at once: the Interrupt path."""
+        if (controller := self._current(conn)) is not None:
+            at = conn.clock.to_hub(event.ts)
+            self._button_event(controller, event.cap, event.name, event.data, at, edge=True)
+
     def device_event(self, conn: DeviceConnection, event: Event) -> None:
         """Apply a device Event at once, outside the op queue."""
-        controller = self._controllers.get(conn.manifest.device_id)
-        if controller is None or controller.conn is not conn:
+        controller = self._current(conn)
+        if controller is None:
+            return
+        if event.cap in controller.gestures and event.name in ("down", "up"):
+            at = conn.clock.to_hub(event.ts)
+            edge = (Down if event.name == "down" else Up)(now_us() if at is None else at)
+            self._gestures(controller, edge, now_us(), event.cap)
             return
         stream = controller.streams.get(event.cap)
         if not isinstance(stream, SpeakerStream) or event.data.get("stream") != stream.stream_id:
@@ -153,10 +184,11 @@ class Control:
 
     def device_offline(self, conn: DeviceConnection) -> None:
         device_id = conn.manifest.device_id
-        if (controller := self._controllers.get(device_id)) is not None and controller.conn is conn:
+        if (controller := self._current(conn)) is not None:
             for stream in list(controller.streams.values()):
                 self._end(stream, "disconnected", None)
             controller.thinking_alarm.cancel()
+            controller.gestures_alarm.cancel()
             del self._controllers[device_id]
         if self._session is not None:
             # By its welcome name: a rename or forget has changed the record already.
@@ -172,6 +204,8 @@ class Control:
         if (claim := self._claims.get(conn.manifest.device_id)) is not None:
             commands += claim.replay()
         await conn.pipeline(commands, strict=False)
+        if (controller := self._current(conn)) is not None:
+            controller.up_to_date = True
         if conn.state == "online" and self._session is not None:
             self._session.notify(
                 "device.online", {"device": conn.name, "manifest": conn.manifest.to_json()}
@@ -612,6 +646,43 @@ class Control:
                 "stream.ended", {"handle": stream.handle, **end.to_json()}, after=stream.handle
             )
 
+    def _gestures(
+        self, controller: Controller, input: Down | Up | Tick, now: int, cap: str | None = None
+    ) -> None:
+        """Run the gestures of button `cap`, or of every button for a `Tick`, and send what
+        they see to the Session."""
+        conn = controller.conn
+        for cap_id, gestures in controller.gestures.items():
+            if cap is not None and cap_id != cap:
+                continue
+            for gesture in gestures.handle(input, now):
+                self._button_event(controller, cap_id, gesture.name, {}, gesture.ts)
+        deadlines = [d for g in controller.gestures.values() if (d := g.next_deadline())]
+        if self._current(conn) is controller:
+            controller.gestures_alarm.set(min(deadlines, default=None), now)
+
+    def _button_event(
+        self,
+        controller: Controller,
+        cap: str,
+        name: str,
+        data: JsonObject,
+        at: int | None,
+        *,
+        edge: bool = False,
+    ) -> None:
+        """Send `button.<name>` to the Session, once the device is up to date. `at` is when it
+        happened, in hub µs; `edge` marks a raw edge."""
+        conn = controller.conn
+        if (
+            self._session is not None
+            and controller.up_to_date
+            and self._current(conn) is controller
+        ):
+            self._session.device_event(
+                f"button.{name}", {"address": f"{conn.name}/{cap}", "data": data}, at, edge=edge
+            )
+
     def _thinking(self) -> Thinking:
         return Thinking(timeout=self._timing.thinking_ms * 1000)
 
@@ -621,15 +692,17 @@ class Control:
         """Run the device's `thinking` core, and show what it says while the Session lasts."""
         now = now_us() if now is None else now
         for show in controller.thinking.handle(input, now):
-            if (
-                self._session is not None
-                and self._controllers.get(controller.conn.manifest.device_id) is controller
-            ):
+            if self._session is not None and self._current(controller.conn) is controller:
                 _log_failure(controller.conn.command(*_status(show.state)))
         controller.thinking_alarm.set(controller.thinking.next_deadline(), now)
 
     def _hub_status(self) -> _HubStatus:
         return "no_agent" if self._session is None else "agent"
+
+    def _current(self, conn: DeviceConnection) -> Controller | None:
+        """The controller of `conn`, while it's the device's online Connection."""
+        controller = self._controllers.get(conn.manifest.device_id)
+        return controller if controller is not None and controller.conn is conn else None
 
     def _controller(self, device: DeviceRecord) -> Controller:
         """Raises `disconnected` if the device is offline."""

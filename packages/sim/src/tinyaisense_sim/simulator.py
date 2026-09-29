@@ -28,6 +28,7 @@ from tinyaisense_wire import (
     ControlDecoder,
     Error,
     Event,
+    EventMirror,
     FailedReply,
     Hello,
     JsonObject,
@@ -47,6 +48,7 @@ from tinyaisense_wire import (
 )
 
 from .backoff import Backoff
+from .button import Edge, SimButton
 from .discovery import Mdns, Resolve
 from .faults import ConnectionSocket, Faults
 from .led import Light, SimLed
@@ -62,6 +64,8 @@ OUTPUT_LATENCY_MS = 30
 """How long audio takes from the jitter buffer to the ear: the DMA."""
 _CLOSED_STREAMS = 16
 """The closed stream ids a Connection remembers, to drop their late frames silently."""
+MIRROR_GAP_MS = 5
+"""An event's second UDP mirror goes out this long after its first."""
 
 DeviceState = Literal["connecting", "pending", "online", "closed"]
 
@@ -229,6 +233,11 @@ class SimDevice:
             for cap in manifest.capabilities
             if cap.kind == "mic"
         }
+        self._buttons = {
+            cap.id: SimButton(self._button_edge(cap.id))
+            for cap in manifest.capabilities
+            if cap.kind == "button"
+        }
 
     @property
     def device_id(self) -> str:
@@ -259,6 +268,12 @@ class SimDevice:
         """The mic capability, on a Board with one."""
         [mic] = self._mics.values()
         return mic
+
+    @property
+    def button(self) -> SimButton:
+        """The button capability, on a Board with one."""
+        [button] = self._buttons.values()
+        return button
 
     def lights(self, cap: str = "led") -> tuple[Light, ...]:
         """What each LED of the led capability `cap` shows now, the Status included."""
@@ -423,12 +438,28 @@ class SimDevice:
             mic.cut()
         self._layers.claimed = False
 
-    def _emit(self, cap: str, name: str, data: JsonObject) -> None:
-        """Send an Event on the Connection, if it's up."""
-        if self._conn is None or self.state != "online":
+    def _emit(self, cap: str, name: str, data: JsonObject, *, mirror: bool = False) -> None:
+        """Send an Event on the Connection, if it's up; with `mirror`, over UDP too, twice."""
+        if self._conn is None or self.state != "online" or self.conn_id is None:
             return
-        self._conn.send(Event(self._event_seq, cap, name, self._clock(), data))
+        event = Event(self._event_seq, cap, name, self._clock(), data)
         self._event_seq += 1
+        if mirror:
+            self._mirror(event, self.conn_id)
+            asyncio.get_running_loop().call_later(
+                MIRROR_GAP_MS / 1000, self._mirror, event, self.conn_id
+            )
+        self._conn.send_later(event, self.faults.delay_events_ms / 1000)
+
+    def _mirror(self, event: Event, conn_id: int) -> None:
+        """Send an Event's UDP mirror, if its Connection is still up."""
+        if self.conn_id == conn_id:
+            self._send_datagram(encode_datagram(EventMirror(conn_id, event)))
+
+    # The button.
+
+    def _button_edge(self, cap: str) -> Callable[[Edge], None]:
+        return lambda edge: self._emit(cap, edge, {}, mirror=True)
 
     # UDP.
 
@@ -463,10 +494,16 @@ class SimDevice:
 
     def _send_frame(self, stream: int, seq: int, ts: int, payload: bytes) -> None:
         """Send a stream frame to the hub, through the network's faults."""
-        if self._udp is None or self._hub_udp is None or self.conn_id is None:
+        if self.conn_id is not None:
+            self._send_datagram(
+                encode_datagram(StreamFrame(self.conn_id, stream, seq, ts, payload))
+            )
+
+    def _send_datagram(self, datagram: bytes) -> None:
+        """Send a datagram to the hub, through the network's faults."""
+        if self._udp is None or self._hub_udp is None:
             return
         udp, to = self._udp, self._hub_udp
-        datagram = encode_datagram(StreamFrame(self.conn_id, stream, seq, ts, payload))
         self.faults.udp_up.apply(datagram, lambda data: udp.sendto(data, to))
 
     # The mic.

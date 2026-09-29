@@ -27,11 +27,13 @@ from tinyaisense_wire import (
     validate,
 )
 
+from .alarm import now_us
 from .config import Timing
 from .core import Core
 from .errors import HubError, HubErrorCode
 from .resampler import RATES
 from .session import EndReason, Session, ThenListen, UtteranceOptIn
+from .stats import Latency
 
 _PARSE_ERROR = -32700
 _INVALID_REQUEST = -32600
@@ -161,9 +163,12 @@ _CANCEL: Schema = {
 _log = logging.getLogger("tinyaisense_hub.agent_api")
 
 
-def agent_app(core: Core, timing: Timing) -> Starlette:
+def agent_app(core: Core, timing: Timing, button_latency: Latency) -> Starlette:
+    """`button_latency` takes the time from each raw button edge on a device to its write on
+    an agent's socket."""
+
     async def agent(websocket: WebSocket) -> None:
-        await AgentLink(websocket, core, timing).run()
+        await AgentLink(websocket, core, timing, button_latency).run()
 
     return Starlette(routes=[WebSocketRoute("/agent", agent)])
 
@@ -174,6 +179,15 @@ class _After:
 
     result: JsonObject
     handle: int | None
+
+
+@dataclass(frozen=True, slots=True)
+class _Timed:
+    """A message whose time to the socket, from `latency_from` on the hub's monotonic clock,
+    counts toward the button latency stats."""
+
+    text: str
+    latency_from: int
 
 
 type _Method = Callable[[JsonObject], Awaitable[JsonObject | _After]]
@@ -189,12 +203,15 @@ class _Request:
 class AgentLink:
     """One `/agent` WebSocket, and the sink of the Session it claims."""
 
-    def __init__(self, websocket: WebSocket, core: Core, timing: Timing) -> None:
+    def __init__(
+        self, websocket: WebSocket, core: Core, timing: Timing, button_latency: Latency
+    ) -> None:
         self._ws = websocket
         self._core = core
         self._timing = timing
+        self._button_latency = button_latency
         self._session: Session | None = None
-        self._control: deque[str | bytes] = deque()
+        self._control: deque[str | bytes | _Timed] = deque()
         """The control lane: JSON messages waiting for the socket, ahead of any audio."""
         self._lanes: dict[int, deque[str | bytes]] = {}
         """The audio lane: each stream's frames waiting for the socket, as the streams take
@@ -240,14 +257,20 @@ class AgentLink:
 
     # SessionSink.
 
-    def notify(self, method: str, params: JsonObject, after: int | None = None) -> None:
+    def notify(
+        self,
+        method: str,
+        params: JsonObject,
+        after: int | None = None,
+        latency_from: int | None = None,
+    ) -> None:
         message: JsonObject = {"jsonrpc": "2.0", "method": method, "params": params}
         if method == "session.ended":
             # Nothing follows it: the streams' last frames and ends go first.
             for lane in self._lanes.values():
                 self._control.extend(lane)
             self._lanes.clear()
-        self._send(message, after)
+        self._send(message, after, latency_from)
 
     def ended(self, reason: EndReason) -> None:
         self._finish(_GOING_AWAY if reason == "shutdown" else _NORMAL)
@@ -525,15 +548,19 @@ class AgentLink:
         error = {"code": code, "message": message, "data": {"code": hub_code} | (data or {})}
         self._send({"jsonrpc": "2.0", "id": request_id, "error": error})
 
-    def _send(self, message: JsonObject, after: int | None = None) -> None:
+    def _send(
+        self, message: JsonObject, after: int | None = None, latency_from: int | None = None
+    ) -> None:
         """Queue `message` on the control lane; or, `after` a handle, behind the audio frames
-        of it queued so far, which nothing else waits behind."""
+        of it queued so far, which nothing else waits behind. Its time to the socket from
+        `latency_from`, if given, counts toward the button latency stats."""
         if self._close_code is not None:
             return
         if after is not None and (lane := self._lanes.get(after)):
             lane.append(_encode(message))
         else:
-            self._control.append(_encode(message))
+            text = _encode(message)
+            self._control.append(text if latency_from is None else _Timed(text, latency_from))
             self._wake.set()
 
     def _finish(self, code: int) -> None:
@@ -544,7 +571,7 @@ class AgentLink:
             self._lanes.clear()
             self._wake.set()
 
-    def _next(self) -> str | bytes | None:
+    def _next(self) -> str | bytes | _Timed | None:
         """What the socket takes next: the control lane first, then the audio lane's next
         message, from the stream whose turn it is."""
         if self._control:
@@ -563,7 +590,10 @@ class AgentLink:
                 await self._wake.wait()
                 self._wake.clear()
                 while (message := self._next()) is not None:
-                    if isinstance(message, str):
+                    if isinstance(message, _Timed):
+                        await self._ws.send_text(message.text)
+                        self._button_latency.record(now_us() - message.latency_from)
+                    elif isinstance(message, str):
                         await self._ws.send_text(message)
                     else:
                         await self._ws.send_bytes(message)
