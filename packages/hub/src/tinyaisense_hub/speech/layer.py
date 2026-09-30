@@ -10,13 +10,14 @@ from typing import Any
 
 from tinyaisense_wire import Capability, JsonObject
 
-from ..config import ConfigError, SpeechConfig, Timing, VoiceConfig
+from ..config import ConfigError, EngineNames, SpeechConfig, Timing, VoiceConfig, engine_names
 from ..control import Control
 from ..errors import HubError
 from ..mic import Listener
 from ..session import Session, ThenListen, UtteranceOptIn
 from ..state import DeviceRecord
 from ..streams import FORMAT
+from .cloud import THREADS, Engines, Runner
 from .engines import Engine, Stt, Tts, Turn, Vad
 from .listen import Ears, Listen, Trigger
 from .say import EngineVoice, Run, Say
@@ -32,16 +33,17 @@ class Speech:
         self._config = config
         self._control = control
         self._timing = timing
-        self._executors: dict[type[Engine], ThreadPoolExecutor] = {}
-        """Role → the one thread its engines run on."""
-        self._tts: dict[str, Tts] = {}
-        """Language → the engine that speaks it."""
+        self._executors: dict[type[Engine] | str, ThreadPoolExecutor] = {}
+        """Role → the one thread its engines run on, bar the cloud engines: cloud engine, by
+        name → its own threads."""
+        self._tts: dict[str, Engines[Tts]] = {}
+        """Language → the engines that speak it."""
         self._defaults: dict[str, VoiceConfig] = {}
         """Language → its default Voice."""
-        self._vad: Vad | None = None
-        self._turn: Turn | None = None
-        self._stt: dict[str, Stt] = {}
-        """Language → the engine that hears it."""
+        self._vad: Runner[Vad] | None = None
+        self._turn: Runner[Turn] | None = None
+        self._stt: dict[str, Engines[Stt]] = {}
+        """Language → the engines that hear it."""
         self._runs: dict[tuple[str, str], Run] = {}
         """(device_id, capability) → the newest Run on the speaker, until it's over."""
         self._tasks: set[asyncio.Task[None]] = set()
@@ -58,51 +60,46 @@ class Speech:
             raise
 
     async def _start_tts(self) -> None:
-        engines: dict[str, Tts] = {}
-        for lang, name in self._config.tts.items():
-            if name not in engines:
-                engines[name] = await self._load(name, Tts)
-            engine = self._tts[lang] = engines[name]
-            if engine.languages and lang not in engine.languages:
-                raise ConfigError(
-                    f"speech engine {name!r} doesn't speak {lang}, only "
-                    f"{', '.join(engine.languages)}"
-                )
+        self._tts = await self._load_languages(self._config.tts, Tts, "speak")
         for voice in self._config.voices:
             self._defaults.setdefault(voice.lang, voice)
-            engine = self._tts[voice.lang]
-            if engine.voices is not None and voice.engine_voice not in engine.voices:
-                raise ConfigError(
-                    f"Voice {voice.id!r}: speech engine {self._config.tts[voice.lang]!r} has no "
-                    f"voice {voice.engine_voice!r}"
-                )
+            engines = self._tts[voice.lang]
+            _check_voice(voice, engines.engine, voice.engine_voice)
+            if engines.stand_in is not None:
+                _check_voice(voice, engines.stand_in, voice.fallback_voice, "its fallback_voice")
 
     async def _start_listening(self) -> None:
         config = self._config
         if config.vad is not None:
-            self._vad = await self._load_listening(config.vad, Vad)
+            self._vad = _listening(await self._load(config.vad, Vad))
         if config.turn is not None:
-            self._turn = await self._load_listening(config.turn, Turn)
-        engines: dict[str, Stt] = {}
-        for lang, name in config.stt.items():
-            if name not in engines:
-                engines[name] = await self._load_listening(name, Stt)
-            engine = self._stt[lang] = engines[name]
-            if engine.languages and lang not in engine.languages:
-                raise ConfigError(
-                    f"speech engine {name!r} doesn't hear {lang}, only "
-                    f"{', '.join(engine.languages)}"
-                )
+            self._turn = _listening(await self._load(config.turn, Turn))
+        self._stt = await self._load_languages(config.stt, Stt, "hear")
+        for engines in self._stt.values():
+            for runner in engines.runners:
+                _listening(runner)
 
-    async def _load_listening[E: Engine](self, name: str, role: type[E]) -> E:
-        """Make engine `name`, which takes the devices' audio as it is."""
-        engine = await self._load(name, role)
-        if engine.rate != FORMAT.rate:
-            raise ConfigError(
-                f"speech engine {name!r} hears at {engine.rate} Hz: the hub listens at "
-                f"{FORMAT.rate} Hz only"
-            )
-        return engine
+    async def _load_languages[E: Engine](
+        self, languages: dict[str, EngineNames], role: type[E], verb: str
+    ) -> dict[str, Engines[E]]:
+        """Make the engines that serve `role` in each language, once each, and check that
+        they `verb` it, and that a local engine stands in for each cloud engine."""
+        loaded: dict[str, Runner[E]] = {}
+        served: dict[str, Engines[E]] = {}
+        for lang, names in languages.items():
+            runners: list[Runner[E]] = []
+            for name in engine_names(names):
+                if name not in loaded:
+                    loaded[name] = await self._load(name, role)
+                runner = loaded[name]
+                if (known := runner.engine.languages) and lang not in known:
+                    raise ConfigError(
+                        f"speech engine {name!r} doesn't {verb} {lang}, only {', '.join(known)}"
+                    )
+                runners.append(runner)
+            engine, *stand_in = runners
+            served[lang] = Engines(engine, _stand_in(engine, stand_in), self._timing)
+        return served
 
     def close(self) -> None:
         for task in self._tasks:
@@ -294,7 +291,7 @@ class Speech:
         elif (stt := self._stt.get(lang)) is None:
             raise HubError("unsupported", f"no STT engine hears {lang!r}")
         assert self._vad is not None  # the config checked
-        return Ears(self._vad, self._turn, stt, self._executors)
+        return Ears(self._vad, self._turn, stt)
 
     def _say(
         self,
@@ -338,7 +335,7 @@ class Speech:
             self._more(say)
 
     def _engine_voice(self, voice: VoiceConfig) -> EngineVoice:
-        return EngineVoice(self._tts[voice.lang], voice.engine_voice)
+        return EngineVoice(self._tts[voice.lang], voice.engine_voice, voice.fallback_voice)
 
     def _run(
         self, session: Session, device: DeviceRecord, capability: Capability, replace: bool
@@ -355,9 +352,7 @@ class Speech:
             elif run.draining:
                 run.followed()
                 after = run
-        run = self._runs[key] = Run(
-            self._config, self._control, self._executors[Tts], session, device, capability, after
-        )
+        run = self._runs[key] = Run(self._config, self._control, session, device, capability, after)
         task = asyncio.create_task(run.speak())
         self._tasks.add(task)
 
@@ -385,8 +380,9 @@ class Speech:
             return self._defaults[lang]
         return None
 
-    async def _load[E: Engine](self, name: str, role: type[E]) -> E:
-        """Make engine `name` on `role`'s thread, and warm it up there."""
+    async def _load[E: Engine](self, name: str, role: type[E]) -> Runner[E]:
+        """Make engine `name` on `role`'s thread, or on threads of its own if it's a cloud
+        engine, and warm it up there."""
         config = self._config.engines[name]
         module, _, qualname = config.cls.partition(":")
         try:
@@ -395,10 +391,12 @@ class Speech:
             raise ConfigError(f"speech engine {name!r}: can't import {config.cls}: {e}") from e
         if not isinstance(cls, type) or not issubclass(cls, role):
             raise ConfigError(f"speech engine {name!r}: {config.cls} isn't a {role.__name__}")
-        executor = self._executors.get(role)
+        key = name if cls.cloud else role
+        executor = self._executors.get(key)
         if executor is None:
-            executor = self._executors[role] = ThreadPoolExecutor(
-                1, thread_name_prefix=f"speech-{role.__name__.lower()}"
+            executor = self._executors[key] = ThreadPoolExecutor(
+                THREADS if cls.cloud else 1,
+                thread_name_prefix=f"speech-{name if cls.cloud else role.__name__.lower()}",
             )
         loop = asyncio.get_running_loop()
         try:
@@ -406,7 +404,45 @@ class Speech:
             await loop.run_in_executor(executor, engine.warm_up)
         except Exception as e:
             raise ConfigError(f"speech engine {name!r}: {e}") from e
-        return engine
+        return Runner(name, engine, executor)
+
+
+def _listening[E: Engine](runner: Runner[E]) -> Runner[E]:
+    """An engine that takes the devices' audio as it is. Raises `ConfigError`."""
+    if runner.engine.rate != FORMAT.rate:
+        raise ConfigError(
+            f"speech engine {runner.name!r} hears at {runner.engine.rate} Hz: the hub listens at "
+            f"{FORMAT.rate} Hz only"
+        )
+    return runner
+
+
+def _stand_in[E: Engine](engine: Runner[E], stand_in: list[Runner[E]]) -> Runner[E] | None:
+    """The local engine that stands in for `engine`, if it's a cloud engine; None if it's a
+    local one. Raises `ConfigError`."""
+    if not engine.engine.cloud:
+        if stand_in:
+            raise ConfigError(
+                f"speech engine {engine.name!r} isn't a cloud engine: it needs no stand-in"
+            )
+        return None
+    if not stand_in:
+        raise ConfigError(
+            f"speech engine {engine.name!r} is a cloud engine: a local one must stand in for it"
+        )
+    [local] = stand_in
+    if local.engine.cloud:
+        raise ConfigError(f"speech engine {local.name!r} is a cloud engine: it can't stand in")
+    return local
+
+
+def _check_voice(voice: VoiceConfig, tts: Runner[Tts], name: str, key: str = "") -> None:
+    """Raises `ConfigError` if `tts` has no voice `name` for `voice`, as its `key` says."""
+    if tts.engine.voices is not None and name not in tts.engine.voices:
+        raise ConfigError(
+            f"Voice {voice.id!r}: speech engine {tts.name!r} has no voice {name!r}"
+            + (f": set {key}" if key else "")
+        )
 
 
 def _retrieve(done: asyncio.Future[JsonObject]) -> None:

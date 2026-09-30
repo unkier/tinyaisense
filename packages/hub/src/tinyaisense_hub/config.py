@@ -66,6 +66,11 @@ class Timing:
     a `double_click`."""
     long_press_ms: int = 1000
     """A button held down this long is a `long_press`."""
+    cloud_first_byte_ms: int = 1000
+    """A cloud speech engine that gives nothing this soon has failed: a local one stands in."""
+    cloud_skip_ms: int = 60000
+    """After a few failures in a row (`speech.cloud.FAILURES`), a cloud speech engine is skipped
+    for this long."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -86,9 +91,23 @@ class VoiceConfig:
     name: str
     engine_voice: str = ""
     """The TTS engine's own name for the voice: the `id` if left empty."""
+    fallback_voice: str = ""
+    """The name for it of the engine that stands in when a cloud TTS engine fails: the
+    `engine_voice` if left empty."""
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "engine_voice", self.engine_voice or self.id)
+        object.__setattr__(self, "fallback_voice", self.fallback_voice or self.engine_voice)
+
+
+type EngineNames = str | tuple[str, str]
+"""What serves a role in a language: an engine, by name; or a cloud engine and the local one
+that stands in when it fails."""
+
+
+def engine_names(names: EngineNames) -> tuple[str, ...]:
+    """The engine, or the cloud engine and its stand-in."""
+    return (names,) if isinstance(names, str) else names
 
 
 @dataclass(frozen=True, slots=True)
@@ -98,9 +117,9 @@ class SpeechConfig:
 
     engines: dict[str, EngineConfig] = field(default_factory=dict[str, EngineConfig])
     """By a name of the owner's choosing, which the roles refer to."""
-    tts: dict[str, str] = field(default_factory=dict[str, str])
+    tts: dict[str, EngineNames] = field(default_factory=dict[str, EngineNames])
     """Language → the engine that speaks it."""
-    stt: dict[str, str] = field(default_factory=dict[str, str])
+    stt: dict[str, EngineNames] = field(default_factory=dict[str, EngineNames])
     """Language → the engine that hears it."""
     vad: str | None = None
     """The engine that tells speech from silence. Listening needs one."""
@@ -119,12 +138,16 @@ class SpeechConfig:
 
     def check(self) -> None:
         """Raises `ConfigError` if the engines, languages and Voices don't hold together."""
-        roles = [(f"tts.{lang}", name) for lang, name in self.tts.items()]
-        roles += [(f"stt.{lang}", name) for lang, name in self.stt.items()]
+        roles = [(f"tts.{lang}", engines) for lang, engines in self.tts.items()]
+        roles += [(f"stt.{lang}", engines) for lang, engines in self.stt.items()]
         roles += [(role, name) for role, name in (("vad", self.vad), ("turn", self.turn)) if name]
-        for role, name in roles:
-            if name not in self.engines:
-                raise ConfigError(f"speech.{role}: no engine {name!r} in [speech.engines]")
+        for role, engines in roles:
+            names = engine_names(engines)
+            if len(names) == 2 and names[0] == names[1]:
+                raise ConfigError(f"speech.{role}: engine {names[0]!r} can't stand in for itself")
+            for name in names:
+                if name not in self.engines:
+                    raise ConfigError(f"speech.{role}: no engine {name!r} in [speech.engines]")
         if self.stt and self.vad is None:
             raise ConfigError("speech.stt needs a speech.vad engine, to tell speech from silence")
         ids: set[str] = set()
@@ -221,11 +244,15 @@ speaker_latency_ms = {speech.speaker_latency_ms}
     ]
     if speech.tts:
         blocks.append(
-            "# The engine that speaks each language.\n[speech.tts]\n" + _toml_lines(speech.tts)
+            "# The engine that speaks each language: or a cloud engine and the local one that "
+            'stands in\n# when it fails, e.g. ru = ["polza_tts", "silero_tts"].\n[speech.tts]\n'
+            + _toml_lines(speech.tts)
         )
     if speech.stt:
         blocks.append(
-            "# The engine that hears each language.\n[speech.stt]\n" + _toml_lines(speech.stt)
+            "# The engine that hears each language: or a cloud engine and the local one that "
+            'stands in\n# when it fails, e.g. ru = ["polza_stt", "parakeet"].\n[speech.stt]\n'
+            + _toml_lines(speech.stt)
         )
     engines = [
         f'[speech.engines.{name}]\nclass = "{engine.cls}"\n'
@@ -241,9 +268,22 @@ speaker_latency_ms = {speech.speaker_latency_ms}
         )
     blocks += engines
     blocks.append("""\
+# The polza.ai cloud engines need the hub's [polza] extra, and the API key in env
+# POLZA_API_KEY. They take the `model` to use, e.g. "openai/gpt-4o-mini-tts", and `options`
+# for each request, e.g. { speed = 1.2 }. A cloud engine needs a local one to stand in for it
+# when it fails, or gives nothing within timing.cloud_first_byte_ms: see [speech.tts]. E.g.:
+#
+# [speech.engines.polza_tts]
+# class = "tinyaisense_hub.speech.polza:PolzaTts"
+#
+# [speech.engines.polza_stt]
+# class = "tinyaisense_hub.speech.polza:PolzaStt"
+""")
+    blocks.append("""\
 # The Voices: agents pick one by `id`. The first of each language is its default, and
-# `engine_voice` is the TTS engine's own name for it, if not the `id`. Silero also speaks
-# Russian as baya, kseniya, aidar and eugene. For example:
+# `engine_voice` is the TTS engine's own name for it, if not the `id`. `fallback_voice` is the
+# stand-in's name for it, if not the `engine_voice`. Silero also speaks Russian as baya,
+# kseniya, aidar and eugene; polza.ai as OpenAI's alloy, nova and more. For example:
 #
 # [[speech.voices]]
 # id = "aidar"
@@ -252,7 +292,10 @@ speaker_latency_ms = {speech.speaker_latency_ms}
 """)
     blocks += [
         "[[speech.voices]]\n"
-        + _toml_lines({"id": v.id, "lang": v.lang, "name": v.name, "engine_voice": v.engine_voice})
+        + _toml_lines(
+            {"id": v.id, "lang": v.lang, "name": v.name, "engine_voice": v.engine_voice}
+            | ({"fallback_voice": v.fallback_voice} if v.fallback_voice != v.engine_voice else {})
+        )
         for v in speech.voices
     ]
     return "\n".join(blocks)
@@ -275,7 +318,7 @@ def _toml(value: object) -> str:
             return repr(value)
         case str():
             return json.dumps(value, ensure_ascii=False)
-        case list():
+        case list() | tuple():
             return "[" + ", ".join(map(_toml, cast(list[object], value))) + "]"
         case dict():
             table = cast(dict[str, object], value).items()
@@ -322,8 +365,8 @@ def _speech(table: _Table) -> SpeechConfig:
     defaults = SpeechConfig()
     speech = SpeechConfig(
         engines={name: _engine(engines.table(name)) for name in engines.names()},
-        tts={lang: tts.string(lang) for lang in tts.names()},
-        stt={lang: stt.string(lang) for lang in stt.names()},
+        tts={lang: tts.engines(lang) for lang in tts.names()},
+        stt={lang: stt.engines(lang) for lang in stt.names()},
         vad=table.optional_string("vad"),
         turn=table.optional_string("turn"),
         voices=tuple(_voice(voice) for voice in table.tables("voices")),
@@ -349,6 +392,7 @@ def _voice(table: _Table) -> VoiceConfig:
         table.string("lang"),
         table.string("name"),
         table.string("engine_voice", ""),
+        table.string("fallback_voice", ""),
     )
     table.check_unknown()
     return voice
@@ -455,6 +499,19 @@ class _Table:
         if not isinstance(value, str) or not value:
             raise ConfigError(f"{self._key(key)} must be a non-empty string")
         return value
+
+    def engines(self, key: str) -> EngineNames:
+        """An engine's name, or a cloud engine's and its stand-in's."""
+        match self._get(key):
+            case str(name) if name:
+                return name
+            case [str(cloud), str(stand_in)] if cloud and stand_in:
+                return cloud, stand_in
+            case _:
+                raise ConfigError(
+                    f"{self._key(key)} must be an engine's name, or a cloud engine's and its "
+                    "stand-in's"
+                )
 
     def optional_string(self, key: str) -> str | None:
         """A non-empty string, or None if it's left out."""

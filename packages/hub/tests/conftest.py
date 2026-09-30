@@ -10,6 +10,8 @@ from tinyaisense_hub import Config, Hub, OwnerClient, SpeechConfig, Timing
 from tinyaisense_sim import Simulator
 from tinyaisense_sim.pytest_plugin import SimulatorFactory
 
+from .fake_polza import KEY, FakePolza, serve
+
 FAST_TIMING = Timing(
     hello_timeout_ms=300,
     ping_interval_ms=100,
@@ -48,6 +50,13 @@ def no_proxy(monkeypatch: pytest.MonkeyPatch) -> None:
     """Agents connect straight to the hub, whatever proxy this machine has."""
     for name in ("no_proxy", "NO_PROXY"):
         monkeypatch.setenv(name, "*")
+
+
+@pytest.fixture
+def polza(monkeypatch: pytest.MonkeyPatch) -> Iterator[FakePolza]:
+    """A fake polza.ai, and its key in env `POLZA_API_KEY`."""
+    monkeypatch.setenv("POLZA_API_KEY", KEY)
+    yield from serve(FakePolza())
 
 
 @pytest.fixture

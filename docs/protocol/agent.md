@@ -231,6 +231,8 @@ One binary WebSocket frame is one audio frame, all integers little-endian:
 
 The hub turns text into speech and speech into text in its own speech layer. Agents pick a **Voice** by id from `voices` and never see engine names.
 
+**Cloud engines.** The owner may have a cloud engine speak or hear a language, always with a local engine to stand in for it. When the cloud engine fails, or gives nothing within 1 s, the local one takes its place for that clause or speech segment, and the result carries `degraded: true` rather than an error. After 3 failures in a row, the hub skips the cloud engine for 60 s.
+
 ### `say`
 
 `say{address, text, voice?, lang?, then_listen?, replace?}` speaks `text` on a speaker and replies when playback ends:
@@ -269,7 +271,7 @@ An **Utterance** is one span of human speech captured from a mic, delivered as a
 
 - `utterance.start{utterance_id, address, trigger, handle?}`. `trigger` is `listen`, `then_listen` or `button`. `handle` names the stream carrying its audio, if the agent opted in to audio.
 - `transcript.partial{utterance_id, text, lang}`: one per speech segment that the STT heard words in, if the agent opted in to transcripts. The Utterance's `lang` is that of its longest such segment.
-- `utterance.end{utterance_id, reason, transcript?, lang?, degraded?, stats}`. `stats` is `{duration_ms, lost}`.
+- `utterance.end{utterance_id, reason, transcript?, lang?, degraded?, stats}`. `stats` is `{duration_ms, lost}`. `degraded` is present and `true` if a local STT engine stood in for a cloud one on any of its segments.
 
 **Opt-in.** `hello{utterances}` sets the Session default, and each `listen` can override it:
 

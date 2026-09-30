@@ -12,7 +12,7 @@ from pathlib import Path
 
 from tinyaisense_wire import JsonObject
 
-from ..config import SpeechConfig
+from ..config import EngineNames, SpeechConfig, engine_names
 from .gates import Gate, percentile
 
 ESCAPE_HATCH = (
@@ -283,17 +283,22 @@ def _read(path: str) -> str | None:
 
 
 def _engines(speech: SpeechConfig) -> dict[str, str]:
-    """Each role's engine, by its name and class."""
+    """Each role's engine, by its name and class, and its stand-in if it's a cloud engine."""
 
     def engine(name: str) -> str:
         config = speech.engines[name]
         params = ", ".join(f"{k}={v}" for k, v in config.params.items())
         return f"{name} ({config.cls}{f', {params}' if params else ''})"
 
-    roles = {role: name for role, name in (("vad", speech.vad), ("turn", speech.turn)) if name}
-    roles |= {f"stt.{lang}": name for lang, name in speech.stt.items()}
-    roles |= {f"tts.{lang}": name for lang, name in speech.tts.items()}
-    return {role: engine(name) for role, name in roles.items()}
+    roles: dict[str, EngineNames] = {
+        role: name for role, name in (("vad", speech.vad), ("turn", speech.turn)) if name
+    }
+    roles |= {f"stt.{lang}": names for lang, names in speech.stt.items()}
+    roles |= {f"tts.{lang}": names for lang, names in speech.tts.items()}
+    return {
+        role: ", falling back to ".join(map(engine, engine_names(names)))
+        for role, names in roles.items()
+    }
 
 
 def _by_lang(samples: Iterable[tuple[str, float]]) -> list[tuple[str, list[float]]]:

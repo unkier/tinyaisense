@@ -4,8 +4,8 @@ share one stream, back to back."""
 import asyncio
 import contextlib
 import logging
+import threading
 from collections.abc import Callable, Iterator
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 
 from tinyaisense_wire import Capability, JsonObject
@@ -19,6 +19,7 @@ from ..session import Session
 from ..speaker import SpeakerStream
 from ..state import DeviceRecord
 from ..streams import FORMAT, EndReason, StreamEnd
+from .cloud import Engines, Runner
 from .engines import Tts
 from .text import Clause, Script
 
@@ -30,10 +31,12 @@ _log = logging.getLogger("tinyaisense_hub.speech")
 
 @dataclass(frozen=True, slots=True)
 class EngineVoice:
-    """A Voice, as its engine knows it."""
+    """A Voice, as its engines know it."""
 
-    engine: Tts
+    engines: Engines[Tts]
     name: str
+    fallback: str
+    """The stand-in's name for it."""
 
 
 @dataclass(eq=False)
@@ -63,6 +66,8 @@ class Say:
     then: Callable[[], JsonObject] | None = None
     """What it does if its stream drains after it, with no `say` following: `then_listen`.
     Returns what its result adds."""
+    degraded: bool = False
+    """Whether a local engine stood in for a cloud one on any of its clauses."""
 
     def finish(self, reason: EndReason, played: int) -> None:
         """Set its result, given why the stream ended, or `drained` for a `say` another
@@ -87,6 +92,8 @@ class Say:
             "interrupted": reason != "drained" or heard < len(clauses),
             "heard_text": text[: clauses[heard - 1].end].strip() if heard else "",
         }
+        if self.degraded:
+            result["degraded"] = True
         if drained and self.then is not None:
             result |= self.then()
         self.done.set_result(result)
@@ -115,7 +122,6 @@ class Run:
         self,
         config: SpeechConfig,
         control: Control,
-        executor: ThreadPoolExecutor,
         session: Session,
         device: DeviceRecord,
         capability: Capability,
@@ -129,7 +135,6 @@ class Run:
         """Why its stream ended; `disconnected` if it never started."""
         self._config = config
         self._control = control
-        self._executor = executor
         self._device = device
         self._capability = capability
         self._after = after
@@ -231,9 +236,8 @@ class Run:
         is synthesized."""
         say.start = self._fed
         while (clause := await _clause(say, len(say.ends))) is not None:
-            voice = say.voice
-            assert voice is not None
-            synthesis = _Synthesis(self._executor, voice.engine, clause.text, voice.name)
+            assert say.voice is not None
+            synthesis = _Synthesis(say.voice, clause.text)
             try:
                 while not self._cut:
                     try:
@@ -242,6 +246,7 @@ class Run:
                         _log.exception("%s: the TTS failed on %r", say.address, clause.text)
                         say.end = self._fed
                         return True
+                    say.degraded |= synthesis.degraded
                     if pcm is None:
                         break
                     stream = await starting
@@ -316,35 +321,72 @@ async def _clause(say: Say, index: int) -> Clause | None:
 
 
 class _Synthesis:
-    """A text being synthesized on the TTS thread, a piece at a time, and resampled there to
-    the device's rate. The resampler lets go of the end of the text's audio once it's all
-    made: then the next text starts afresh."""
+    """A clause being synthesized in a Voice: by its engine, or by the stand-in if that's a
+    cloud engine that fails before its first piece of audio. Then it's `degraded`."""
 
-    def __init__(self, executor: ThreadPoolExecutor, engine: Tts, text: str, voice: str) -> None:
-        self._executor = executor
-        self._engine = engine
-        self._text = text
+    def __init__(self, voice: EngineVoice, text: str) -> None:
         self._voice = voice
-        self._pieces: Iterator[bytes] | None = None
-        self._resampler: Resampler | SoxrResampler | None = None
-        """From the engine's rate; None if it's the device's, or once flushed."""
-        if engine.rate != FORMAT.rate:
-            self._resampler = resampler_for(engine.rate, FORMAT.rate)
+        self._text = text
+        self._speech: _Speech | None = None
+        """Once the engine that speaks it has given its first piece."""
+        self.degraded = False
+        """Whether the stand-in speaks it."""
 
     async def next(self) -> bytes | None:
         """The next piece of audio, at the device's rate; None once there's no more."""
-        loop = asyncio.get_running_loop()
+        if self._speech is not None:
+            return await self._speech.next()
+        (self._speech, pcm), self.degraded = await self._voice.engines.call(self._first)
+        return pcm
+
+    async def _first(self, runner: Runner[Tts], stand_in: bool) -> tuple[_Speech, bytes | None]:
+        """The clause's speech by `runner`'s engine, the `stand_in` or not, and its first
+        piece."""
+        voice = self._voice
+        speech = _Speech(runner, self._text, voice.fallback if stand_in else voice.name)
+        try:
+            return speech, await speech.next()
+        except BaseException:
+            speech.close()
+            raise
+
+    def close(self) -> None:
+        """Stop it, if it has started."""
+        if self._speech is not None:
+            self._speech.close()
+
+
+class _Speech:
+    """A text being synthesized by one engine on its thread, a piece at a time, and resampled
+    there to the device's rate. The resampler lets go of the end of the text's audio once it's
+    all made: then the next text starts afresh. A cloud engine has several threads: a piece it
+    was given up on may still be being made on one when it's closed on another."""
+
+    def __init__(self, runner: Runner[Tts], text: str, voice: str) -> None:
+        self._runner = runner
+        self._text = text
+        self._voice = voice
+        self._pieces: Iterator[bytes] | None = None
+        self._making = threading.Lock()
+        """Held on the engine's thread while it makes a piece, or stops."""
+        self._resampler: Resampler | SoxrResampler | None = None
+        """From the engine's rate; None if it's the device's, or once flushed."""
+        if runner.engine.rate != FORMAT.rate:
+            self._resampler = resampler_for(runner.engine.rate, FORMAT.rate)
+
+    async def next(self) -> bytes | None:
+        """The next piece of audio, at the device's rate; None once there's no more."""
         pieces = self._pieces
         if pieces is None:
-            pieces = await loop.run_in_executor(
-                self._executor, lambda: iter(self._engine.synthesize(self._text, self._voice))
+            pieces = self._pieces = await self._runner.run(
+                lambda tts: iter(tts.synthesize(self._text, self._voice))
             )
-            self._pieces = pieces
-        return await loop.run_in_executor(self._executor, self._next, pieces)
+        return await self._runner.run(lambda _: self._next(pieces))
 
     def _next(self, pieces: Iterator[bytes]) -> bytes | None:
-        """On the TTS thread."""
-        pcm = next(pieces, None)
+        """On the engine's thread."""
+        with self._making:
+            pcm = next(pieces, None)
         if self._resampler is None:
             return pcm
         if pcm is None:
@@ -353,8 +395,13 @@ class _Synthesis:
         return self._resampler.process(pcm)
 
     def close(self) -> None:
-        """Stop it, on the TTS thread once that's free: engines only ever run there."""
+        """Stop it, on the engine's thread once that's free: engines only ever run there."""
         close = getattr(self._pieces, "close", None)
         if close is not None:
             with contextlib.suppress(RuntimeError):  # the hub is shutting down
-                self._executor.submit(close)
+                self._runner.thread.submit(self._stop, close)
+
+    def _stop(self, close: Callable[[], object]) -> None:
+        """On the engine's thread, once it has made the piece it's making."""
+        with self._making:
+            close()

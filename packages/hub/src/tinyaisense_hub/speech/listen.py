@@ -9,8 +9,7 @@ holds the button, only the release ends it.
 import asyncio
 import logging
 from collections import deque
-from collections.abc import Coroutine, Mapping
-from concurrent.futures import ThreadPoolExecutor
+from collections.abc import Coroutine
 from dataclasses import dataclass
 from typing import Any, Literal
 
@@ -25,7 +24,8 @@ from ..mic import Listener, MicStream
 from ..session import Session, UtteranceOptIn
 from ..state import DeviceRecord
 from ..streams import FORMAT, StreamEnd
-from .engines import Engine, Stt, Transcript, Turn, Vad
+from .cloud import Engines, Runner
+from .engines import Stt, Transcript, Turn, Vad
 from .listening import End, EndReason, Hold, Listening, Segment, Stop, TurnVerdict, Window
 
 type Trigger = Literal["listen", "then_listen", "button"]
@@ -47,12 +47,11 @@ _log = logging.getLogger("tinyaisense_hub.speech")
 
 @dataclass(frozen=True, slots=True)
 class Ears:
-    """The engines a listen hears with, and the threads they run on."""
+    """The engines a listen hears with, on their threads."""
 
-    vad: Vad
-    turn: Turn | None
-    stt: Stt
-    executors: Mapping[type[Engine], ThreadPoolExecutor]
+    vad: Runner[Vad]
+    turn: Runner[Turn] | None
+    stt: Engines[Stt]
 
 
 class Listen:
@@ -107,6 +106,8 @@ class Listen:
         """The VAD's ratings, in the order of the audio, as they come."""
         self._segments: list[tuple[int, asyncio.Future[Transcript | None]]] = []
         """Each segment's length in samples, and its transcript to come."""
+        self._degraded = False
+        """Whether a local STT engine stood in for a cloud one on any segment."""
         self._tasks: set[asyncio.Future[None]] = set()
 
     def listener(self) -> Listener:
@@ -168,7 +169,7 @@ class Listen:
         if self.handle is not None:
             params["handle"] = self.handle
         self.session.notify("utterance.start", params)
-        window = 0 if self._ears is None else self._ears.vad.window
+        window = 0 if self._ears is None else self._ears.vad.engine.window
         self._core = Listening(now_us(), self._timing, window=window)
         if self._held:
             self._run(Hold())
@@ -180,19 +181,20 @@ class Listen:
         if self._ears is None:
             return
         self._audio += pcm
-        window = self._ears.vad.window * _SAMPLE
+        vad = self._ears.vad
+        window = vad.engine.window * _SAMPLE
         loop = asyncio.get_running_loop()
         while len(self._audio) - self._unrated >= window:
             chunk = bytes(self._audio[self._unrated : self._unrated + window])
             self._unrated += window
-            rating = loop.run_in_executor(self._ears.executors[Vad], self._rate, chunk)
+            rating = loop.run_in_executor(vad.thread, self._rate, chunk)
             rating.add_done_callback(self._rating)
             self._rated.append(rating)
 
     def _rate(self, pcm: bytes) -> float:
         """On the VAD's thread."""
         assert self._ears is not None
-        vad = self._ears.vad
+        vad = self._ears.vad.engine
         if self._vad_state is None:
             self._vad_state = vad.new_state()
         return vad.probability(self._vad_state, pcm)
@@ -249,11 +251,14 @@ class Listen:
         if not self._utterances.transcript:
             return None
         assert self._ears is not None
-        loop = asyncio.get_running_loop()
+        lang = self._lang
+
+        async def transcribe(stt: Runner[Stt], _: bool) -> Transcript:
+            return await stt.run(lambda engine: engine.transcribe(pcm, lang))
+
         try:
-            transcript = await loop.run_in_executor(
-                self._ears.executors[Stt], self._ears.stt.transcribe, pcm, self._lang
-            )
+            transcript, degraded = await self._ears.stt.call(transcribe)
+            self._degraded |= degraded
         except Exception:
             _log.exception("%s: the STT failed", self._address)
             transcript = None
@@ -270,9 +275,8 @@ class Listen:
         assert self._ears is not None
         turn = self._ears.turn
         assert turn is not None
-        loop = asyncio.get_running_loop()
         try:
-            complete = await loop.run_in_executor(self._ears.executors[Turn], turn.complete, pcm)
+            complete = await turn.run(lambda engine: engine.complete(pcm))
         except Exception:
             _log.exception("%s: the end-of-turn model failed", self._address)
             return
@@ -313,6 +317,8 @@ class Listen:
             result["transcript"] = " ".join(t.text for _, t in transcripts)
             if transcripts:
                 result["lang"] = max(transcripts, key=lambda length_t: length_t[0])[1].lang
+        if self._degraded:
+            result["degraded"] = True
         result["stats"] = {"duration_ms": duration_ms, "lost": lost}
         return result
 

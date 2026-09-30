@@ -67,6 +67,8 @@ def test_init_writes_a_config_with_a_random_agent_token(
         "click_ms": 250,
         "double_click_ms": 300,
         "long_press_ms": 1000,
+        "cloud_first_byte_ms": 1000,
+        "cloud_skip_ms": 60000,
     }
     assert config["speech"] == {
         "lang": "en",

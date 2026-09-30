@@ -96,6 +96,14 @@ _Avoid_: Recording, clip, turn
 A named way the hub speaks text aloud in one language, which an agent picks by id. It hides which speech engine, local or cloud, produces the audio.
 _Avoid_: Speaker (that's the actuator), TTS model, engine
 
+**Cloud engine**:
+A speech engine that runs off the hub, behind a web API (e.g. polza.ai). It always has a stand-in.
+_Avoid_: Remote engine, provider
+
+**Stand-in**:
+The local speech engine the hub falls back to when a cloud engine fails or is skipped. Speech it makes or hears in the cloud engine's place is **degraded**.
+_Avoid_: Backup, secondary
+
 **Interrupt**:
 Stopping an agent's running turn because of an Event (e.g. a button press). An adapter running next to the agent does it; the hub only delivers the Event.
 _Avoid_: Barge-in (that's the human cutting off speech), cancel

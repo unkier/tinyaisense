@@ -20,8 +20,8 @@ tinyaisense-hub = "tinyaisense_hub.cli:main"
 [project.optional-dependencies]
 # Local speech engines. torch runs Silero's Russian TTS only.
 local = ["onnxruntime>=1.30", "piper-tts>=1.8", "sherpa-onnx>=1.13.8", "torch>=2.14"]
-# polza.ai cloud speech plugin.
-polza = []
+# The polza.ai cloud speech engines.
+polza = ["httpx>=0.28"]
 # `bench speech`: the Simulator and the SDK drive the hub, and soundfile reads the corpus.
 bench = ["soundfile>=0.13", "tinyaisense", "tinyaisense-sim"]
 

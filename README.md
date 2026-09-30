@@ -19,6 +19,8 @@ uv run tinyaisense-hub forget den
 
 The config `init` writes speaks and listens with the local engines, on the CPU: Silero VAD v6, Smart Turn v3.2 for the end of the turn, Parakeet TDT 0.6B v3 for English and Russian speech to text, and for text to speech Piper `en_US-lessac` in English and Silero v5 in Russian. Its default Voices are `lessac` and `xenia`, and text written in Cyrillic is spoken in Russian. `models fetch` downloads the models they run from pinned URLs and checks each file's sha256; the hub refuses to start while any is missing. The `[local]` extra takes torch, for Silero, from PyTorch's CPU-only index. Silero's TTS models are licensed CC BY-NC 4.0, for non-commercial use only.
 
+A cloud engine can serve a language too, always with a local engine to stand in for it: the `[polza]` extra has polza.ai's TTS and STT, which take the API key from env `POLZA_API_KEY`. The config names the two together, e.g. `ru = ["polza_tts", "silero_tts"]` under `[speech.tts]`. When the cloud engine fails, or gives nothing within 1 s (`cloud_first_byte_ms`), the local one speaks or hears in its place, and the agent gets `degraded: true`. After 3 failures in a row, the cloud engine is skipped for 60 s (`cloud_skip_ms`).
+
 The hub advertises itself over mDNS as `_tinyaisense._tcp`, so devices find it without an address; `serve --no-mdns` turns that off. Every timeout, such as the 2 s ping and the 6 s dead Connection, lives in the config's `[timing]`.
 
 The owner commands reach the running hub over a 0600 Unix socket in `$XDG_RUNTIME_DIR/tinyaisense/`, and no other way. Paired devices, with their volumes, live in `$XDG_STATE_HOME/tinyaisense/state.json`.
@@ -35,7 +37,7 @@ The Python packages live in one uv workspace under `packages/`:
 | `tinyaisense` (SDK) | ≥3.11 | `packages/sdk` |
 
 ```sh
-uv sync --all-packages --extra local --extra bench
+uv sync --all-packages --extra local --extra polza --extra bench
 uv run ruff check && uv run ruff format --check
 uv run pyright
 uv run pyright --pythonversion 3.11 packages/wire packages/sdk docs/protocol/vectors
@@ -46,7 +48,7 @@ The device↔hub protocol is specified in [`docs/protocol/`](docs/protocol/READM
 
 Hub integration tests run the real hub in-process on ephemeral ports and drive it with simulated devices from the `simulator` pytest fixture, which `tinyaisense-sim` exports. A simulated device finds the hub over mDNS unless given its address, and `device.faults` breaks its Connection on demand: `rst()`, `close()`, `vanish()` and `stall_reads`. `device.faults.udp_down` and `udp_up` fault the datagrams from and to the hub, seeded from the Simulator's `seed` and live: Bernoulli `loss`, Gilbert–Elliott `bursts`, `delay_ms`, `jitter_ms`, `duplicate`, `drop(stream, seqs)` and `blackout(ms)`; `mic_tx_stall` holds the mic's frames in its 200 ms queue. `device.speaker.captured` records what the speaker played, with when each frame was heard. `device.mic.feed(pcm)` gives the mic something to hear, in real time or with `burst=True` at once, from `tinyaisense_sim.sources`: `silence`, `tone`, `wav` files and raw `pcm`, resampled to 16 kHz mono. `device.button` presses and clicks; while the hub has armed the Reflex (`device.armed`), a press cuts the speaker and opens the mic, as firmware does, and `await device.talk(pcm)` presses, lets the mic hear `pcm` in real time, then releases. The mDNS tests need multicast on some interface, and each uses a service type of its own so that it never finds another hub on the LAN.
 
-Most speech tests use a fake speech plugin, whose TTS speaks text as tones that its STT decodes. The local engines are tested on real English and Russian speech from `packages/hub/tests/audio/`, and what the TTS engines say, Parakeet hears back; those tests are skipped unless the `[local]` extra is installed and `models fetch` has run. The `typings/` stubs give pyright the parts of onnxruntime, sherpa-onnx and soxr that the hub uses, since none of them ships types.
+Most speech tests use a fake speech plugin, whose TTS speaks text as tones that its STT decodes. The local engines are tested on real English and Russian speech from `packages/hub/tests/audio/`, and what the TTS engines say, Parakeet hears back; those tests are skipped unless the `[local]` extra is installed and `models fetch` has run. The polza.ai engines run against a fake polza.ai, `packages/hub/tests/fake_polza.py`, which speaks and hears the fake plugin's tones. The `typings/` stubs give pyright the parts of onnxruntime, sherpa-onnx and soxr that the hub uses, since none of them ships types.
 ### The speech bench
 
 `bench speech` times the latency gates of the model tier on the hub the config makes, run as `serve` runs it, in a process of its own, with simulated Atom Echos for devices and the SDK for the agent. It needs the `[bench]` extra.

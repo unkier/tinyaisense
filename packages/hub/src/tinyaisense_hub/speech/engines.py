@@ -2,8 +2,9 @@
 
 An engine is a Python class that the hub config names by import path, `module:Class`, with
 the keyword arguments to make it with. The hub makes and warms up every engine at start, and
-calls each role's engines on that role's own thread, one call at a time. Audio is s16le mono
-PCM at the engine's `rate`.
+calls each role's engines on that role's own thread, one call at a time; bar a cloud engine,
+which runs on threads of its own, and may be called on several at once. Audio is s16le mono PCM
+at the engine's `rate`.
 """
 
 from abc import ABC, abstractmethod
@@ -20,6 +21,9 @@ class Engine:
     """Its native sample rate: of the audio it takes, or of the audio it gives."""
     partials: bool = False
     """Whether it gives partial results before its final one."""
+    cloud: bool = False
+    """Whether it runs off the hub, behind a web API: then a local engine stands in for it when
+    it fails. Set it as a class attribute: the hub reads it before making the engine."""
 
     def warm_up(self) -> None:
         """Load what it needs, and run once, so that the first real call is fast. Called on
