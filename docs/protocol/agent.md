@@ -75,7 +75,7 @@ A `hello` on a link that already holds a Session gets `invalid_args`.
 - **One at a time.** A `hello` while a Session exists gets `busy`.
 - **Takeover wins.** With `takeover: true`, the hub first ends the old Session with reason `taken_over`, completely, and only then starts the new one and replies. An agent must not reconnect by itself after `taken_over`, or two agents would take the hub from each other forever; the SDK never does.
 - **No resume.** A link that drops takes its Session with it. Reconnecting means a new Session and a fresh `devices`.
-- **Several links, one Session.** An MCP link with `X-Hub-Session` acts within the Session. The agent-API link gets every notification in the Session, whichever link caused it; MCP links get only their tool results.
+- **Several links, one Session.** An MCP link with `X-Hub-Session` acts within the Session; once the Session has ended, its every tool fails with `disconnected`. The agent-API link gets every notification in the Session, whichever link caused it; MCP links get only their tool results, and have no Event queue (`wait_for_event`). A joined call that returns `pending` sends its result to the agent-API link as `mcp.result`. MCP `listen` and `then_listen` return transcripts, whatever the Session's Utterance opt-in.
 - **Arming.** While a Session exists, the hub arms the Reflex on every online device, and devices show the Status `agent`.
 
 ### Ending
@@ -162,6 +162,7 @@ The cancelled request still gets its reply. Cancelling a request that has finish
 | `utterance.start` | `utterance_id`, `address`, `trigger`, `handle?` |
 | `transcript.partial` | `utterance_id`, `text`, `lang` |
 | `utterance.end` | `utterance_id`, `reason`, `transcript?`, `lang?`, `degraded?`, `stats` |
+| `mcp.result` | `pending`, `tool`, and `result` or `error`: of a joined MCP call that returned `pending` |
 | `session.ended` | `reason` |
 
 - **Presence.** `device.online` goes out when a paired device connects, with the Manifest of that Connection, once the hub has brought it up to date (volume, Status, Reflex, LED claim). `device.offline` goes out when the Connection drops. A device the owner renames drops and comes back, so agents see it go offline under the old name and online under the new one.

@@ -60,6 +60,11 @@ class Core:
         idle. Raises `HubError`: `busy` if another Session holds the hub."""
         return self._sessions.mcp_call(identity, sink)
 
+    def joined(self, session_id: str) -> Session:
+        """The Session `session_id`, which an MCP link joins. Raises `HubError`:
+        `disconnected` if it has ended."""
+        return self._sessions.joined(session_id)
+
     def mcp_session(self, identity: str) -> Session | None:
         """The MCP-only Session of the agent `identity`, if it holds the hub."""
         return self._sessions.mcp_session(identity)

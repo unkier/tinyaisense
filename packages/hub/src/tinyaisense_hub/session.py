@@ -36,7 +36,8 @@ _log = logging.getLogger("tinyaisense_hub.session")
 
 class SessionSink(Protocol):
     """Where a Session's notifications and audio go: its agent-API link, or an MCP-only
-    Session's Event queue. No method may block."""
+    Session's Event queue; and what follows them for the MCP links that joined an agent-API
+    Session. No method may block."""
 
     def notify(
         self,
@@ -108,6 +109,9 @@ class Session:
     utterances: UtteranceOptIn
     mcp: McpOnly | None = None
     """Set for a Session that MCP claimed, with no agent-API link."""
+    joined: SessionSink | None = None
+    """What also hears the Session's notifications, but not its audio: the MCP links that
+    joined it, once one has."""
     id: str = field(default_factory=lambda: secrets.token_urlsafe(16))
     since: int = field(default_factory=lambda: _now_ms())
     """Epoch ms."""
@@ -125,7 +129,10 @@ class Session:
     def notify(self, method: str, params: JsonObject, after: int | None = None) -> None:
         """Send a notification, stamped with `t`: now. `after` a stream handle, it follows
         the frames of it queued so far."""
-        self.sink.notify(method, params | {"t": _now_ms()}, after)
+        params = params | {"t": _now_ms()}
+        self.sink.notify(method, params, after)
+        if self.joined is not None:
+            self.joined.notify(method, params)
 
     def device_event(
         self, method: str, params: JsonObject, at: int | None, *, edge: bool = False
@@ -133,8 +140,10 @@ class Session:
         """Send a device Event, stamped with `t`: `at`, when it happened on the hub's
         monotonic clock in µs; now if None. A raw button `edge` counts toward the button
         latency stats."""
-        t = _now_ms() if at is None else epoch_ms(at)
-        self.sink.notify(method, params | {"t": t}, latency_from=at if edge else None)
+        params = params | {"t": _now_ms() if at is None else epoch_ms(at)}
+        self.sink.notify(method, params, latency_from=at if edge else None)
+        if self.joined is not None:
+            self.joined.notify(method, params)
 
     def audio(self, handle: int, index: int, pcm: bytes) -> None:
         self.sink.audio(handle, index, pcm)
@@ -223,6 +232,14 @@ class Sessions:
         finally:
             self.mcp_idle(session, CallEnded())
 
+    def joined(self, session_id: str) -> Session:
+        """The Session `session_id`, which an MCP link joins. Raises `HubError`:
+        `disconnected` if it isn't the one that holds the hub."""
+        session = self.current
+        if session is None or session.id != session_id:
+            raise HubError("disconnected", "the Session it joined has ended")
+        return session
+
     def mcp_session(self, identity: str) -> Session | None:
         """The MCP-only Session of the agent `identity`, if it holds the hub."""
         session = self.current
@@ -297,6 +314,8 @@ class Sessions:
         if reason != "closed":  # else its link is gone
             session.notify("session.ended", {"reason": reason})
         session.sink.ended(reason)
+        if session.joined is not None:
+            session.joined.ended(reason)
 
     def _spawn(self, coroutine: Coroutine[Any, Any, None]) -> None:
         task = asyncio.create_task(coroutine)

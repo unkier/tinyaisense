@@ -25,6 +25,20 @@ The hub advertises itself over mDNS as `_tinyaisense._tcp`, so devices find it w
 
 The owner commands reach the running hub over a 0600 Unix socket in `$XDG_RUNTIME_DIR/tinyaisense/`, and no other way. Paired devices, with their volumes, live in `$XDG_STATE_HOME/tinyaisense/state.json`.
 
+## Agents over MCP
+
+MCP clients reach the hub at `http://<hub>:8421/mcp` over Streamable HTTP, with the agent token as `Authorization: Bearer <token>`. For agents on other machines, add the name they reach the hub by to `allowed_hosts`.
+
+`tinyaisense mcp`, in the SDK's `[mcp]` extra, serves the same tools over stdio. It holds a Session over the agent API, so with `--channel` it pushes push-to-talk Utterances, button gestures and the results of calls that returned `pending` into Claude Code, as channel events that wake it while it's idle:
+
+```sh
+pip install 'tinyaisense[mcp]'
+claude mcp add tinyaisense -e TINYAISENSE_TOKEN=<agent_token> -- tinyaisense mcp --hub http://hub.local:8421 --channel
+claude --dangerously-load-development-channels server:tinyaisense
+```
+
+When another agent holds the hub, the shim exits and says who; `--takeover` takes the hub from it instead. The shim exits too once its Session ends, e.g. taken over.
+
 ## Development
 
 The Python packages live in one uv workspace under `packages/`:

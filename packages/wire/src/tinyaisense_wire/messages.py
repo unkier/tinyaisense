@@ -23,6 +23,8 @@ DEVICE_PORT = 8420
 HTTP_PORT = 8421
 """The hub's HTTP port: `/agent` and `/mcp`."""
 MDNS_SERVICE = "_tinyaisense._tcp.local."
+X_HUB_SESSION = "X-Hub-Session"
+"""The HTTP header by which an MCP link joins an agent-API Session: its id, from `hello`."""
 
 U16_MAX = 2**16 - 1
 U32_MAX = 2**32 - 1

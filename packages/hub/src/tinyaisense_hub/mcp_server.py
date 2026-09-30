@@ -10,12 +10,14 @@ import asyncio
 import json
 import logging
 from collections.abc import AsyncGenerator, Awaitable, Callable, Sequence
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, nullcontext
+from dataclasses import dataclass
 from importlib.metadata import version
 from typing import Any, cast
 
 import mcp.types as types
 from mcp.server import Server, ServerRequestContext
+from mcp.server.context import CallNext, HandlerResult
 from mcp.server.streamable_http import MCP_SESSION_ID_HEADER
 from mcp.server.streamable_http_manager import StreamableHTTPASGIApp, StreamableHTTPSessionManager
 from mcp.server.transport_security import TransportSecuritySettings
@@ -25,41 +27,48 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.routing import Route
 from starlette.types import Message, Receive, Scope, Send
-from tinyaisense_wire import KINDS, JsonObject, Schema, SchemaError, validate
+from tinyaisense_wire import KINDS, X_HUB_SESSION, JsonObject, Schema, SchemaError, validate
 
 from .config import Timing
 from .core import Core
 from .errors import HubError, HubErrorCode
-from .mcp_events import Inbox
-from .session import Session, ThenListen
+from .mcp_events import Follower, Inbox, Joined
+from .session import Session, ThenListen, UtteranceOptIn
 
-INSTRUCTIONS = """\
+_VOICE_LOOP = """\
 tinyaisense lets you hear and speak to a human through small devices near them, e.g. an \
 M5Stack Atom Echo: a mic, a speaker, a button and an LED. The voice loop: `listen` returns \
 what the human said, and `say` answers aloud, returning once it has played. To ask and hear \
 the answer in one call, `say` with `then_listen`. Speak plainly and briefly: no markdown, \
-lists or code. Devices are half-duplex: they don't hear while they speak.
-
+lists or code. Devices are half-duplex: they don't hear while they speak."""
+_EVENTS = """\
 Events: any tool result, errors included, may carry `events`: what happened since your last \
 call, e.g. what the human said by push-to-talk, a button gesture, or a device going online or \
 offline. Each comes once: act on it. With nothing to do, `wait_for_event` waits for the next. \
-A call still running after {block} returns `pending`; its result comes later as an event.
-
+A call still running after {block} returns `pending`; its result comes later as an event."""
+_JOINED_PENDING = """\
+A call still running after {block} returns `pending`; its result comes later, through the \
+program that runs you."""
+_BARGE_IN = """\
 Barge-in: the human can press the button to cut you off. `say` then returns \
 `interrupted: true`, `heard_text`: what they heard before the cut, and `utterance`: what they \
 said while holding the button, push-to-talk; a short click means "stop talking". \
-`set_reflex` with `armed: false` makes a press only an event.
-
+`set_reflex` with `armed: false` makes a press only an event."""
+_ADDRESSES = """\
 Addresses name capabilities `<device>/<capability>`, e.g. `kitchen/speaker`: `devices` lists \
 them, with each one's commands. Leave `address` out when only one online device has what the \
 tool needs. `command` drives the rest, e.g. the LED's `set` and `off`; the LED then shows your \
-colours instead of the device's status, until `led_release`.
-
+colours instead of the device's status, until `led_release`."""
+_CLAIM = """\
 One agent holds the hub at a time. Your first call other than `devices` and `voices` claims \
-it, and it's released after {idle} with no call. `busy` says who holds it and since when.
-"""
+it, and it's released after {idle} with no call. `busy` says who holds it and since when."""
+
+INSTRUCTIONS = "\n\n".join((_VOICE_LOOP, _EVENTS, _BARGE_IN, _ADDRESSES, _CLAIM)) + "\n"
 """The server instructions, given the idle time and the longest a call blocks. The first
 paragraph must stand alone, in 512 chars; the whole stays under 2048."""
+JOINED_INSTRUCTIONS = "\n\n".join((_VOICE_LOOP, _BARGE_IN, _ADDRESSES, _JOINED_PENDING)) + "\n"
+"""The server instructions for an MCP link that joined an agent-API Session, given the longest
+a call blocks: it has no Event queue, and the Session is the agent-API link's."""
 
 _ADDRESS = {
     "type": "string",
@@ -350,6 +359,12 @@ TOOLS = (
     ),
 )
 
+_TRANSCRIPT = UtteranceOptIn(transcript=True, audio=False)
+"""What an Utterance that MCP hears delivers, whatever its Session's opt-in: MCP takes no
+audio."""
+_QUEUE_TOOLS = ("wait_for_event",)
+"""The tools of the Event queue, which MCP links that joined an agent-API Session don't have."""
+
 _log = logging.getLogger("tinyaisense_hub.mcp")
 _WEB = ("http", "https")
 
@@ -366,15 +381,15 @@ class McpServer:
     def __init__(self, core: Core, allowed_hosts: Sequence[str], timing: Timing) -> None:
         self._core = core
         self._timing = timing
+        block = _duration(timing.mcp_max_block_ms)
         server = Server[Any](
             "tinyaisense",
             version=version("tinyaisense-hub"),
-            instructions=INSTRUCTIONS.format(
-                idle=_duration(timing.mcp_idle_ms), block=_duration(timing.mcp_max_block_ms)
-            ),
+            instructions=INSTRUCTIONS.format(idle=_duration(timing.mcp_idle_ms), block=block),
             on_list_tools=self._list_tools,
             on_call_tool=self._call_tool,
         )
+        server.middleware.append(_Instructions(JOINED_INSTRUCTIONS.format(block=block)))
         security = TransportSecuritySettings(
             allowed_hosts=list(allowed_hosts),
             allowed_origins=[f"{scheme}://{host}" for host in allowed_hosts for scheme in _WEB],
@@ -411,32 +426,46 @@ class McpServer:
     async def _list_tools(
         self, ctx: ServerRequestContext[Any], params: types.PaginatedRequestParams | None
     ) -> types.ListToolsResult:
-        return types.ListToolsResult(tools=list(TOOLS))
+        if _caller(ctx).hub_session is None:
+            return types.ListToolsResult(tools=list(TOOLS))
+        tools = [tool for tool in TOOLS if tool.name not in _QUEUE_TOOLS]
+        return types.ListToolsResult(tools=tools)
 
     async def _call_tool(
         self, ctx: ServerRequestContext[Any], params: types.CallToolRequestParams
     ) -> types.CallToolResult:
         name, args = params.name, params.arguments or {}
-        if name not in self._schemas:
+        caller = _caller(ctx)
+        if name not in self._schemas or (caller.hub_session is not None and name in _QUEUE_TOOLS):
             raise MCPError(types.INVALID_PARAMS, f"Unknown tool: {name}")
-        identity = _identity(ctx)
         try:
             validate(self._schemas[name], args, "arguments")
         except SchemaError as e:
-            return self._result(identity, (_error("invalid_args", str(e)), True))
+            return self._result(caller, (_error("invalid_args", str(e)), True))
         if (sessionless := self._sessionless.get(name)) is not None:
-            outcome = await _outcome(name, sessionless(args))
+            outcome = await _outcome(name, self._sessionless_call(caller, sessionless, args))
         else:
-            outcome = await self._blocking(ctx, identity, name, args)
-        return self._result(identity, outcome)
+            outcome = await self._blocking(ctx, caller, name, args)
+        return self._result(caller, outcome)
+
+    async def _sessionless_call(
+        self,
+        caller: _Caller,
+        tool: Callable[[JsonObject], Awaitable[JsonObject]],
+        args: JsonObject,
+    ) -> JsonObject:
+        """Run a tool that needs no Session; on a link that joined one, only while it lasts."""
+        if caller.hub_session is not None:
+            self._core.joined(caller.hub_session)
+        return await tool(args)
 
     async def _blocking(
-        self, ctx: ServerRequestContext[Any], identity: str, name: str, args: JsonObject
+        self, ctx: ServerRequestContext[Any], caller: _Caller, name: str, args: JsonObject
     ) -> _Outcome:
         """Run a tool that claims the hub, for `mcp_max_block_ms` at most: `wait_for_event`
         returns by then by itself. What's left of it runs on, and its result comes as an
         Event. A client cancel stops it."""
-        call = _Call(self._core, identity, name, self._tools[name], args)
+        call = _Call(self._core, caller, name, self._tools[name], args)
         self._calls.add(call.task)
         call.task.add_done_callback(self._calls.discard)
         start = asyncio.get_running_loop().time()
@@ -475,11 +504,14 @@ class McpServer:
                 return False
             await ctx.session.report_progress(round(loop.time() - start, 3))
 
-    def _result(self, identity: str, outcome: _Outcome) -> types.CallToolResult:
-        """A tool result, with the Events queued for the agent `identity`, if it holds the
-        hub."""
+    def _result(self, caller: _Caller, outcome: _Outcome) -> types.CallToolResult:
+        """A tool result, with the Events queued for the `caller`, if its MCP-only Session
+        holds the hub."""
         result, error = outcome
-        if (session := self._core.mcp_session(identity)) is not None:
+        if (
+            caller.hub_session is None
+            and (session := self._core.mcp_session(caller.identity)) is not None
+        ):
             result = result | _inbox(session).take()
         return _result(result, error=error)
 
@@ -495,7 +527,7 @@ class McpServer:
         """With `then_listen`, or cut by the Reflex, it returns what the human said then."""
         then = None
         if args.get("then_listen"):
-            then = ThenListen(raw=False, lang=None, utterances=session.utterances)
+            then = ThenListen(raw=False, lang=None, utterances=_TRANSCRIPT)
         address = self._address(args, "speaker")
         device = self._core.device_of(address)
         result = await self._core.say(
@@ -508,14 +540,14 @@ class McpServer:
             then_listen=then,
             stop=stop,
         )
-        inbox = _inbox(session)
+        follower = _follower(session)
         if (utterance_id := result.pop("utterance_id", None)) is not None:
-            answer = asyncio.ensure_future(inbox.answer(utterance_id))
+            answer = asyncio.ensure_future(follower.answer(utterance_id))
             if not await _before(answer, stop):
                 self._core.utterance_stop(session, utterance_id)
             result["utterance"] = await answer
         elif result["reason"] == "reflex":
-            if (said := await inbox.cut(device, stop)) is not None:
+            if (said := await follower.cut(device, stop)) is not None:
                 result["utterance"] = said
         return result
 
@@ -524,7 +556,7 @@ class McpServer:
             session,
             self._address(args, "mic"),
             lang=args.get("lang"),
-            utterances=session.utterances,
+            utterances=_TRANSCRIPT,
             stop=stop,
         )
         return result
@@ -568,7 +600,9 @@ class _Call:
     """A call of a tool that claims the hub, run as a task of its own: it may run on after
     the MCP request, as a leftover."""
 
-    def __init__(self, core: Core, identity: str, name: str, tool: _Tool, args: JsonObject) -> None:
+    def __init__(
+        self, core: Core, caller: _Caller, name: str, tool: _Tool, args: JsonObject
+    ) -> None:
         self.stop = asyncio.Event()
         """Set when the client cancels it."""
         self.session: Session | None = None
@@ -576,12 +610,18 @@ class _Call:
         self.claimed: asyncio.Future[None] = asyncio.get_running_loop().create_future()
         """Done once it has claimed the hub, or failed to."""
         self._name = name
-        self.task = asyncio.create_task(self._run(core, identity, tool, args))
+        self.task = asyncio.create_task(self._run(core, caller, tool, args))
         self.task.add_done_callback(self._claimed)
 
-    async def _run(self, core: Core, identity: str, tool: _Tool, args: JsonObject) -> _Outcome:
+    async def _run(self, core: Core, caller: _Caller, tool: _Tool, args: JsonObject) -> _Outcome:
         async def run() -> JsonObject:
-            async with core.mcp_call(identity, Inbox) as session:
+            if caller.hub_session is None:
+                claim = core.mcp_call(caller.identity, Inbox)
+            else:
+                claim = nullcontext(core.joined(caller.hub_session))
+            async with claim as session:
+                if caller.hub_session is not None and session.joined is None:
+                    session.joined = Joined(session)  # before it acts, to follow what it does
                 self.session = session
                 self._claimed()
                 return await tool(session, args, self.stop)
@@ -596,12 +636,12 @@ class _Call:
         """It runs on after its request, in the Session it claimed: its result is to come as
         an Event. Returns its `pending` id."""
         assert self.session is not None
-        inbox = _inbox(self.session)
-        pending = inbox.pending()
+        follower = _follower(self.session)
+        pending = follower.pending()
 
         def done(task: asyncio.Task[_Outcome]) -> None:
             if not task.cancelled():
-                inbox.late(pending, self._name, *task.result())
+                follower.late(pending, self._name, *task.result())
 
         self.task.add_done_callback(done)
         return pending
@@ -626,6 +666,22 @@ async def _outcome(name: str, result: Awaitable[JsonObject]) -> _Outcome:
     except Exception:
         _log.exception("MCP tool %s failed", name)
         return _error("failed", "failed; see the hub log"), True
+
+
+class _Instructions:
+    """Gives an MCP link that joined an agent-API Session its own server instructions."""
+
+    def __init__(self, instructions: str) -> None:
+        self._instructions = instructions
+
+    async def __call__(
+        self, ctx: ServerRequestContext[Any, Any], call_next: CallNext
+    ) -> HandlerResult:
+        result = await call_next(ctx)
+        if ctx.method in ("initialize", "server/discover") and _caller(ctx).hub_session is not None:
+            assert isinstance(result, dict)
+            result["instructions"] = self._instructions
+        return result
 
 
 class _Endpoint:
@@ -660,21 +716,39 @@ class _Endpoint:
             await self._core.mcp_release(_mcp_session_identity(mcp_session))
 
 
-def _identity(ctx: ServerRequestContext[Any]) -> str:
-    """The agent behind an MCP request: its MCP session, on the handshake versions; else the
-    name its MCP client gives and its address."""
+@dataclass(frozen=True, slots=True)
+class _Caller:
+    """Who makes an MCP request."""
+
+    identity: str
+    """The agent: its MCP session, on the handshake versions; else the name its MCP client
+    gives and its address."""
+    hub_session: str | None
+    """The agent-API Session its link joined, by id, if any: its `X-Hub-Session`."""
+
+
+def _caller(ctx: ServerRequestContext[Any]) -> _Caller:
     request = cast(Request, ctx.request)
+    hub_session = request.headers.get(X_HUB_SESSION)
     if mcp_session := request.headers.get(MCP_SESSION_ID_HEADER):
-        return _mcp_session_identity(mcp_session)
+        return _Caller(_mcp_session_identity(mcp_session), hub_session)
     client = ctx.session.client_params
     name = client.client_info.name if client is not None else ""
-    return f"agent {name}@{request.client.host if request.client else ''}"
+    return _Caller(f"agent {name}@{request.client.host if request.client else ''}", hub_session)
 
 
 def _inbox(session: Session) -> Inbox:
     """Where an MCP-only Session's notifications go."""
     assert isinstance(session.sink, Inbox)
     return session.sink
+
+
+def _follower(session: Session) -> Follower:
+    """What MCP hears of `session`: an MCP-only one's Event queue; else what its MCP links
+    that joined it hear."""
+    follower = session.sink if session.joined is None else session.joined
+    assert isinstance(follower, Follower)
+    return follower
 
 
 def _mcp_session_identity(mcp_session: str) -> str:

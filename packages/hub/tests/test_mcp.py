@@ -27,7 +27,7 @@ from tinyaisense_hub.speech import fake
 from tinyaisense_hub.speech.layer import Speech
 from tinyaisense_sim import SimDevice, Simulator, sources
 from tinyaisense_sim.led import Light
-from tinyaisense_wire import JsonObject
+from tinyaisense_wire import X_HUB_SESSION, JsonObject
 
 from .conftest import StartHub
 from .test_listen import SPEECH, TIMING, paired, says
@@ -53,11 +53,18 @@ async def hub(start_hub: StartHub, request: pytest.FixtureRequest) -> Hub:
 
 @contextlib.asynccontextmanager
 async def mcp(
-    hub: Hub, version: str, *, token: str = TOKEN, name: str = "test-agent"
+    hub: Hub,
+    version: str,
+    *,
+    token: str = TOKEN,
+    name: str = "test-agent",
+    session: str | None = None,
 ) -> AsyncGenerator[Client]:
-    """An MCP client of `hub`, speaking `version`. Leaving it ends its MCP session, on the
-    handshake versions."""
+    """An MCP client of `hub`, speaking `version`; joined to the agent-API Session `session`,
+    if given. Leaving it ends its MCP session, on the handshake versions."""
     headers = {"Authorization": f"Bearer {token}"}
+    if session is not None:
+        headers[X_HUB_SESSION] = session
     async with (
         create_mcp_http_client(headers) as http,
         Client(

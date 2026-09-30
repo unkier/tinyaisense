@@ -8,6 +8,13 @@ dependencies = [
     "websockets>=16.1",
 ]
 
+[project.optional-dependencies]
+# `tinyaisense mcp`, the MCP stdio shim.
+mcp = ["mcp>=2.2,<3"]
+
+[project.scripts]
+tinyaisense = "tinyaisense.cli:main"
+
 [tool.uv.sources]
 tinyaisense-wire = { workspace = true }
 

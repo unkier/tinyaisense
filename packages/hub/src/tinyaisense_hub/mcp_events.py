@@ -1,18 +1,20 @@
-"""What an MCP-only Session hears: its Event queue, and the Utterances its `say`s return.
+"""What MCP hears of a Session: its Event queue, and the Utterances its `say`s return.
 
-MCP has no way to push notifications, so the Session's notifications land here. Those an
-agent must not miss are queued as Events, which ride on its next tool result. What the human
+MCP has no way to push notifications, so an MCP-only Session's notifications land here. Those
+an agent must not miss are queued as Events, which ride on its next tool result. What the human
 says in answer to a `say`, with `then_listen` or cutting it off with the button, comes back
-with the `say` instead.
+with the `say` instead. An agent-API Session that MCP links joined has no queue: its agent-API
+link gets every notification.
 """
 
 import asyncio
 import time
+from abc import ABC, abstractmethod
 from collections import deque
 
 from tinyaisense_wire import JsonObject
 
-from .session import EndReason
+from .session import EndReason, Session
 
 QUEUE = 100
 """How many Events wait at most: past it, the oldest is dropped."""
@@ -45,16 +47,11 @@ class _Cut:
             self.said.set_result(said)
 
 
-class Inbox:
-    """An MCP-only Session's sink: its Event queue."""
+class Follower(ABC):
+    """What MCP hears of a Session's notifications: it follows the Utterances that `say`s
+    return, and hands what's for the agent besides to `_deliver`."""
 
     def __init__(self) -> None:
-        self._events: deque[JsonObject] = deque(maxlen=QUEUE)
-        self._dropped = 0
-        """Events dropped from the queue since the last delivery."""
-        self._queued = asyncio.Event()
-        """Set while an Event waits, or once the Session has ended."""
-        self._ended = False
         self._last_pending = 0
         self._utterances: dict[int, JsonObject] = {}
         """The `utterance.start` params of each Utterance under way, by id."""
@@ -66,24 +63,6 @@ class Inbox:
         ends."""
         self._opened: dict[int, _Cut] = {}
         """Utterance id → the cut whose press opened it."""
-
-    def take(self) -> JsonObject:
-        """The Events queued, under `events`, each once, and `dropped`: how many were dropped
-        for want of room since the last delivery. Either is left out if there are none."""
-        taken: JsonObject = {}
-        if self._events:
-            taken["events"] = list(self._events)
-            self._events.clear()
-        if self._dropped:
-            taken["dropped"] = self._dropped
-            self._dropped = 0
-        if not self._ended:
-            self._queued.clear()
-        return taken
-
-    async def wait(self) -> None:
-        """Wait until an Event is queued, or the Session ends."""
-        await self._queued.wait()
 
     async def answer(self, utterance_id: int) -> JsonObject:
         """What the human said in the Utterance `utterance_id` that a `then_listen` opened,
@@ -115,11 +94,8 @@ class Inbox:
         return self._last_pending
 
     def late(self, pending: int, tool: str, result: JsonObject, error: bool) -> None:
-        """Queue the result of the call of `tool` that returned `pending`, or its error."""
-        key = "error" if error else "result"
-        self._queue(
-            {"event": "result", "pending": pending, "tool": tool, key: result, "t": _now_ms()}
-        )
+        """Deliver the result of the call of `tool` that returned `pending`, or its error."""
+        self._late({"pending": pending, "tool": tool, "error" if error else "result": result})
 
     # The Session's sink.
 
@@ -134,12 +110,12 @@ class Inbox:
         match method:
             case "device.online" | "device.offline":
                 device: str = params["device"]
-                self._queue({"event": method, "device": device, "t": params["t"]})
+                self._deliver({"event": method, "device": device, "t": params["t"]})
                 cut = self._cuts.get(device)
                 if method == "device.offline" and cut is not None and not cut.opened:
                     self._expire(device, cut)  # no Utterance starts on it now
             case "button.click" | "button.double_click" | "button.long_press":
-                self._queue({"event": method, "address": params["address"], "t": params["t"]})
+                self._deliver({"event": method, "address": params["address"], "t": params["t"]})
             case "say.ended" if params["reason"] == "reflex":
                 self._cut(_device(params["address"]))
             case "utterance.start":
@@ -149,7 +125,7 @@ class Inbox:
             case _:
                 pass  # partials, raw button edges, streams: not for MCP
 
-    def audio(self, handle: int, index: int, pcm: bytes) -> None:
+    def audio(self, handle: int, index: int, pcm: bytes) -> None:  # noqa: B027
         pass  # MCP takes no audio
 
     def audio_ended(self, handle: int) -> int:
@@ -157,8 +133,6 @@ class Inbox:
 
     def ended(self, reason: EndReason) -> None:
         """Its Utterances were delivered first: any a `say` still waits for never started."""
-        self._ended = True
-        self._queued.set()
         for cut in [*self._cuts.values(), *self._opened.values()]:
             cut.end(None)
         for answer in self._answers.values():
@@ -192,7 +166,7 @@ class Inbox:
                 cut.expiry.cancel()
 
     def _utterance_end(self, params: JsonObject) -> None:
-        """Hand what the human said to the `say` that waits for it; or queue it, if it's
+        """Hand what the human said to the `say` that waits for it; or deliver it, if it's
         push-to-talk's final transcript. A click's has nothing heard: its gesture says it."""
         utterance_id: int = params["utterance_id"]
         start = self._utterances.pop(utterance_id, None)
@@ -210,7 +184,7 @@ class Inbox:
                 return
         if start["trigger"] == "button" and params["reason"] != "click":
             event = {"event": "utterance", "address": start["address"]} | said
-            self._queue(event | {"t": params["t"]})
+            self._deliver(event | {"t": params["t"]})
 
     def _answer(self, utterance_id: int) -> asyncio.Future[JsonObject]:
         answer = self._answers.get(utterance_id)
@@ -218,11 +192,76 @@ class Inbox:
             answer = self._answers[utterance_id] = asyncio.get_running_loop().create_future()
         return answer
 
-    def _queue(self, event: JsonObject) -> None:
+    @abstractmethod
+    def _late(self, late: JsonObject) -> None:
+        """A late result for the agent: `pending`, `tool`, and `result` or `error`."""
+
+    @abstractmethod
+    def _deliver(self, event: JsonObject) -> None:
+        """An Event for the agent."""
+
+
+class Inbox(Follower):
+    """An MCP-only Session's sink: its Event queue."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._events: deque[JsonObject] = deque(maxlen=QUEUE)
+        self._dropped = 0
+        """Events dropped from the queue since the last delivery."""
+        self._queued = asyncio.Event()
+        """Set while an Event waits, or once the Session has ended."""
+        self._ended = False
+
+    def take(self) -> JsonObject:
+        """The Events queued, under `events`, each once, and `dropped`: how many were dropped
+        for want of room since the last delivery. Either is left out if there are none."""
+        taken: JsonObject = {}
+        if self._events:
+            taken["events"] = list(self._events)
+            self._events.clear()
+        if self._dropped:
+            taken["dropped"] = self._dropped
+            self._dropped = 0
+        if not self._ended:
+            self._queued.clear()
+        return taken
+
+    async def wait(self) -> None:
+        """Wait until an Event is queued, or the Session ends."""
+        await self._queued.wait()
+
+    def _late(self, late: JsonObject) -> None:
+        """Queue it as a `result` Event."""
+        self._deliver({"event": "result"} | late | {"t": _now_ms()})
+
+    def ended(self, reason: EndReason) -> None:
+        super().ended(reason)
+        self._ended = True
+        self._queued.set()
+
+    def _deliver(self, event: JsonObject) -> None:
+        """Queue it."""
         if len(self._events) == QUEUE:
             self._dropped += 1
         self._events.append(event)
         self._queued.set()
+
+
+class Joined(Follower):
+    """What the MCP links that joined an agent-API Session hear of it. They have no queue:
+    the agent-API link gets every notification, and a late result as `mcp.result`."""
+
+    def __init__(self, session: Session) -> None:
+        super().__init__()
+        self._session = session
+
+    def _late(self, late: JsonObject) -> None:
+        """Notify the Session of it: `mcp.result`."""
+        self._session.notify("mcp.result", late)
+
+    def _deliver(self, event: JsonObject) -> None:
+        pass  # the agent-API link has it
 
 
 def _said(end: JsonObject) -> JsonObject:
