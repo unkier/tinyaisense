@@ -501,12 +501,14 @@ class Registry:
         return [
             {
                 "name": record.name,
-                "online": (conn := self._live.get(record.device_id)) is not None
-                and conn.state == "online",
+                "online": self._is_online(record),
                 "manifest": record.manifest.to_json(),
             }
             for record in sorted(self._records.values(), key=lambda r: r.name)
         ]
+
+    def _is_online(self, record: DeviceRecord) -> bool:
+        return (conn := self._live.get(record.device_id)) is not None and conn.state == "online"
 
     async def approve(self, device: str, name: str | None = None) -> JsonObject:
         """Pair a pending device and welcome it with its new token."""
@@ -619,6 +621,27 @@ class Registry:
                 candidates=candidates,
             )
         return matches[0]
+
+    def only_online(self, kind: str) -> str:
+        """The Address of the one capability of `kind` on an online device.
+
+        Raises `HubError`: `invalid_args` if several are online, with the candidates in
+        `candidates`; `disconnected` if none is; `unknown_address` if no paired device has one.
+        """
+        records = sorted(self._records.values(), key=lambda r: r.name)
+        having = [(r, c) for r in records for c in r.manifest.capabilities if c.kind == kind]
+        online = [f"{r.name}/{c.id}" for r, c in having if self._is_online(r)]
+        if len(online) > 1:
+            raise HubError(
+                "invalid_args",
+                f"several {kind}s are online, name one: {', '.join(online)}",
+                candidates=online,
+            )
+        if not online:
+            if having:
+                raise HubError("disconnected", f"no {kind} is online")
+            raise HubError("unknown_address", f"no paired device has a {kind}")
+        return online[0]
 
     # The handshake, called by DeviceConnection.
 

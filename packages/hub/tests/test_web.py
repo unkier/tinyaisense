@@ -20,6 +20,8 @@ class LazyApp:
         self.disconnected = asyncio.Event()
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] == "lifespan":
+            return  # nothing to start
         assert scope["type"] == "websocket"
         await receive()  # websocket.connect
         await send({"type": "websocket.accept"})

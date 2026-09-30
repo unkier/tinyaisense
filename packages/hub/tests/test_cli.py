@@ -69,7 +69,9 @@ def test_init_writes_a_config_with_a_random_agent_token(
         "long_press_ms": 1000,
         "cloud_first_byte_ms": 1000,
         "cloud_skip_ms": 60000,
+        "mcp_idle_ms": 600000,
     }
+    assert config["allowed_hosts"] == ["127.0.0.1:*", "localhost:*", "[::1]:*"]
     assert config["speech"] == {
         "lang": "en",
         "say_ahead_ms": 3000,
@@ -422,6 +424,22 @@ def test_serve_refuses_a_turn_silence_within_the_segment_silence(
     assert main(["serve"]) == 1
 
     assert "timing.turn_silence_ms must be more than" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("hosts", ['"hub.local:*"', '["hub.local:*", ""]', "[8421]"])
+def test_serve_refuses_allowed_hosts_that_arent_host_names(
+    hosts: str, xdg: dict[str, str], capsys: pytest.CaptureFixture[str]
+) -> None:
+    main(["init"])
+    config = Path(xdg["XDG_CONFIG_HOME"]) / "tinyaisense" / "hub.toml"
+    text = re.sub(
+        r"^allowed_hosts = .*$", f"allowed_hosts = {hosts}", config.read_text(), flags=re.M
+    )
+    config.write_text(replace_speech(text))
+
+    assert main(["serve"]) == 1
+
+    assert "allowed_hosts must be an array of non-empty strings" in capsys.readouterr().err
 
 
 def test_serve_says_when_its_port_is_taken(

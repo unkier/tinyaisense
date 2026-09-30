@@ -5,7 +5,7 @@ description = "tinyaisense agent SDK: asyncio client, OpenAI Agents SDK adapter 
 requires-python = ">=3.11"
 dependencies = [
     "tinyaisense-wire",
-    "websockets>=17.1",
+    "websockets>=16.1",
 ]
 
 [tool.uv.sources]

@@ -139,7 +139,7 @@ class HttpServer:
             ws_per_message_deflate=False,
             ws_ping_interval=self._timing.agent_ping_interval_ms / 1000,
             ws_ping_timeout=self._timing.agent_dead_after_ms / 1000,
-            lifespan="off",
+            lifespan="on",
             log_config=None,
             access_log=False,
             timeout_graceful_shutdown=1,

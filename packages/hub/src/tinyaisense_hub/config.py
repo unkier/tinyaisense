@@ -71,6 +71,8 @@ class Timing:
     cloud_skip_ms: int = 60000
     """After a few failures in a row (`speech.cloud.FAILURES`), a cloud speech engine is skipped
     for this long."""
+    mcp_idle_ms: int = 600_000
+    """An MCP-only Session ends after this long with no tool call running."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -168,12 +170,18 @@ class SpeechConfig:
             raise ConfigError(f"speech.lang: no Voice speaks {self.lang}")
 
 
+LOCAL_HOSTS = ("127.0.0.1:*", "localhost:*", "[::1]:*")
+
+
 @dataclass(frozen=True, slots=True)
 class Config:
     agent_token: str
     device_port: int = DEVICE_PORT
     """TCP and UDP. 0 picks free ports."""
     http_port: int = HTTP_PORT
+    allowed_hosts: tuple[str, ...] = LOCAL_HOSTS
+    """The `Host` headers `/mcp` takes, against DNS rebinding: `host:port`, or `host:*` for
+    any port."""
     timing: Timing = field(default_factory=Timing)
     speech: SpeechConfig = field(default_factory=SpeechConfig)
 
@@ -209,6 +217,11 @@ def render_config(config: Config) -> str:
 
 # Agents authenticate with this token.
 agent_token = "{config.agent_token}"
+
+# The Host headers /mcp takes, against DNS rebinding: "host:port", or "host:*" for any port.
+# Add the names and addresses that agents on other machines reach the hub by, e.g.
+# "hub.local:*" or "192.168.0.10:*".
+allowed_hosts = {_toml(config.allowed_hosts)}
 
 [ports]
 # Device protocol, TCP and UDP.
@@ -340,6 +353,7 @@ def parse_config(text: str) -> Config:
         agent_token=top.string("agent_token"),
         device_port=ports.port("device", DEVICE_PORT),
         http_port=ports.port("http", HTTP_PORT),
+        allowed_hosts=top.strings("allowed_hosts", LOCAL_HOSTS),
         timing=Timing(
             **{f.name: timing.positive_int(f.name, cast(int, f.default)) for f in fields(Timing)}
         ),
@@ -499,6 +513,16 @@ class _Table:
         if not isinstance(value, str) or not value:
             raise ConfigError(f"{self._key(key)} must be a non-empty string")
         return value
+
+    def strings(self, key: str, default: tuple[str, ...]) -> tuple[str, ...]:
+        """An array of non-empty strings, or `default` if it's left out."""
+        value = self._get(key)
+        if value is None:
+            return default
+        items = cast(list[object], value) if isinstance(value, list) else None
+        if items is None or not all(isinstance(item, str) and item for item in items):
+            raise ConfigError(f"{self._key(key)} must be an array of non-empty strings")
+        return tuple(cast(list[str], items))
 
     def engines(self, key: str) -> EngineNames:
         """An engine's name, or a cloud engine's and its stand-in's."""

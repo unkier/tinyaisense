@@ -6,9 +6,10 @@ from pathlib import Path
 from types import TracebackType
 from typing import Self, cast
 
+from starlette.applications import Starlette
 from tinyaisense_wire import MDNS_SERVICE
 
-from .agent_api import agent_app
+from .agent_api import agent_route
 from .config import Config
 from .control import Control
 from .core import Core
@@ -84,11 +85,20 @@ class Hub:
     @property
     def agent_url(self) -> str:
         """The agent API's WebSocket URL, on this machine."""
+        return f"ws://{self._http_host}/agent"
+
+    @property
+    def mcp_url(self) -> str:
+        """The MCP server's URL, on this machine."""
+        return f"http://{self._http_host}/mcp"
+
+    @property
+    def _http_host(self) -> str:
         assert self._http is not None, "the hub isn't running"
         host = self._host or "localhost"
         if ":" in host:
             host = f"[{host}]"  # an IPv6 address
-        return f"ws://{host}:{self._http.address[1]}/agent"
+        return f"{host}:{self._http.address[1]}"
 
     @property
     def owner_socket(self) -> Path:
@@ -127,7 +137,7 @@ class Hub:
             self._udp, datagrams = await loop.create_datagram_endpoint(
                 Datagrams, local_addr=(self._host or "0.0.0.0", port)
             )
-        sessions = Sessions(self._control, self._speech)
+        sessions = Sessions(self._control, self._speech, self.config.timing)
         self._registry = Registry(
             StateStore(self._state_dir),
             udp=self._udp,
@@ -145,8 +155,16 @@ class Hub:
             self._tcp = await loop.create_server(self._registry.connection, sock=sock)
         else:
             self._tcp = await loop.create_server(self._registry.connection, self._host, port)
+        # Here: the MCP SDK takes half a second to import, which the owner commands don't need.
+        from .mcp_server import McpServer
+
+        mcp = McpServer(self._core, self.config.allowed_hosts, self.config.timing.mcp_idle_ms)
+        app = Starlette(
+            routes=[agent_route(self._core, self.config.timing, self.button_latency), mcp.route],
+            lifespan=mcp.run,
+        )
         self._http = HttpServer(
-            agent_app(self._core, self.config.timing, self.button_latency),
+            app,
             host=self._host,
             port=self.config.http_port,
             timing=self.config.timing,

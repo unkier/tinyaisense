@@ -11,6 +11,7 @@ explicit = true
 
 [dependency-groups]
 test = [
+    "openai-agents>=0.22",
     "pytest>=9.0",
     "pytest-asyncio>=1.4",
     "pytest-cov>=7.0",

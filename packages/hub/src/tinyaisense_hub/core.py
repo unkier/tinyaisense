@@ -1,11 +1,12 @@
 """The core facade: the internal seam every front-end talks to.
 
-The agent-facing front-ends (the agent API, and MCP later) only translate between their wire
-and these calls. Behaviour lives here and below.
+The agent-facing front-ends (the agent API and MCP) only translate between their wire and
+these calls. Behaviour lives here and below.
 """
 
 import asyncio
 import secrets
+from contextlib import AbstractAsyncContextManager
 
 from tinyaisense_wire import Capability, JsonObject
 
@@ -42,9 +43,24 @@ class Core:
         utterances: UtteranceOptIn,
     ) -> Session:
         """Claim the hub for an agent. Raises `HubError`: `unauthorized` or `busy`."""
-        if not secrets.compare_digest(token.encode(), self._agent_token):
+        if not self.authorized(token):
             raise HubError("unauthorized", "the agent token doesn't match")
         return await self._sessions.claim(holder, sink, takeover=takeover, utterances=utterances)
+
+    def authorized(self, token: str) -> bool:
+        """Whether `token` is the agent token."""
+        return secrets.compare_digest(token.encode(), self._agent_token)
+
+    def mcp_call(self, identity: str) -> AbstractAsyncContextManager[Session]:
+        """Run a tool call of the agent `identity`, an authorized one, in its MCP-only
+        Session: claimed now if no Session holds the hub, and released once idle. Raises
+        `HubError`: `busy` if another Session holds the hub."""
+        return self._sessions.mcp_call(identity)
+
+    async def mcp_release(self, identity: str) -> None:
+        """The agent `identity` ended its MCP session: so ends its MCP-only Session, if
+        it holds the hub."""
+        await self._sessions.mcp_release(identity)
 
     async def close_session(self, session: Session) -> None:
         """The Session's link closed or went dead."""
@@ -59,6 +75,12 @@ class Core:
 
     def voices(self) -> list[JsonObject]:
         return self._speech.voices()
+
+    def only_online(self, kind: str) -> str:
+        """The Address of the one capability of `kind` on an online device. Raises `HubError`:
+        `invalid_args` with the `candidates` if several are online, `disconnected` if none
+        is, or `unknown_address` if no paired device has one."""
+        return self._registry.only_online(kind)
 
     async def command(
         self, session: Session, address: str, name: str, args: JsonObject

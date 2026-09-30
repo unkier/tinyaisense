@@ -4,13 +4,18 @@ import asyncio
 import logging
 import secrets
 import time
+from collections.abc import AsyncGenerator, Coroutine
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Literal, Protocol
+from typing import TYPE_CHECKING, Any, Literal, Protocol
 
 from tinyaisense_wire import JsonObject
 
-from .alarm import epoch_ms
+from .alarm import Alarm, epoch_ms, now_us
+from .config import Timing
 from .errors import HubError
+from .idle import CallEnded, CallStarted, Idle
+from .keepalive import Tick
 from .streams import Stream
 
 if TYPE_CHECKING:
@@ -20,9 +25,9 @@ if TYPE_CHECKING:
 type Holder = Literal["agent_api", "mcp"]
 """Which front-end claimed the Session."""
 
-type EndReason = Literal["closed", "taken_over", "shutdown"]
-"""Why a Session ended: its link closed or went dead, another agent took over, or the hub
-is shutting down."""
+type EndReason = Literal["closed", "taken_over", "shutdown", "idle"]
+"""Why a Session ended: its link closed or went dead, another agent took over, the hub is
+shutting down, or an MCP-only Session sat idle."""
 
 _MAX_HANDLE = 65535
 
@@ -80,10 +85,29 @@ class ThenListen:
 
 
 @dataclass(eq=False, slots=True)
+class McpOnly:
+    """What an MCP-only Session holds besides: which agent holds it, and the idle timer that
+    releases it."""
+
+    identity: str
+    """The agent that holds it: its MCP session, or its MCP client's name and address."""
+    idle: Idle
+    alarm: Alarm
+    released: bool = False
+    """It went idle: its end is under way, and no call takes it up again."""
+
+    def takes(self, identity: str) -> bool:
+        """Whether a call of the agent `identity` runs in it."""
+        return self.identity == identity and not self.released
+
+
+@dataclass(eq=False, slots=True)
 class Session:
     holder: Holder
     sink: SessionSink
     utterances: UtteranceOptIn
+    mcp: McpOnly | None = None
+    """Set for a Session that MCP claimed, with no agent-API link."""
     id: str = field(default_factory=lambda: secrets.token_urlsafe(16))
     since: int = field(default_factory=lambda: _now_ms())
     """Epoch ms."""
@@ -155,13 +179,15 @@ class SpeechControl(Protocol):
 class Sessions:
     """The Session manager."""
 
-    def __init__(self, control: DeviceControl, speech: SpeechControl) -> None:
+    def __init__(self, control: DeviceControl, speech: SpeechControl, timing: Timing) -> None:
         self.current: Session | None = None
         self._control = control
         self._speech = speech
+        self._idle_after = timing.mcp_idle_ms * 1000
         self._lock = asyncio.Lock()
         """Held while a Session starts or ends, so that a takeover ends the old one first."""
         self._shut_down = False
+        self._tasks: set[asyncio.Task[None]] = set()
 
     async def claim(
         self, holder: Holder, sink: SessionSink, *, takeover: bool, utterances: UtteranceOptIn
@@ -169,21 +195,50 @@ class Sessions:
         """Start a Session. Raises `HubError`: `busy` if one exists and not `takeover`, or
         `failed` once the hub is shutting down."""
         async with self._lock:
-            if self._shut_down:
-                raise HubError("failed", "the hub is shutting down")
-            if (old := self.current) is not None:
-                if not takeover:
-                    raise HubError(
-                        "busy",
-                        f"another agent holds the hub, since {_local_time(old.since)}",
-                        holder=old.holder,
-                        since=old.since,
-                    )
-                await self._end(old, "taken_over")
-            session = self.current = Session(holder, sink, utterances)
-            _log.info("Session %s started (%s)", session.id, holder)
-            self._control.session_started(session)
-            return session
+            await self._free(takeover)
+            return self._start(Session(holder, sink, utterances))
+
+    @asynccontextmanager
+    async def mcp_call(self, identity: str) -> AsyncGenerator[Session]:
+        """Run a tool call of the agent `identity` in its MCP-only Session, which it claims
+        if no Session holds the hub. The Session ends once no call of it has run for
+        `mcp_idle_ms`. Raises `HubError`: `busy` if another Session holds the hub, or `failed`
+        once the hub is shutting down."""
+        async with self._lock:
+            session = self.current
+            if session is None or session.mcp is None or not session.mcp.takes(identity):
+                await self._free(takeover=False)
+                session = Session("mcp", _Unheard(), UtteranceOptIn())
+                session.mcp = McpOnly(
+                    identity,
+                    Idle(after=self._idle_after),
+                    Alarm(lambda now: self.mcp_idle(session, Tick(), now)),
+                )
+                self._start(session)
+        self.mcp_idle(session, CallStarted())
+        try:
+            yield session
+        finally:
+            self.mcp_idle(session, CallEnded())
+
+    def mcp_idle(
+        self, session: Session, input: CallStarted | CallEnded | Tick, now: int | None = None
+    ) -> None:
+        """Run the idle timer of the MCP-only `session`, while it holds the hub."""
+        if self.current is not session or (mcp := session.mcp) is None:
+            return
+        now = now_us() if now is None else now
+        if mcp.idle.handle(input, now):
+            _log.info("Session %s is idle", session.id)
+            mcp.released = True
+            self._spawn(self.end(session, "idle"))
+        mcp.alarm.set(mcp.idle.next_deadline(), now)
+
+    async def mcp_release(self, identity: str) -> None:
+        """End the MCP-only Session of the agent `identity`, if it holds the hub."""
+        session = self.current
+        if session is not None and session.mcp is not None and session.mcp.identity == identity:
+            await self.end(session, "closed")
 
     async def end(self, session: Session, reason: EndReason) -> None:
         """End `session`, if it's still the current one."""
@@ -198,14 +253,68 @@ class Sessions:
             if self.current is not None:
                 await self._end(self.current, "shutdown")
 
+    async def _free(self, takeover: bool) -> None:
+        """Make way for a new Session: end the one that holds the hub, if `takeover` or it went
+        idle. Raises
+        `HubError`: `busy` if one holds it and not `takeover`, or `failed` once the hub is
+        shutting down."""
+        if self._shut_down:
+            raise HubError("failed", "the hub is shutting down")
+        if (old := self.current) is not None and old.mcp is not None and old.mcp.released:
+            await self._end(old, "idle")  # ahead of its own end
+        elif old is not None:
+            if not takeover:
+                raise HubError(
+                    "busy",
+                    f"another agent holds the hub, since {_local_time(old.since)}",
+                    holder=old.holder,
+                    since=old.since,
+                )
+            await self._end(old, "taken_over")
+
+    def _start(self, session: Session) -> Session:
+        self.current = session
+        _log.info("Session %s started (%s)", session.id, session.holder)
+        self._control.session_started(session)
+        return session
+
     async def _end(self, session: Session, reason: EndReason) -> None:
         self.current = None
+        if session.mcp is not None:
+            session.mcp.alarm.cancel()
         _log.info("Session %s ended: %s", session.id, reason)
         await self._control.session_ended(session)
         await self._speech.session_ended(session)
         if reason != "closed":  # else its link is gone
             session.notify("session.ended", {"reason": reason})
         session.sink.ended(reason)
+
+    def _spawn(self, coroutine: Coroutine[Any, Any, None]) -> None:
+        task = asyncio.create_task(coroutine)
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+
+
+class _Unheard:
+    """The sink of an MCP-only Session: MCP has no way to deliver its notifications."""
+
+    def notify(
+        self,
+        method: str,
+        params: JsonObject,
+        after: int | None = None,
+        latency_from: int | None = None,
+    ) -> None:
+        pass
+
+    def audio(self, handle: int, index: int, pcm: bytes) -> None:
+        pass
+
+    def audio_ended(self, handle: int) -> int:
+        return 0
+
+    def ended(self, reason: EndReason) -> None:
+        pass
 
 
 def _now_ms() -> int:

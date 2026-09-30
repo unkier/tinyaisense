@@ -13,7 +13,6 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, replace
 from typing import Any, cast
 
-from starlette.applications import Starlette
 from starlette.routing import WebSocketRoute
 from starlette.websockets import WebSocket, WebSocketDisconnect
 from tinyaisense_wire import (
@@ -169,14 +168,14 @@ _CANCEL: Schema = {
 _log = logging.getLogger("tinyaisense_hub.agent_api")
 
 
-def agent_app(core: Core, timing: Timing, button_latency: Latency) -> Starlette:
-    """`button_latency` takes the time from each raw button edge on a device to its write on
-    an agent's socket."""
+def agent_route(core: Core, timing: Timing, button_latency: Latency) -> WebSocketRoute:
+    """The `/agent` endpoint. `button_latency` takes the time from each raw button edge on a
+    device to its write on an agent's socket."""
 
     async def agent(websocket: WebSocket) -> None:
         await AgentLink(websocket, core, timing, button_latency).run()
 
-    return Starlette(routes=[WebSocketRoute("/agent", agent)])
+    return WebSocketRoute("/agent", agent)
 
 
 @dataclass(frozen=True, slots=True)

@@ -19,6 +19,7 @@ from tinyaisense_hub.state import StateStore
 from tinyaisense_sim import SimDevice, Simulator
 from tinyaisense_wire import JsonObject
 from websockets.asyncio.client import ClientConnection
+from websockets.asyncio.connection import Connection
 
 from .conftest import FAST_TIMING
 
@@ -112,7 +113,7 @@ async def test_no_session_starts_once_the_hub_is_shutting_down(tmp_path: Path) -
     )
     control = Control(Timing())
     speech = Speech(SpeechConfig(), control, Timing())
-    sessions = Sessions(control, speech)
+    sessions = Sessions(control, speech, Timing())
     registry = Registry(
         StateStore(tmp_path), udp=udp, timing=Timing(), auto_approve=False, observer=control
     )
@@ -232,7 +233,7 @@ async def raw(hub: Hub) -> ClientConnection:
     return await websockets.connect(hub.agent_url, ping_interval=None)
 
 
-async def rpc(ws: ClientConnection, request: object) -> JsonObject:
+async def rpc(ws: Connection, request: object) -> JsonObject:
     """Send `request`, as JSON unless it's text already, and return the reply."""
     await ws.send(request if isinstance(request, str) else json.dumps(request))
     return json.loads(await ws.recv())

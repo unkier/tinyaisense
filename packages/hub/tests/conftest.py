@@ -7,6 +7,7 @@ from typing import Protocol
 import pytest
 import uvloop
 from tinyaisense_hub import Config, Hub, OwnerClient, SpeechConfig, Timing
+from tinyaisense_hub.config import LOCAL_HOSTS
 from tinyaisense_sim import Simulator
 from tinyaisense_sim.pytest_plugin import SimulatorFactory
 
@@ -42,6 +43,7 @@ class StartHub(Protocol):
         mdns: str | None = None,
         host: str | None = "127.0.0.1",
         speech: SpeechConfig = ...,
+        allowed_hosts: tuple[str, ...] = ...,
     ) -> Awaitable[Hub]: ...
 
 
@@ -84,11 +86,13 @@ async def start_hub(tmp_path: Path, runtime_dir: Path) -> AsyncIterator[StartHub
         mdns: str | None = None,
         host: str | None = "127.0.0.1",
         speech: SpeechConfig = NO_SPEECH,
+        allowed_hosts: tuple[str, ...] = LOCAL_HOSTS,
     ) -> Hub:
         config = Config(
             agent_token="agent-token",
             device_port=device_port,
             http_port=0,
+            allowed_hosts=allowed_hosts,
             timing=timing,
             speech=speech,
         )
