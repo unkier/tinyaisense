@@ -11,6 +11,8 @@ dependencies = [
 [project.optional-dependencies]
 # `tinyaisense mcp`, the MCP stdio shim.
 mcp = ["mcp>=2.2,<3"]
+# `tinyaisense.openai_agents`, the OpenAI Agents SDK text adapter.
+agents = ["openai-agents>=0.22", "mcp>=2.2,<3"]
 
 [project.scripts]
 tinyaisense = "tinyaisense.cli:main"

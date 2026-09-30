@@ -67,9 +67,13 @@ class Session:
     the hub back, and two agents would take it from each other forever.
     """
 
-    def __init__(self, ws: ClientConnection) -> None:
+    def __init__(self, ws: ClientConnection, url: str, token: str) -> None:
         self.id = ""
         """The Session id, from `hello`. An MCP link joins with it in `X-Hub-Session`."""
+        self.url = url
+        """The hub's agent API, `ws://<hub>:8421/agent`."""
+        self.token = token
+        """The agent token."""
         self.ended: str | None = None
         """Why the Session ended, once it has: `taken_over`, `shutdown`, or `closed` when
         the link dropped."""
@@ -83,6 +87,9 @@ class Session:
         self._utterance_handles: dict[int, int] = {}
         """The handle of each Utterance whose audio is coming, by utterance id."""
         self._cancels: set[asyncio.Task[None]] = set()
+        self.disarmed: set[str] = set()
+        """The devices whose Reflex the Session disarmed, by name. The Reflex of every other
+        device is armed."""
         self._reader = asyncio.create_task(self._read())
 
     async def __aenter__(self) -> Session:
@@ -138,6 +145,10 @@ class Session:
         """Arm or disarm `device`'s Reflex, barge-in and push-to-talk, for this Session. It's
         armed on every device by default."""
         await self.call("reflex.set", device=device, armed=armed)
+        if armed:
+            self.disarmed.discard(device)
+        else:
+            self.disarmed.add(device)
 
     async def stream_start(
         self, address: str, *, rate: int | None = None, prefill_ms: int | None = None
@@ -398,7 +409,7 @@ class _Connect:
         ws = await ws_connect(
             self._url, compression=None, ping_interval=PING_INTERVAL, ping_timeout=PING_TIMEOUT
         )
-        session = Session(ws)
+        session = Session(ws, self._url, self._params["token"])
         try:
             session.id = (await session.call("hello", **self._params))["session"]
         except BaseException:

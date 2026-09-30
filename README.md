@@ -39,6 +39,30 @@ claude --dangerously-load-development-channels server:tinyaisense
 
 When another agent holds the hub, the shim exits and says who; `--takeover` takes the hub from it instead. The shim exits too once its Session ends, e.g. taken over.
 
+Tools such as `say` block for up to 50 s before they return `pending`, so give MCP clients a read timeout of at least 60 s: in the OpenAI Agents SDK, `client_session_timeout_seconds=60`.
+
+## Agents in Python
+
+The SDK, `tinyaisense`, is an asyncio client for the agent API at `ws://<hub>:8421/agent`, the one way to the instant Interrupt path, raw audio and streaming text. Its `[agents]` extra runs an existing [OpenAI Agents SDK](https://openai.github.io/openai-agents-python/) agent by voice:
+
+```python
+import tinyaisense
+from agents import Agent
+from tinyaisense.openai_agents import HubMcpServer, VoiceAgent
+
+async with (
+    tinyaisense.connect("ws://hub.local:8421/agent", token) as hub,
+    HubMcpServer(hub) as tools,  # the hub's MCP tools, in the same Session
+):
+    agent = Agent(name="butler", instructions="You run the house.", mcp_servers=[tools])
+    await VoiceAgent(hub, agent).run()  # until the Session ends
+```
+
+- What the human says by push-to-talk is the input of a turn, `Runner.run_streamed`, and the reply is spoken as it streams, through `say.open/append/close` on the same device: one `say` for each model response, so that the `say`s its tools make follow it.
+- A press interrupts the running turn: `cancel("immediate")`. The Reflex has already cut the speaker, and the next user message starts with *you were cut off; the human heard: '…'*, of the reply and the `say`s of its tools. The heard text also goes back into the conversation, `session.add_items`, since the cancelled run keeps none of the reply. A click interrupts too, and starts no turn; an idle agent isn't interrupted, and a disarmed device never interrupts. `policy=` swaps in another rule, `(event, armed) -> bool`.
+- The conversation lives in `session=`, an Agents SDK session, in memory by default. `on_turn=` gets each `Turn` once it has ended: its input, how it was spoken, and its run.
+- `HubMcpServer` joins the Session with `X-Hub-Session`, with a 60 s timeout, and `VoiceAgent` adds its server instructions to the agent's.
+
 ## Development
 
 The Python packages live in one uv workspace under `packages/`:
