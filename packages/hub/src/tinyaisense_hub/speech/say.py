@@ -149,6 +149,8 @@ class Run:
         """Bytes fed to the stream so far."""
         self._timers: list[asyncio.TimerHandle] = []
         self._feeding: asyncio.Future[None] | None = None
+        self._stopping: asyncio.Future[StreamEnd] | None = None
+        """The stop that `cut` asked for: kept from the garbage collector till it has run."""
 
     @property
     def accepting(self) -> bool:
@@ -175,6 +177,16 @@ class Run:
         self._replaced = True
         if self._after is not None:
             self._after.replace()
+
+    def cut(self, say: Say) -> None:
+        """Stop `say`, `stopped`: skip it if none of it has gone out yet; else stop the
+        stream, which cuts the `say`s after it, and those whose tail still plays."""
+        if say.done.done():
+            return
+        if self._stream is None or say.start is None or say.start == self._fed:
+            say.finish("stopped", 0)
+        else:
+            self._stopping = asyncio.ensure_future(self._control.stop(self._stream))
 
     async def speak(self) -> None:
         """Speak every `say` that joins, until the stream ends: that ends each of them."""
@@ -232,10 +244,12 @@ class Run:
 
     async def _feed_say(self, say: Say, starting: asyncio.Future[SpeakerStream]) -> bool:
         """Synthesize `say` a clause at a time, as they come in, and feed it. If the TTS
-        fails, the rest of it is skipped. Returns False if the stream was cut: nothing more
-        is synthesized."""
+        fails, the rest of it is skipped, as is all of it if it's cut before any went out.
+        Returns False if the stream was cut: nothing more is synthesized."""
         say.start = self._fed
         while (clause := await _clause(say, len(say.ends))) is not None:
+            if say.done.done():  # cut before any of it went out
+                break
             assert say.voice is not None
             synthesis = _Synthesis(say.voice, clause.text)
             try:
@@ -250,6 +264,9 @@ class Run:
                     if pcm is None:
                         break
                     stream = await starting
+                    if say.done.done():  # cut before any of it went out
+                        say.end = self._fed
+                        return True
                     self._control.speaker_feed(stream, pcm)
                     self._fed += len(pcm)
                     await self._keep_ahead(stream)

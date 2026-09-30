@@ -6,6 +6,7 @@ these calls. Behaviour lives here and below.
 
 import asyncio
 import secrets
+from collections.abc import Callable
 from contextlib import AbstractAsyncContextManager
 
 from tinyaisense_wire import Capability, JsonObject
@@ -51,11 +52,17 @@ class Core:
         """Whether `token` is the agent token."""
         return secrets.compare_digest(token.encode(), self._agent_token)
 
-    def mcp_call(self, identity: str) -> AbstractAsyncContextManager[Session]:
+    def mcp_call(
+        self, identity: str, sink: Callable[[], SessionSink]
+    ) -> AbstractAsyncContextManager[Session]:
         """Run a tool call of the agent `identity`, an authorized one, in its MCP-only
-        Session: claimed now if no Session holds the hub, and released once idle. Raises
-        `HubError`: `busy` if another Session holds the hub."""
-        return self._sessions.mcp_call(identity)
+        Session: claimed now, with a new `sink`, if no Session holds the hub, and released once
+        idle. Raises `HubError`: `busy` if another Session holds the hub."""
+        return self._sessions.mcp_call(identity, sink)
+
+    def mcp_session(self, identity: str) -> Session | None:
+        """The MCP-only Session of the agent `identity`, if it holds the hub."""
+        return self._sessions.mcp_session(identity)
 
     async def mcp_release(self, identity: str) -> None:
         """The agent `identity` ended its MCP session: so ends its MCP-only Session, if
@@ -81,6 +88,12 @@ class Core:
         `invalid_args` with the `candidates` if several are online, `disconnected` if none
         is, or `unknown_address` if no paired device has one."""
         return self._registry.only_online(kind)
+
+    def device_of(self, address: str) -> str:
+        """The name of the device at an Address. Raises `HubError`: `unknown_address`, or
+        `invalid_args` for a bare capability id that several devices have."""
+        device, _ = self._registry.resolve(address)
+        return device.name
 
     async def command(
         self, session: Session, address: str, name: str, args: JsonObject
@@ -128,10 +141,12 @@ class Core:
         lang: str | None,
         replace: bool,
         then_listen: ThenListen | None = None,
+        stop: asyncio.Event | None = None,
     ) -> JsonObject:
         """Speak `text` on the speaker at `address`, after what's queued on it, or cutting it
         off if `replace`; then, if it plays to the end, listen on the device's mic as
-        `then_listen` says. Returns how it went once it has played. Raises `HubError`."""
+        `then_listen` says. Returns how it went once it has played. Setting `stop` cuts it,
+        `stopped`. Raises `HubError`."""
         device, capability = self._speaker(address)
         return await self._speech.say(
             session,
@@ -142,6 +157,7 @@ class Core:
             lang=lang,
             replace=replace,
             then_listen=then_listen,
+            stop=stop,
         )
 
     def say_open(
@@ -196,6 +212,10 @@ class Core:
         return await self._speech.listen(
             session, device, capability, lang=lang, utterances=utterances, stop=stop
         )
+
+    def utterance_stop(self, session: Session, utterance_id: int) -> None:
+        """End the Session's Utterance `utterance_id`, `stopped`, if it's under way."""
+        self._speech.utterance_stop(session, utterance_id)
 
     def _speaker(self, address: str) -> tuple[DeviceRecord, Capability]:
         """The speaker at `address`. Raises `HubError`."""

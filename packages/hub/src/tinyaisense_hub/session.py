@@ -4,7 +4,7 @@ import asyncio
 import logging
 import secrets
 import time
-from collections.abc import AsyncGenerator, Coroutine
+from collections.abc import AsyncGenerator, Callable, Coroutine
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal, Protocol
@@ -35,8 +35,8 @@ _log = logging.getLogger("tinyaisense_hub.session")
 
 
 class SessionSink(Protocol):
-    """Where a Session's notifications and audio go: its agent-API link. No method may
-    block."""
+    """Where a Session's notifications and audio go: its agent-API link, or an MCP-only
+    Session's Event queue. No method may block."""
 
     def notify(
         self,
@@ -199,16 +199,18 @@ class Sessions:
             return self._start(Session(holder, sink, utterances))
 
     @asynccontextmanager
-    async def mcp_call(self, identity: str) -> AsyncGenerator[Session]:
-        """Run a tool call of the agent `identity` in its MCP-only Session, which it claims
-        if no Session holds the hub. The Session ends once no call of it has run for
-        `mcp_idle_ms`. Raises `HubError`: `busy` if another Session holds the hub, or `failed`
-        once the hub is shutting down."""
+    async def mcp_call(
+        self, identity: str, sink: Callable[[], SessionSink]
+    ) -> AsyncGenerator[Session]:
+        """Run a tool call of the agent `identity` in its MCP-only Session, which it claims,
+        with a new `sink`, if no Session holds the hub. The Session ends once no call of it has
+        run for `mcp_idle_ms`. Raises `HubError`: `busy` if another Session holds the hub, or
+        `failed` once the hub is shutting down."""
         async with self._lock:
-            session = self.current
-            if session is None or session.mcp is None or not session.mcp.takes(identity):
+            session = self.mcp_session(identity)
+            if session is None:
                 await self._free(takeover=False)
-                session = Session("mcp", _Unheard(), UtteranceOptIn())
+                session = Session("mcp", sink(), UtteranceOptIn())
                 session.mcp = McpOnly(
                     identity,
                     Idle(after=self._idle_after),
@@ -220,6 +222,13 @@ class Sessions:
             yield session
         finally:
             self.mcp_idle(session, CallEnded())
+
+    def mcp_session(self, identity: str) -> Session | None:
+        """The MCP-only Session of the agent `identity`, if it holds the hub."""
+        session = self.current
+        if session is not None and session.mcp is not None and session.mcp.takes(identity):
+            return session
+        return None
 
     def mcp_idle(
         self, session: Session, input: CallStarted | CallEnded | Tick, now: int | None = None
@@ -293,28 +302,6 @@ class Sessions:
         task = asyncio.create_task(coroutine)
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
-
-
-class _Unheard:
-    """The sink of an MCP-only Session: MCP has no way to deliver its notifications."""
-
-    def notify(
-        self,
-        method: str,
-        params: JsonObject,
-        after: int | None = None,
-        latency_from: int | None = None,
-    ) -> None:
-        pass
-
-    def audio(self, handle: int, index: int, pcm: bytes) -> None:
-        pass
-
-    def audio_ended(self, handle: int) -> int:
-        return 0
-
-    def ended(self, reason: EndReason) -> None:
-        pass
 
 
 def _now_ms() -> int:

@@ -2,9 +2,11 @@
 
 It runs on the MCP SDK's Streamable HTTP session manager, the one `streamable_http_app()`
 builds, with SSE responses; the hub's HTTP lifespan runs the manager. Like the agent API, it
-only translates: between MCP tool calls and the core facade.
+translates between MCP tool calls and the core facade; and it gives MCP, which can't push, what
+it can't do without: calls that return in time, and an Event queue (`mcp_events`).
 """
 
+import asyncio
 import json
 import logging
 from collections.abc import AsyncGenerator, Awaitable, Callable, Sequence
@@ -25,8 +27,10 @@ from starlette.routing import Route
 from starlette.types import Message, Receive, Scope, Send
 from tinyaisense_wire import KINDS, JsonObject, Schema, SchemaError, validate
 
+from .config import Timing
 from .core import Core
 from .errors import HubError, HubErrorCode
+from .mcp_events import Inbox
 from .session import Session, ThenListen
 
 INSTRUCTIONS = """\
@@ -38,12 +42,13 @@ lists or code. Devices are half-duplex: they don't hear while they speak.
 
 Events: any tool result, errors included, may carry `events`: what happened since your last \
 call, e.g. what the human said by push-to-talk, a button gesture, or a device going online or \
-offline. Each comes once: act on it.
+offline. Each comes once: act on it. With nothing to do, `wait_for_event` waits for the next. \
+A call still running after {block} returns `pending`; its result comes later as an event.
 
 Barge-in: the human can press the button to cut you off. `say` then returns \
-`interrupted: true`, and `heard_text`: what they heard before the cut. Holding the button \
-records them, push-to-talk; a short click means "stop talking". `set_reflex` with \
-`armed: false` makes a press only an event.
+`interrupted: true`, `heard_text`: what they heard before the cut, and `utterance`: what they \
+said while holding the button, push-to-talk; a short click means "stop talking". \
+`set_reflex` with `armed: false` makes a press only an event.
 
 Addresses name capabilities `<device>/<capability>`, e.g. `kitchen/speaker`: `devices` lists \
 them, with each one's commands. Leave `address` out when only one online device has what the \
@@ -53,8 +58,8 @@ colours instead of the device's status, until `led_release`.
 One agent holds the hub at a time. Your first call other than `devices` and `voices` claims \
 it, and it's released after {idle} with no call. `busy` says who holds it and since when.
 """
-"""The server instructions, given the idle time. The first paragraph must stand alone, in 512
-chars; the whole stays under 2048."""
+"""The server instructions, given the idle time and the longest a call blocks. The first
+paragraph must stand alone, in 512 chars; the whole stays under 2048."""
 
 _ADDRESS = {
     "type": "string",
@@ -64,7 +69,7 @@ _ADDRESS = {
 _DEVICE = {"type": "string", "description": "a device name, e.g. `kitchen`"}
 _LANG = {"type": "string", "description": "a language code, e.g. `en` or `ru`"}
 _NO_ARGS: Schema = {"type": "object", "properties": {}, "additionalProperties": False}
-_OBJECT: Schema = {"type": "object"}
+_OBJECT: Schema = {"type": "object", "properties": {}}
 
 _SAY_RESULT: Schema = {
     "type": "object",
@@ -78,7 +83,16 @@ _SAY_RESULT: Schema = {
         "interrupted": {"type": "boolean"},
         "heard_text": {"type": "string"},
         "degraded": {"type": "boolean"},
-        "utterance_id": {"type": "integer"},
+        "utterance": {
+            "type": "object",
+            "required": ["text", "reason"],
+            "properties": {
+                "text": {"type": "string"},
+                "lang": {"type": "string"},
+                "reason": {"type": "string"},
+            },
+            "description": "with `then_listen`, or cut off by the button: what the human said then",
+        },
     },
 }
 _UTTERANCE_END: Schema = {
@@ -165,6 +179,55 @@ _VOICES_RESULT: Schema = {
     },
 }
 
+_EVENTS_RESULT: Schema = {"type": "object", "required": ["events"], "properties": {}}
+
+_EVENT: Schema = {
+    "type": "object",
+    "required": ["event", "t"],
+    "properties": {
+        "event": {
+            "type": "string",
+            "description": "`utterance`, `result`, `device.online`, `button.click`, ...",
+        },
+        "t": {"type": "integer", "description": "when, in epoch ms"},
+    },
+}
+_DELIVERY = {
+    "events": {
+        "type": "array",
+        "items": _EVENT,
+        "description": "what happened since your last call, each Event once",
+    },
+    "dropped": {
+        "type": "integer",
+        "description": "how many Events were dropped, the oldest first, for want of room",
+    },
+}
+
+
+_PENDING = {
+    "type": "integer",
+    "description": "the call is still running: its result comes as the `result` Event with "
+    "this `pending`",
+}
+
+
+def _delivering(schema: Schema) -> dict[str, Any]:
+    """The output schema of a tool whose result `schema` says, and that also carries the
+    Events queued for its caller."""
+    return {**schema, "properties": {**schema["properties"], **_DELIVERY}}
+
+
+def _blocking(schema: Schema) -> dict[str, Any]:
+    """The output schema of a tool whose result `schema` says, unless it's still running:
+    then it's `pending`, and the result comes later, as an Event."""
+    blocking = _delivering(schema)
+    blocking["properties"]["pending"] = _PENDING
+    if (required := blocking.pop("required", None)) is not None:
+        blocking["anyOf"] = [{"required": required}, {"required": ["pending"]}]
+    return blocking
+
+
 _READ_ONLY = types.ToolAnnotations(read_only_hint=True, open_world_hint=False)
 _ACTS = types.ToolAnnotations(read_only_hint=False, destructive_hint=False, open_world_hint=True)
 
@@ -174,21 +237,22 @@ TOOLS = (
         description="The paired devices, whether each is online, and their capabilities: each "
         "one's Address, Kind and commands.",
         input_schema=dict(_NO_ARGS),
-        output_schema=dict(_DEVICES_RESULT),
+        output_schema=_delivering(_DEVICES_RESULT),
         annotations=_READ_ONLY,
     ),
     types.Tool(
         name="voices",
         description="The Voices `say` can speak in, by id, with their language.",
         input_schema=dict(_NO_ARGS),
-        output_schema=dict(_VOICES_RESULT),
+        output_schema=_delivering(_VOICES_RESULT),
         annotations=_READ_ONLY,
     ),
     types.Tool(
         name="say",
         description="Speak `text` aloud on a speaker. Returns once it has played, or was cut "
-        "off: then `interrupted` is true and `heard_text` is what the human heard. Queued "
-        "after what's already speaking, unless `replace`.",
+        "off: then `interrupted` is true, `heard_text` is what the human heard, and "
+        "`utterance` what they said if they cut it off with the button. Queued after what's "
+        "already speaking, unless `replace`.",
         input_schema={
             "type": "object",
             "required": ["text"],
@@ -204,11 +268,12 @@ TOOLS = (
                 },
                 "then_listen": {
                     "type": "boolean",
-                    "description": "once it has played, listen for the human's answer",
+                    "description": "once it has played, listen for the human's answer, and "
+                    "return it as `utterance`",
                 },
             },
         },
-        output_schema=dict(_SAY_RESULT),
+        output_schema=_blocking(_SAY_RESULT),
         annotations=_ACTS,
     ),
     types.Tool(
@@ -220,8 +285,26 @@ TOOLS = (
             "additionalProperties": False,
             "properties": {"address": _ADDRESS, "lang": _LANG},
         },
-        output_schema=dict(_UTTERANCE_END),
+        output_schema=_blocking(_UTTERANCE_END),
         annotations=_ACTS,
+    ),
+    types.Tool(
+        name="wait_for_event",
+        description="Wait until an Event comes, e.g. the human speaking by push-to-talk, and "
+        "return the Events: at once if some are waiting.",
+        input_schema={
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "timeout_s": {
+                    "type": "number",
+                    "minimum": 0,
+                    "description": "how long to wait at most, in seconds",
+                }
+            },
+        },
+        output_schema=_delivering(_EVENTS_RESULT),
+        annotations=_READ_ONLY,
     ),
     types.Tool(
         name="command",
@@ -237,7 +320,7 @@ TOOLS = (
                 "args": {"type": "object", "description": "the command's args"},
             },
         },
-        output_schema=dict(_OBJECT),
+        output_schema=_blocking(_OBJECT),
         annotations=_ACTS,
     ),
     types.Tool(
@@ -249,7 +332,7 @@ TOOLS = (
             "additionalProperties": False,
             "properties": {"device": _DEVICE},
         },
-        output_schema=dict(_OBJECT),
+        output_schema=_blocking(_OBJECT),
         annotations=_ACTS,
     ),
     types.Tool(
@@ -262,7 +345,7 @@ TOOLS = (
             "additionalProperties": False,
             "properties": {"device": _DEVICE, "armed": {"type": "boolean"}},
         },
-        output_schema=dict(_OBJECT),
+        output_schema=_blocking(_OBJECT),
         annotations=_ACTS,
     ),
 )
@@ -270,21 +353,25 @@ TOOLS = (
 _log = logging.getLogger("tinyaisense_hub.mcp")
 _WEB = ("http", "https")
 
-type _Tool = Callable[[Session, JsonObject], Awaitable[JsonObject]]
-"""A tool that runs in the caller's Session."""
+type _Tool = Callable[[Session, JsonObject, asyncio.Event], Awaitable[JsonObject]]
+"""A tool that runs in the caller's Session. Setting the event stops it: the client cancelled
+the call."""
+type _Outcome = tuple[JsonObject, bool]
+"""A tool call's result, and whether it's an error."""
 
 
 class McpServer:
     """The `/mcp` endpoint."""
 
-    def __init__(self, core: Core, allowed_hosts: Sequence[str], idle_ms: int) -> None:
-        """`idle_ms`: how long an MCP-only Session lasts with no call, as the instructions
-        tell it."""
+    def __init__(self, core: Core, allowed_hosts: Sequence[str], timing: Timing) -> None:
         self._core = core
+        self._timing = timing
         server = Server[Any](
             "tinyaisense",
             version=version("tinyaisense-hub"),
-            instructions=INSTRUCTIONS.format(idle=_duration(idle_ms)),
+            instructions=INSTRUCTIONS.format(
+                idle=_duration(timing.mcp_idle_ms), block=_duration(timing.mcp_max_block_ms)
+            ),
             on_list_tools=self._list_tools,
             on_call_tool=self._call_tool,
         )
@@ -307,9 +394,13 @@ class McpServer:
             "command": self._command,
             "led_release": self._led_release,
             "set_reflex": self._set_reflex,
+            "wait_for_event": self._wait_for_event,
         }
         """The tools that claim the hub."""
         self._schemas = {tool.name: tool.input_schema for tool in TOOLS}
+        self._calls: set[asyncio.Task[_Outcome]] = set()
+        """The calls running, those that returned `pending` or were cancelled too: kept from
+        the garbage collector."""
 
     @asynccontextmanager
     async def run(self, _app: object = None) -> AsyncGenerator[None]:
@@ -328,21 +419,69 @@ class McpServer:
         name, args = params.name, params.arguments or {}
         if name not in self._schemas:
             raise MCPError(types.INVALID_PARAMS, f"Unknown tool: {name}")
+        identity = _identity(ctx)
         try:
             validate(self._schemas[name], args, "arguments")
-            if (sessionless := self._sessionless.get(name)) is not None:
-                result = await sessionless(args)
-            else:
-                async with self._core.mcp_call(_identity(ctx)) as session:
-                    result = await self._tools[name](session, args)
         except SchemaError as e:
-            return _result({"code": "invalid_args", "message": str(e)}, error=True)
-        except HubError as e:
-            return _result(e.data | _error(e.code, e.message), error=True)
-        except Exception:
-            _log.exception("MCP tool %s failed", name)
-            return _result(_error("failed", "failed; see the hub log"), error=True)
-        return _result(result)
+            return self._result(identity, (_error("invalid_args", str(e)), True))
+        if (sessionless := self._sessionless.get(name)) is not None:
+            outcome = await _outcome(name, sessionless(args))
+        else:
+            outcome = await self._blocking(ctx, identity, name, args)
+        return self._result(identity, outcome)
+
+    async def _blocking(
+        self, ctx: ServerRequestContext[Any], identity: str, name: str, args: JsonObject
+    ) -> _Outcome:
+        """Run a tool that claims the hub, for `mcp_max_block_ms` at most: `wait_for_event`
+        returns by then by itself. What's left of it runs on, and its result comes as an
+        Event. A client cancel stops it."""
+        call = _Call(self._core, identity, name, self._tools[name], args)
+        self._calls.add(call.task)
+        call.task.add_done_callback(self._calls.discard)
+        start = asyncio.get_running_loop().time()
+        deadline = (
+            None if name == "wait_for_event" else start + self._timing.mcp_max_block_ms / 1000
+        )
+        try:
+            done = await self._wait(ctx, call.task, start, deadline)
+            if not done and not call.claimed.done():  # it can't be pending till it has claimed
+                await self._wait(ctx, call.claimed, start, None)
+                done = call.task.done()
+        except BaseException:  # cancelled, or the client has gone
+            call.stop.set()
+            raise
+        if done:
+            return call.task.result()
+        return {"pending": call.leftover()}, False
+
+    async def _wait(
+        self,
+        ctx: ServerRequestContext[Any],
+        future: asyncio.Future[Any],
+        start: float,
+        deadline: float | None,
+    ) -> bool:
+        """Wait until `future` is done, or the loop time is `deadline`, with progress every
+        `mcp_progress_ms`, if the client asked for it: the seconds since `start`. Returns
+        whether it's done."""
+        loop = asyncio.get_running_loop()
+        every = self._timing.mcp_progress_ms / 1000
+        while True:
+            wait = every if deadline is None else min(every, deadline - loop.time())
+            if (await asyncio.wait((future,), timeout=max(0, wait)))[0]:
+                return True
+            if deadline is not None and loop.time() >= deadline:
+                return False
+            await ctx.session.report_progress(round(loop.time() - start, 3))
+
+    def _result(self, identity: str, outcome: _Outcome) -> types.CallToolResult:
+        """A tool result, with the Events queued for the agent `identity`, if it holds the
+        hub."""
+        result, error = outcome
+        if (session := self._core.mcp_session(identity)) is not None:
+            result = result | _inbox(session).take()
+        return _result(result, error=error)
 
     # The tools.
 
@@ -352,44 +491,141 @@ class McpServer:
     async def _voices(self, args: JsonObject) -> JsonObject:
         return {"voices": self._core.voices()}
 
-    async def _say(self, session: Session, args: JsonObject) -> JsonObject:
+    async def _say(self, session: Session, args: JsonObject, stop: asyncio.Event) -> JsonObject:
+        """With `then_listen`, or cut by the Reflex, it returns what the human said then."""
         then = None
         if args.get("then_listen"):
             then = ThenListen(raw=False, lang=None, utterances=session.utterances)
-        return await self._core.say(
+        address = self._address(args, "speaker")
+        device = self._core.device_of(address)
+        result = await self._core.say(
             session,
-            self._address(args, "speaker"),
+            address,
             args["text"],
             voice=args.get("voice"),
             lang=args.get("lang"),
             replace=args.get("replace", False),
             then_listen=then,
+            stop=stop,
         )
+        inbox = _inbox(session)
+        if (utterance_id := result.pop("utterance_id", None)) is not None:
+            answer = asyncio.ensure_future(inbox.answer(utterance_id))
+            if not await _before(answer, stop):
+                self._core.utterance_stop(session, utterance_id)
+            result["utterance"] = await answer
+        elif result["reason"] == "reflex":
+            if (said := await inbox.cut(device, stop)) is not None:
+                result["utterance"] = said
+        return result
 
-    async def _listen(self, session: Session, args: JsonObject) -> JsonObject:
+    async def _listen(self, session: Session, args: JsonObject, stop: asyncio.Event) -> JsonObject:
         result, _ = await self._core.listen(
             session,
             self._address(args, "mic"),
             lang=args.get("lang"),
             utterances=session.utterances,
+            stop=stop,
         )
         return result
 
-    async def _command(self, session: Session, args: JsonObject) -> JsonObject:
+    async def _command(self, session: Session, args: JsonObject, stop: asyncio.Event) -> JsonObject:
         return await self._core.command(session, args["address"], args["name"], args["args"])
 
-    async def _led_release(self, session: Session, args: JsonObject) -> JsonObject:
+    async def _led_release(
+        self, session: Session, args: JsonObject, stop: asyncio.Event
+    ) -> JsonObject:
         await self._core.led_release(session, args["device"])
         return {}
 
-    async def _set_reflex(self, session: Session, args: JsonObject) -> JsonObject:
+    async def _set_reflex(
+        self, session: Session, args: JsonObject, stop: asyncio.Event
+    ) -> JsonObject:
         await self._core.reflex_set(session, args["device"], args["armed"])
         return {}
+
+    async def _wait_for_event(
+        self, session: Session, args: JsonObject, stop: asyncio.Event
+    ) -> JsonObject:
+        block = self._timing.mcp_max_block_ms / 1000
+        queued = asyncio.ensure_future(_inbox(session).wait())
+        try:
+            async with asyncio.timeout(min(args.get("timeout_s", block), block)):
+                await _before(queued, stop)
+        except TimeoutError:
+            pass
+        finally:
+            queued.cancel()
+        return {"events": []}
 
     def _address(self, args: JsonObject, kind: str) -> str:
         """The `address` arg; or, left out, the one online capability of `kind`."""
         address: str | None = args.get("address")
         return self._core.only_online(kind) if address is None else address
+
+
+class _Call:
+    """A call of a tool that claims the hub, run as a task of its own: it may run on after
+    the MCP request, as a leftover."""
+
+    def __init__(self, core: Core, identity: str, name: str, tool: _Tool, args: JsonObject) -> None:
+        self.stop = asyncio.Event()
+        """Set when the client cancels it."""
+        self.session: Session | None = None
+        """The Session it runs in, once it has claimed it."""
+        self.claimed: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+        """Done once it has claimed the hub, or failed to."""
+        self._name = name
+        self.task = asyncio.create_task(self._run(core, identity, tool, args))
+        self.task.add_done_callback(self._claimed)
+
+    async def _run(self, core: Core, identity: str, tool: _Tool, args: JsonObject) -> _Outcome:
+        async def run() -> JsonObject:
+            async with core.mcp_call(identity, Inbox) as session:
+                self.session = session
+                self._claimed()
+                return await tool(session, args, self.stop)
+
+        return await _outcome(self._name, run())
+
+    def _claimed(self, _: object = None) -> None:
+        if not self.claimed.done():
+            self.claimed.set_result(None)
+
+    def leftover(self) -> int:
+        """It runs on after its request, in the Session it claimed: its result is to come as
+        an Event. Returns its `pending` id."""
+        assert self.session is not None
+        inbox = _inbox(self.session)
+        pending = inbox.pending()
+
+        def done(task: asyncio.Task[_Outcome]) -> None:
+            if not task.cancelled():
+                inbox.late(pending, self._name, *task.result())
+
+        self.task.add_done_callback(done)
+        return pending
+
+
+async def _before(future: asyncio.Future[Any], stop: asyncio.Event) -> bool:
+    """Wait until `future` is done, or `stop` is set. Returns whether it was done first."""
+    stopping = asyncio.ensure_future(stop.wait())
+    try:
+        await asyncio.wait((future, stopping), return_when=asyncio.FIRST_COMPLETED)
+    finally:
+        stopping.cancel()
+    return future.done()
+
+
+async def _outcome(name: str, result: Awaitable[JsonObject]) -> _Outcome:
+    """What the call of tool `name` comes to: its `result`, or the error it raises."""
+    try:
+        return await result, False
+    except HubError as e:
+        return e.data | _error(e.code, e.message), True
+    except Exception:
+        _log.exception("MCP tool %s failed", name)
+        return _error("failed", "failed; see the hub log"), True
 
 
 class _Endpoint:
@@ -433,6 +669,12 @@ def _identity(ctx: ServerRequestContext[Any]) -> str:
     client = ctx.session.client_params
     name = client.client_info.name if client is not None else ""
     return f"agent {name}@{request.client.host if request.client else ''}"
+
+
+def _inbox(session: Session) -> Inbox:
+    """Where an MCP-only Session's notifications go."""
+    assert isinstance(session.sink, Inbox)
+    return session.sink
 
 
 def _mcp_session_identity(mcp_session: str) -> str:

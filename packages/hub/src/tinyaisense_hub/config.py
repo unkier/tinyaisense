@@ -73,6 +73,12 @@ class Timing:
     for this long."""
     mcp_idle_ms: int = 600_000
     """An MCP-only Session ends after this long with no tool call running."""
+    mcp_max_block_ms: int = 50_000
+    """An MCP tool call returns within this long, before MCP clients time out: what it has
+    left to do goes on, and its result comes later as an Event."""
+    mcp_progress_ms: int = 5000
+    """While an MCP tool call runs, progress goes out this often, if the client asked for
+    it."""
 
 
 @dataclass(frozen=True, slots=True)

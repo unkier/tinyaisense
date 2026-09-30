@@ -158,7 +158,7 @@ class Hub:
         # Here: the MCP SDK takes half a second to import, which the owner commands don't need.
         from .mcp_server import McpServer
 
-        mcp = McpServer(self._core, self.config.allowed_hosts, self.config.timing.mcp_idle_ms)
+        mcp = McpServer(self._core, self.config.allowed_hosts, self.config.timing)
         app = Starlette(
             routes=[agent_route(self._core, self.config.timing, self.button_latency), mcp.route],
             lifespan=mcp.run,

@@ -70,6 +70,8 @@ def test_init_writes_a_config_with_a_random_agent_token(
         "cloud_first_byte_ms": 1000,
         "cloud_skip_ms": 60000,
         "mcp_idle_ms": 600000,
+        "mcp_max_block_ms": 50000,
+        "mcp_progress_ms": 5000,
     }
     assert config["allowed_hosts"] == ["127.0.0.1:*", "localhost:*", "[::1]:*"]
     assert config["speech"] == {

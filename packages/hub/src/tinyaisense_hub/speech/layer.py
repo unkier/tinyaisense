@@ -121,14 +121,21 @@ class Speech:
         lang: str | None,
         replace: bool = False,
         then_listen: ThenListen | None = None,
+        stop: asyncio.Event | None = None,
     ) -> JsonObject:
         """Speak `text` on a speaker, after the `say`s queued on it, or cutting them off if
         `replace`; then, if the speaker drains after it, listen on the device's mic as
-        `then_listen` says. Returns how it went once it has played. Raises `HubError`."""
+        `then_listen` says. Returns how it went once it has played. Setting `stop` cuts it,
+        `stopped`. Raises `HubError`."""
         say = self._say(session, device, capability, Script.whole(text), voice, lang)
         say.then = self._then(session, device, then_listen)
         self._more(say)
-        self._run(session, device, capability, replace).add(say)
+        run = self._run(session, device, capability, replace)
+        run.add(say)
+        if stop is not None:
+            stopping = asyncio.ensure_future(stop.wait())
+            stopping.add_done_callback(lambda _: run.cut(say))
+            say.done.add_done_callback(lambda _: stopping.cancel())
         return await asyncio.shield(say.done)
 
     def say_open(
@@ -203,6 +210,12 @@ class Speech:
             stopping.add_done_callback(lambda _: listen.stop("stopped"))
             listen.done.add_done_callback(lambda _: stopping.cancel())
         return await asyncio.shield(listen.done), listen.handle
+
+    def utterance_stop(self, session: Session, utterance_id: int) -> None:
+        """End the Session's Utterance `utterance_id`, `stopped`, if it's under way."""
+        for listen in list(session.listens):
+            if listen.id == utterance_id:
+                listen.stop("stopped")
 
     def talk(self, session: Session, device: DeviceRecord, mic: Capability) -> Listener:
         """Push-to-talk on `mic`, on a stream the Reflex opened: an Utterance for the Session,
