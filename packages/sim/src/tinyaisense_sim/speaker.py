@@ -53,6 +53,9 @@ class SimSpeaker:
         self.captured: list[CapturedFrame] = []
         """Every frame played since power-on, as it enters the DMA: the latest may not have
         been heard yet."""
+        self.first_frame_at: float | None = None
+        """When the latest stream's first frame came in off the network, on the event loop's
+        clock: None until it does."""
         self._latency = output_latency_ms / 1000
         self._drained = drained
         self._changed = changed
@@ -76,6 +79,7 @@ class SimSpeaker:
     def start(self, stream: int, format: AudioFormat, prefill_ms: int) -> None:
         """Open stream id `stream`. The caller checks that nothing is playing."""
         assert self._playout is None
+        self.first_frame_at = None
         self._playout = _Playout(stream, format, prefill_ms, self._latency, self._pulled)
         self._changed()
 
@@ -84,6 +88,8 @@ class SimSpeaker:
         frame rules. A short frame waits in the jitter buffer until the final seq is known."""
         assert self._playout is not None
         self._playout.buffer.format.check_frame(pcm, final=True)
+        if self.first_frame_at is None:
+            self.first_frame_at = asyncio.get_running_loop().time()
         self._playout.buffer.push(seq, pcm)
 
     def drain(self, last_seq: int | None) -> None:

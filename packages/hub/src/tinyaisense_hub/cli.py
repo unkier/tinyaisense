@@ -3,10 +3,12 @@
 import argparse
 import asyncio
 import logging
+import os
 import signal
 import sys
 from collections.abc import Awaitable, Callable, Coroutine, Sequence
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 import uvloop
@@ -57,6 +59,9 @@ def _parser() -> argparse.ArgumentParser:
         action="store_true",
         help="don't advertise over mDNS; devices then need the hub's address set",
     )
+    serve.add_argument(
+        "--host", help="the address to serve devices and agents on (default: every address)"
+    )
     serve.set_defaults(run=_serve)
 
     devices = commands.add_parser("devices", help="list paired and pending devices")
@@ -101,6 +106,42 @@ def _parser() -> argparse.ArgumentParser:
         "fetch", help="download the models the local engines run, checked by sha256"
     )
     fetch.set_defaults(run=_models_fetch)
+
+    bench = commands.add_parser("bench", help="time the hub against its latency gates")
+    bench_commands = bench.add_subparsers(required=True, metavar="command")
+    speech = bench_commands.add_parser(
+        "speech",
+        help="time the configured STT and TTS on a pinned corpus, and write an acceptance "
+        "report; needs the hub's [bench] extra",
+    )
+    speech.add_argument(
+        "--load",
+        action="store_true",
+        help="also time presses to `button.down` while STT and TTS are busy",
+    )
+    speech.add_argument("--reps", type=_positive, default=3, help="runs of each gate (default 3)")
+    speech.add_argument(
+        "--presses",
+        type=_positive,
+        default=1000,
+        help="presses in each run with --load (default 1000)",
+    )
+    speech.add_argument(
+        "--out",
+        type=Path,
+        default=Path("acceptance"),
+        help="the dir to write the report into (default ./acceptance)",
+    )
+    speech.add_argument(
+        "--name", help="the report's, after its date and time (default: the hub's commit)"
+    )
+    speech.add_argument(
+        "--max-loadavg",
+        type=float,
+        default=2.0,
+        help="skip the bench if the 1-minute load average is over this at the start (default 2)",
+    )
+    speech.set_defaults(run=_bench_speech)
     return parser
 
 
@@ -126,6 +167,7 @@ def _serve(args: argparse.Namespace) -> int:
             state_dir=state_dir(),
             runtime_dir=runtime_dir(),
             auto_approve=args.auto_approve,
+            host=args.host,
             mdns=None if args.no_mdns else MDNS_SERVICE,
         )
         async with hub:
@@ -162,6 +204,57 @@ def _models_fetch(args: argparse.Namespace) -> int:
     fetch(MODELS, into, report=print)
     print(f"every model is in {into}")
     return 0
+
+
+def _bench_speech(args: argparse.Namespace) -> int:
+    try:
+        from .bench import corpus, run
+    except ImportError as e:
+        return _fail(f"{e}: `bench` needs the hub's [bench] extra")
+    # Before anything of its own loads the machine.
+    if (load := os.getloadavg()[0]) > args.max_loadavg:
+        print(f"skipped: the load average is {load:.2f}, over {args.max_loadavg:g}")
+        return 0
+    config = load_config(config_path())
+    # The bench's agent talks to its hub over loopback, never through a proxy.
+    os.environ["no_proxy"] = ",".join(filter(None, [os.environ.get("no_proxy"), "127.0.0.1"]))
+    into = corpus.corpus_dir()
+    try:
+        corpus.fetch(corpus.CORPUS, into, report=_progress)
+        spoken = [
+            run.Spoken(clip.name, clip.lang, clip.text, corpus.speech(clip, into))
+            for clip in corpus.CORPUS
+        ]
+        report = asyncio.run(
+            run.bench(
+                config,
+                spoken,
+                corpus.SENTENCES,
+                name=args.name,
+                reps=args.reps,
+                load=args.load,
+                presses=args.presses,
+                report=_progress,
+            )
+        )
+    except corpus.BenchError as e:
+        return _fail(str(e))
+    md, _ = report.write(args.out)
+    print(report.markdown(), end="")
+    print(f"{'passed' if report.passed else 'FAILED'}: wrote {md} and its .json")
+    return 0 if report.passed else 1
+
+
+def _positive(text: str) -> int:
+    number = int(text)
+    if number < 1:
+        raise argparse.ArgumentTypeError(f"{number} is not at least 1")
+    return number
+
+
+def _progress(line: str) -> None:
+    """A line of how it goes, out at once: in CI too, where stdout is a pipe."""
+    print(line, flush=True)
 
 
 def _devices(args: argparse.Namespace) -> int:

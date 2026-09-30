@@ -22,8 +22,12 @@ tinyaisense-hub = "tinyaisense_hub.cli:main"
 local = ["onnxruntime>=1.30", "piper-tts>=1.8", "sherpa-onnx>=1.13.8", "torch>=2.14"]
 # polza.ai cloud speech plugin.
 polza = []
+# `bench speech`: the Simulator and the SDK drive the hub, and soundfile reads the corpus.
+bench = ["soundfile>=0.13", "tinyaisense", "tinyaisense-sim"]
 
 [tool.uv.sources]
+tinyaisense = { workspace = true }
+tinyaisense-sim = { workspace = true }
 tinyaisense-wire = { workspace = true }
 # PyPI's torch for Linux pulls in CUDA, GBs of it: the hub runs it on the CPU.
 torch = { index = "pytorch-cpu" }

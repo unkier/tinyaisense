@@ -2,6 +2,7 @@
 
 import math
 from collections import deque
+from collections.abc import Sequence
 
 from tinyaisense_wire import JsonObject
 
@@ -36,8 +37,8 @@ class Latency:
         bounds: list[int | None] = [*BUCKETS_MS, None]
         return {
             "count": len(samples),
-            "p50_ms": _ms(_percentile(samples, 0.5)),
-            "p99_ms": _ms(_percentile(samples, 0.99)),
+            "p50_ms": _ms(nearest_rank(samples, 0.5)),
+            "p99_ms": _ms(nearest_rank(samples, 0.99)),
             "max_ms": _ms(samples[-1] if samples else None),
             "buckets": [
                 {"le_ms": le, "count": count} for le, count in zip(bounds, counts, strict=True)
@@ -45,9 +46,9 @@ class Latency:
         }
 
 
-def _percentile(samples: list[int], p: float) -> int | None:
-    """By nearest rank, of sorted `samples`."""
-    return samples[max(0, math.ceil(p * len(samples)) - 1)] if samples else None
+def nearest_rank[T](ordered: Sequence[T], p: float) -> T | None:
+    """The `p` quantile of sorted `ordered`, by nearest rank; None if it's empty."""
+    return ordered[max(0, math.ceil(p * len(ordered)) - 1)] if ordered else None
 
 
 def _ms(us: int | None) -> float | None:

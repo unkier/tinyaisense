@@ -35,7 +35,7 @@ The Python packages live in one uv workspace under `packages/`:
 | `tinyaisense` (SDK) | ≥3.11 | `packages/sdk` |
 
 ```sh
-uv sync --all-packages --extra local
+uv sync --all-packages --extra local --extra bench
 uv run ruff check && uv run ruff format --check
 uv run pyright
 uv run pyright --pythonversion 3.11 packages/wire packages/sdk docs/protocol/vectors
@@ -47,6 +47,22 @@ The device↔hub protocol is specified in [`docs/protocol/`](docs/protocol/READM
 Hub integration tests run the real hub in-process on ephemeral ports and drive it with simulated devices from the `simulator` pytest fixture, which `tinyaisense-sim` exports. A simulated device finds the hub over mDNS unless given its address, and `device.faults` breaks its Connection on demand: `rst()`, `close()`, `vanish()` and `stall_reads`. `device.faults.udp_down` and `udp_up` fault the datagrams from and to the hub, seeded from the Simulator's `seed` and live: Bernoulli `loss`, Gilbert–Elliott `bursts`, `delay_ms`, `jitter_ms`, `duplicate`, `drop(stream, seqs)` and `blackout(ms)`; `mic_tx_stall` holds the mic's frames in its 200 ms queue. `device.speaker.captured` records what the speaker played, with when each frame was heard. `device.mic.feed(pcm)` gives the mic something to hear, in real time or with `burst=True` at once, from `tinyaisense_sim.sources`: `silence`, `tone`, `wav` files and raw `pcm`, resampled to 16 kHz mono. `device.button` presses and clicks; while the hub has armed the Reflex (`device.armed`), a press cuts the speaker and opens the mic, as firmware does, and `await device.talk(pcm)` presses, lets the mic hear `pcm` in real time, then releases. The mDNS tests need multicast on some interface, and each uses a service type of its own so that it never finds another hub on the LAN.
 
 Most speech tests use a fake speech plugin, whose TTS speaks text as tones that its STT decodes. The local engines are tested on real English and Russian speech from `packages/hub/tests/audio/`, and what the TTS engines say, Parakeet hears back; those tests are skipped unless the `[local]` extra is installed and `models fetch` has run. The `typings/` stubs give pyright the parts of onnxruntime, sherpa-onnx and soxr that the hub uses, since none of them ships types.
+### The speech bench
+
+`bench speech` times the latency gates of the model tier on the hub the config makes, run as `serve` runs it, in a process of its own, with simulated Atom Echos for devices and the SDK for the agent. It needs the `[bench]` extra.
+
+```sh
+uv run tinyaisense-hub bench speech          # STT and TTS: 3 runs of each
+uv run tinyaisense-hub bench speech --load   # and 1000 presses a run, while STT and TTS are busy
+```
+
+- STT: push-to-talk on 30 English clips from LibriSpeech test-clean and 30 Russian ones from Common Voice 17.0, from the release, right after the last speech, to the transcript. p95 ≤150 ms; the word error rate is reported, not gated. The clips are pinned by sha256 in `packages/hub/src/tinyaisense_hub/bench/corpus.py`, and fetched once into `~/.local/share/tinyaisense/bench`.
+- TTS: `say` of 10 English and 10 Russian sentences, to the first 10 ms frame at the device. p95 ≤150 ms.
+- Interrupt, with `--load`: a press to `button.down` at the SDK, while other simulated devices speak and listen. p99 ≤20 ms. A miss here calls for moving STT and TTS to a worker subprocess (ADR 0004).
+
+A gate fails only if 2 of its 3 runs miss. The bench skips, writing nothing, if the load average is over 2 at the start (`--max-loadavg`). Each run writes a report, in Markdown and JSON, into `./acceptance/` (`--out`), with the numbers, the hub's version and the machine's CPU, governor and load.
+
+On every push to main, the model tier (`.github/workflows/model.yml`) runs `bench speech --load` on the hub PC, a self-hosted runner that `.github/runner/setup.sh` registers, and pushes its report to the `acceptance` branch.
 
 ## Firmware
 

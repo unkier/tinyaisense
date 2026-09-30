@@ -1,0 +1,96 @@
+# Model tier: the speech bench and the button under load, on the hub PC's self-hosted runner
+# (.github/runner/setup.sh), with the local engines and their models. Each run's acceptance
+# report goes to the `acceptance` branch, and into the run's summary.
+name: Model
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# One bench at a time on the one hub PC: another would load it.
+concurrency:
+  group: model
+  cancel-in-progress: false
+
+jobs:
+  bench:
+    name: speech bench + interrupt under load
+    runs-on: [self-hosted, tinyaisense-hub]
+    timeout-minutes: 90
+    permissions:
+      contents: write # the report, to the acceptance branch
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@v10.2.0
+      - run: uv sync --locked --all-packages --no-default-groups --extra local --extra bench
+      # The models, and the bench's corpus, stay in ~/.local/share/tinyaisense between runs:
+      # only what's missing downloads.
+      - run: uv run --no-sync tinyaisense-hub models fetch
+      # On the config `init` writes, and so the local engines. It skips, with no report, if
+      # the machine is busy at the start, and fails if 2 of 3 runs of any gate miss.
+      - name: Bench
+        env:
+          XDG_CONFIG_HOME: ${{ runner.temp }}/config
+        run: |
+          uv run --no-sync tinyaisense-hub init
+          uv run --no-sync tinyaisense-hub bench speech --load --out acceptance
+      - name: Summary
+        if: always()
+        run: |
+          shopt -s nullglob
+          reports=(acceptance/*.md)
+          if (( ${#reports[@]} )); then
+            cat "${reports[@]}" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "No report: the bench skipped, or didn't get to the end. See its log." \
+              >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: Push the report to the acceptance branch
+        if: always()
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          reports=(acceptance/*.md acceptance/*.json)
+          if (( ! ${#reports[@]} )); then
+            echo "no report to push"
+            exit 0
+          fi
+          # The token as checkout passes it: in git's environment, never on disk. And the bot
+          # as the author and committer, of the commit and of any rebase of it.
+          export GIT_CONFIG_COUNT=3
+          export GIT_CONFIG_KEY_0=http.https://github.com/.extraheader
+          GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GITHUB_TOKEN" | base64 -w0)"
+          export GIT_CONFIG_VALUE_0
+          export GIT_CONFIG_KEY_1=user.name GIT_CONFIG_VALUE_1="github-actions[bot]"
+          export GIT_CONFIG_KEY_2=user.email
+          export GIT_CONFIG_VALUE_2="41898282+github-actions[bot]@users.noreply.github.com"
+          remote="https://github.com/$GITHUB_REPOSITORY.git"
+          branch="$RUNNER_TEMP/acceptance-branch"
+          rm -rf "$branch"
+          if git ls-remote --exit-code --heads "$remote" acceptance > /dev/null; then
+            git clone --quiet --depth 1 --branch acceptance "$remote" "$branch"
+          else
+            git init --quiet --initial-branch acceptance "$branch"
+            git -C "$branch" remote add origin "$remote"
+          fi
+          mkdir -p "$branch/acceptance"
+          cp "${reports[@]}" "$branch/acceptance/"
+          cd "$branch"
+          git add acceptance
+          git commit --quiet -m "Acceptance report for ${GITHUB_SHA::12}"
+          for attempt in 1 2 3; do
+            if git push --quiet origin HEAD:acceptance; then
+              exit 0
+            fi
+            echo "push $attempt failed; rebasing on the branch as it is now"
+            git pull --quiet --rebase origin acceptance || git rebase --abort || true
+          done
+          exit 1

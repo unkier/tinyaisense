@@ -22,6 +22,7 @@ from tinyaisense_wire import (
     StreamFrame,
     decode_datagram,
     encode_control,
+    encode_datagram,
 )
 
 CONN_ID = 7
@@ -133,6 +134,11 @@ class RawUdp(asyncio.DatagramProtocol):
         datagram = decode_datagram(await self._datagrams.get())
         assert isinstance(datagram, EventMirror)
         return datagram
+
+    def send(self, frame: StreamFrame, port: int) -> None:
+        """Send a stream frame to the device's UDP `port`, on this machine."""
+        assert self._transport is not None
+        self._transport.sendto(encode_datagram(frame), ("127.0.0.1", port))
 
     async def frames(self, count: int) -> list[StreamFrame]:
         return [await self.frame() for _ in range(count)]
