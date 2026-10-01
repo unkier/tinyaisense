@@ -324,23 +324,23 @@ class AgentLink:
         elif self._session is None:
             await self._hello(request)
         elif request.method == "hello":
-            self._error(request.id, _HUB_ERROR, "invalid_args", "this link holds a Session")
+            self._turn_down(request, _HUB_ERROR, "invalid_args", "this link holds a Session")
         elif request.method not in self._methods:
             message = f"no method {request.method!r}"
-            self._error(request.id, _METHOD_NOT_FOUND, "unsupported", message)
+            self._turn_down(request, _METHOD_NOT_FOUND, "unsupported", message)
         else:
             schema, run = self._methods[request.method]
             try:
                 validate(schema, request.params, "params")
             except SchemaError as e:
-                self._error(request.id, _INVALID_PARAMS, "invalid_args", str(e))
+                self._turn_down(request, _INVALID_PARAMS, "invalid_args", str(e))
                 return
             stop = None
             if request.method == "listen":
                 # Stopped by a `cancel` naming its id.
                 stop = self._stops[request.id] = asyncio.Event()
                 run = functools.partial(self._listen, stop=stop)
-            task = asyncio.create_task(self._request(request.id, run, request.params))
+            task = asyncio.create_task(self._request(request, run))
             self._requests.add(task)
             task.add_done_callback(self._requests.discard)
             if stop is not None:
@@ -417,19 +417,38 @@ class AgentLink:
         self._error(request_id, code, hub_code, message, data)
         self._finish(_POLICY)
 
-    async def _request(self, request_id: object, run: _Method, params: JsonObject) -> None:
+    def _turn_down(
+        self, request: _Request, code: int, hub_code: HubErrorCode, message: str
+    ) -> None:
+        """Reply to a request of the Session's agent with an error, without running it."""
+        assert self._session is not None
+        traced = self._session.trace_call("agent_api", request.method, request.params)
+        traced.replied({"code": hub_code, "message": message}, error=True)
+        self._error(request.id, code, hub_code, message)
+
+    async def _request(self, request: _Request, run: _Method) -> None:
+        assert self._session is not None
+        traced = self._session.trace_call("agent_api", request.method, request.params)
         try:
-            result = await run(params)
+            result = await run(request.params)
         except HubError as e:
-            self._error(request_id, _HUB_ERROR, e.code, e.message, e.data)
+            self._error(request.id, _HUB_ERROR, e.code, e.message, e.data)
+            traced.replied(e.data | {"code": e.code, "message": e.message}, error=True)
+        except asyncio.CancelledError:
+            traced.cancelled()
+            raise
         except Exception:
             _log.exception("agent request failed")
-            self._error(request_id, _INTERNAL_ERROR, "failed", "failed; see the hub log")
+            message = "failed; see the hub log"
+            self._error(request.id, _INTERNAL_ERROR, "failed", message)
+            traced.replied({"code": "failed", "message": message}, error=True)
         else:
             if isinstance(result, _After):
-                self._reply(request_id, result.result, result.handle)
+                self._reply(request.id, result.result, result.handle)
+                traced.replied(result.result)
             else:
-                self._reply(request_id, result)
+                self._reply(request.id, result)
+                traced.replied(result)
 
     # Methods.
 

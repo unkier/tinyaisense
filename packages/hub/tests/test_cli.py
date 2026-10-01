@@ -1,6 +1,7 @@
 """The `tinyaisense-hub` command line."""
 
 import asyncio
+import json
 import os
 import re
 import signal
@@ -11,12 +12,15 @@ import tomllib
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import pytest
 import tinyaisense
 import uvloop
 from tinyaisense_hub.cli import main, run_hub
 from tinyaisense_sim.pytest_plugin import SimulatorFactory
+
+from .test_observability import recorded, trace
 
 
 @pytest.fixture
@@ -72,6 +76,7 @@ def test_init_writes_a_config_with_a_random_agent_token(
         "mcp_idle_ms": 600000,
         "mcp_max_block_ms": 50000,
         "mcp_progress_ms": 5000,
+        "loop_lag_ms": 5,
     }
     assert config["allowed_hosts"] == ["127.0.0.1:*", "localhost:*", "[::1]:*"]
     assert config["speech"] == {
@@ -109,6 +114,7 @@ def test_init_writes_a_config_with_a_random_agent_token(
             {"id": "xenia", "lang": "ru", "name": "Xenia", "engine_voice": "xenia"},
         ],
     }
+    assert config["debug"] == {}  # record_dir is off, in a comment
     assert len(config["agent_token"]) >= 32
     assert stat.S_IMODE(path.stat().st_mode) == 0o600
 
@@ -171,6 +177,9 @@ class Served:
     device: tuple[str, int]
     agent_url: str
     agent_token: str
+    process: asyncio.subprocess.Process
+    log: Path
+    """Its stderr."""
 
 
 SPEECH = """
@@ -196,9 +205,11 @@ name = "Маша"
 
 
 @pytest.fixture
-async def served(xdg: dict[str, str], request: pytest.FixtureRequest) -> AsyncIterator[Served]:
+async def served(
+    xdg: dict[str, str], request: pytest.FixtureRequest, tmp_path: Path
+) -> AsyncIterator[Served]:
     """`tinyaisense-hub serve` in a child process, on free ports. Parametrize it indirectly
-    with more config to append."""
+    with more config to append, in which `$TMP` is the test's tmp dir."""
     main(["init"])
     with socket.socket() as device_probe, socket.socket() as http_probe:
         device_probe.bind(("127.0.0.1", 0))
@@ -207,19 +218,23 @@ async def served(xdg: dict[str, str], request: pytest.FixtureRequest) -> AsyncIt
     config = Path(xdg["XDG_CONFIG_HOME"]) / "tinyaisense" / "hub.toml"
     text = config.read_text().replace("device = 8420", f"device = {port}")
     text = text.replace("http = 8421", f"http = {http}")
-    config.write_text(replace_speech(text, getattr(request, "param", "")))
-    hub = await asyncio.create_subprocess_exec(
-        sys.executable, "-m", "tinyaisense_hub", "serve", "--no-mdns", env=os.environ | xdg
-    )
+    more = getattr(request, "param", "").replace("$TMP", str(tmp_path))
+    config.write_text(replace_speech(text, more))
+    log = tmp_path / "hub.log"
+    with log.open("w") as stderr:
+        hub = await asyncio.create_subprocess_exec(
+            sys.executable, "-m", "tinyaisense_hub", "serve", "--no-mdns",
+            env=os.environ | xdg, stderr=stderr,
+        )  # fmt: skip
     owner_socket = Path(xdg["XDG_RUNTIME_DIR"]) / "tinyaisense" / "owner.sock"
     while not owner_socket.exists():
         assert hub.returncode is None
         await asyncio.sleep(0.02)
     token = tomllib.loads(text)["agent_token"]
-    yield Served(("127.0.0.1", port), f"ws://127.0.0.1:{http}/agent", token)
+    yield Served(("127.0.0.1", port), f"ws://127.0.0.1:{http}/agent", token, hub, log)
     if hub.returncode is None:
         hub.send_signal(signal.SIGTERM)
-    assert await hub.wait() == 0
+    assert await hub.wait() == 0, log.read_text()
 
 
 async def test_serve_pairs_a_device_the_owner_approves_from_the_cli(
@@ -294,6 +309,59 @@ async def test_the_owner_sees_the_button_latency_histogram_from_the_cli(
 async def test_serve_serves_the_agent_api(served: Served) -> None:
     async with tinyaisense.connect(served.agent_url, served.agent_token) as agent:
         assert await agent.devices() == []
+
+
+def logged(served: Served) -> list[dict[str, Any]]:
+    """The hub's log, once checked to be JSON lines, each with its time, level, logger and
+    message."""
+    lines = [json.loads(line) for line in served.log.read_text().splitlines()]
+    assert all(line.keys() >= {"t", "level", "logger", "msg"} for line in lines)
+    return lines
+
+
+async def test_serve_on_sigterm_ends_the_session_then_closes_the_connections(
+    served: Served, xdg: dict[str, str], simulator: SimulatorFactory
+) -> None:
+    device = await simulator(served.device).add("m5stack-atom-echo", "kitchen")
+    await cli(xdg, "approve", device.device_id, "as", "kitchen")
+    await device.wait_for(lambda: device.state == "online")
+    seen: list[tuple[str, str, bool]] = []
+
+    def watch() -> bool:
+        seen.append((device.state, device.status, device.armed))
+        return device.state != "online"
+
+    async with tinyaisense.connect(served.agent_url, served.agent_token) as agent:
+        await device.wait_for(lambda: device.armed)
+        watching = asyncio.create_task(device.wait_for(watch))
+
+        served.process.send_signal(signal.SIGTERM)
+
+        ended = [n.params["reason"] async for n in agent.notifications()]
+        await watching
+    assert await served.process.wait() == 0
+
+    assert ended == ["shutdown"]
+    # The device is told the Session is over while it's still connected.
+    assert ("online", "no_agent", False) in seen
+    assert seen[-1][0] != "online"
+    messages = [line["msg"] for line in logged(served)]
+    session_ended = messages.index(f"Session {agent.id} ended: shutdown")
+    assert messages.index("shutting down") < session_ended
+    closed = f"{device.device_id}: Connection closed: the hub is shutting down"
+    assert messages.index(closed) > session_ended
+
+
+@pytest.mark.parametrize("served", ['[debug]\nrecord_dir = "$TMP/rec"\n'], indirect=True)
+async def test_serve_records_each_session_in_the_record_dir_of_its_config(
+    served: Served, tmp_path: Path
+) -> None:
+    async with tinyaisense.connect(served.agent_url, served.agent_token) as agent:
+        await agent.devices()
+
+    records = trace(await recorded(tmp_path / "rec"))
+    assert [r["type"] for r in records] == ["session.started", "call", "reply", "session.ended"]
+    assert records[0]["session"] == agent.id
 
 
 @pytest.mark.parametrize("served", [SPEECH], indirect=True)

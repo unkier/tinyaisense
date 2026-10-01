@@ -25,6 +25,13 @@ The hub advertises itself over mDNS as `_tinyaisense._tcp`, so devices find it w
 
 The owner commands reach the running hub over a 0600 Unix socket in `$XDG_RUNTIME_DIR/tinyaisense/`, and no other way. Paired devices, with their volumes, live in `$XDG_STATE_HOME/tinyaisense/state.json`.
 
+`serve` logs JSON lines to stderr, each with `t`, `level`, `logger` and `msg`. Some carry more fields, for `jq`:
+
+- every stream's end has `"type": "stream.ended"`, with its `stats`, `counters`, `gaps` and, for a mic, `mouth_to_hub_ms` (`p50`, `p99` and `count`), the time from each frame's first sample to the hub;
+- `"type": "loop.lag"` warns that the hub's loop ran a timer over 5 ms late (`loop_lag_ms`), at most once a second, with the `count` and `max_ms` since the last warning.
+
+To debug a bad conversation, set `record_dir` under `[debug]`. The hub then keeps a dir per Session there, holding a 16 kHz WAV per stream (what the mic heard, or what the speaker was sent) and `trace.jsonl`. The trace records the agent's calls and their replies, every notification the agent got, and when each stream started and ended. On SIGTERM, the hub ends the Session (`shutdown`) before it closes the device Connections.
+
 ## Agents over MCP
 
 MCP clients reach the hub at `http://<hub>:8421/mcp` over Streamable HTTP, with the agent token as `Authorization: Bearer <token>`. For agents on other machines, add the name they reach the hub by to `allowed_hosts`.

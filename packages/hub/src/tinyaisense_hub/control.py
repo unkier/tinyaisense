@@ -21,6 +21,7 @@ from .devices import CommandSpec, DeviceConnection, check_args, volume_commands
 from .errors import HubError
 from .gestures import Down, Gesture, Gestures, Up
 from .keepalive import Tick
+from .logs import fields
 from .mic import STARTED as MIC_STARTED
 from .mic import Listener, MicStream
 from .session import Session
@@ -382,6 +383,7 @@ class Control:
         address = f"{record.name}/{mic.id}"
         stream = MicStream.listened(session, conn, mic.id, stream_id, address, listener, tail=tail)
         stream.reflex = True
+        stream.record()
         conn.receivers[stream_id] = stream
         controller.streams[mic.id] = stream
         stream.held = True
@@ -614,6 +616,7 @@ class Control:
             conn.stream_ids.close(stream.stream_id)
             raise started
         controller.streams[stream.cap] = stream
+        stream.record()
         if stream.handle is not None:
             stream.session.streams[stream.handle] = stream
             stream.session.notify(
@@ -772,7 +775,23 @@ class Control:
         if controller is not None and controller.streams.get(stream.cap) is stream:
             del controller.streams[stream.cap]
         end = StreamEnd(reason, stats)
-        _log.info("%s: stream %d ended %s: %s", stream.address, stream.stream_id, reason, stats)
+        how: JsonObject = {"reason": reason, "stats": stats} | stream.report(stats)
+        _log.info(
+            "%s: stream %d ended %s",
+            stream.address,
+            stream.stream_id,
+            reason,
+            extra=fields(
+                type="stream.ended",
+                address=stream.address,
+                kind=stream.kind,
+                stream=stream.stream_id,
+                session=stream.session.id,
+                **how,
+            ),
+        )
+        if stream.recording is not None:
+            stream.recording.close(how)
         stream.ended.set_result(end)
         if stream.on_end is not None:
             stream.on_end(end)

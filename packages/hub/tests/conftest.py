@@ -7,7 +7,7 @@ from typing import Protocol
 import pytest
 import uvloop
 from tinyaisense_hub import Config, Hub, OwnerClient, SpeechConfig, Timing
-from tinyaisense_hub.config import LOCAL_HOSTS
+from tinyaisense_hub.config import LOCAL_HOSTS, Debug
 from tinyaisense_sim import Simulator
 from tinyaisense_sim.pytest_plugin import SimulatorFactory
 
@@ -44,6 +44,7 @@ class StartHub(Protocol):
         host: str | None = "127.0.0.1",
         speech: SpeechConfig = ...,
         allowed_hosts: tuple[str, ...] = ...,
+        record_dir: Path | None = None,
     ) -> Awaitable[Hub]: ...
 
 
@@ -73,8 +74,8 @@ async def start_hub(tmp_path: Path, runtime_dir: Path) -> AsyncIterator[StartHub
     """Start an in-process hub on ephemeral ports, on loopback unless given a host (None: every
     address). Every hub shares one state dir.
 
-    It advertises over mDNS only if given a service type to advertise, and has no speech
-    engines unless given some.
+    It advertises over mDNS only if given a service type to advertise, has no speech engines
+    unless given some, and records nothing unless given a `record_dir`.
     """
     hubs: list[Hub] = []
 
@@ -87,6 +88,7 @@ async def start_hub(tmp_path: Path, runtime_dir: Path) -> AsyncIterator[StartHub
         host: str | None = "127.0.0.1",
         speech: SpeechConfig = NO_SPEECH,
         allowed_hosts: tuple[str, ...] = LOCAL_HOSTS,
+        record_dir: Path | None = None,
     ) -> Hub:
         config = Config(
             agent_token="agent-token",
@@ -95,6 +97,7 @@ async def start_hub(tmp_path: Path, runtime_dir: Path) -> AsyncIterator[StartHub
             allowed_hosts=allowed_hosts,
             timing=timing,
             speech=speech,
+            debug=Debug(record_dir=record_dir),
         )
         hub = Hub(
             config,

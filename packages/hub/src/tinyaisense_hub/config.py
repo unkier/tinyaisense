@@ -79,6 +79,8 @@ class Timing:
     mcp_progress_ms: int = 5000
     """While an MCP tool call runs, progress goes out this often, if the client asked for
     it."""
+    loop_lag_ms: int = 5
+    """The hub logs a warning when its loop runs a timer more than this late."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -176,6 +178,14 @@ class SpeechConfig:
             raise ConfigError(f"speech.lang: no Voice speaks {self.lang}")
 
 
+@dataclass(frozen=True, slots=True)
+class Debug:
+    """Aids to debugging, all off by default: the `[debug]` section."""
+
+    record_dir: Path | None = None
+    """Where to record every Session, for replay: a WAV per stream and a JSONL trace."""
+
+
 LOCAL_HOSTS = ("127.0.0.1:*", "localhost:*", "[::1]:*")
 
 
@@ -190,6 +200,7 @@ class Config:
     any port."""
     timing: Timing = field(default_factory=Timing)
     speech: SpeechConfig = field(default_factory=SpeechConfig)
+    debug: Debug = field(default_factory=Debug)
 
 
 LOCAL_SPEECH = SpeechConfig(
@@ -239,7 +250,23 @@ http = {config.http_port}
 [timing]
 {timing}
 
-{_render_speech(config.speech)}"""
+{_render_speech(config.speech)}
+{_render_debug(config.debug)}"""
+
+
+def _render_debug(debug: Debug) -> str:
+    record_dir = (
+        f"record_dir = {_toml(str(debug.record_dir))}"
+        if debug.record_dir is not None
+        else '# record_dir = "~/tinyaisense-recordings"'
+    )
+    return f"""\
+# Aids to debugging, all off by default.
+[debug]
+# A dir to record every Session in, for replay: a dir per Session under it, with a WAV per
+# stream and a JSONL trace of the agent's calls, what the hub told it, and the streams.
+{record_dir}
+"""
 
 
 def _render_speech(speech: SpeechConfig) -> str:
@@ -364,6 +391,7 @@ def parse_config(text: str) -> Config:
             **{f.name: timing.positive_int(f.name, cast(int, f.default)) for f in fields(Timing)}
         ),
         speech=_speech(top.table("speech")),
+        debug=_debug(top.table("debug")),
     )
     for table in (top, ports, timing):
         table.check_unknown()
@@ -398,6 +426,15 @@ def _speech(table: _Table) -> SpeechConfig:
         checked.check_unknown()
     speech.check()
     return speech
+
+
+def _debug(table: _Table) -> Debug:
+    record_dir = table.optional_string("record_dir")
+    debug = Debug(None if record_dir is None else Path(record_dir).expanduser())
+    if debug.record_dir is not None and not debug.record_dir.is_absolute():
+        raise ConfigError("debug.record_dir must be an absolute path, or start with ~")
+    table.check_unknown()
+    return debug
 
 
 def _engine(table: _Table) -> EngineConfig:

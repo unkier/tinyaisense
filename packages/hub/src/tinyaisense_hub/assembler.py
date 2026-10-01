@@ -65,6 +65,8 @@ class MicAssembler:
         """Frames delivered, zero-filled ones included."""
         self.filled = 0
         """Frames zero-filled."""
+        self.gaps = 0
+        """Runs of frames zero-filled."""
         self.late = 0
         """Late frames and duplicates dropped."""
         self.rejected: Counter[str] = Counter()
@@ -145,6 +147,7 @@ class MicAssembler:
         for index in range(self._next, until):
             actions.append(Deliver(index, silence))
         if until > self._next:
+            self.gaps += 1
             self.filled += until - self._next
             self.frames += until - self._next
             self._next = until

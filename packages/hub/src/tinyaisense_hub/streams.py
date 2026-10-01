@@ -3,11 +3,12 @@
 import asyncio
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, ClassVar, Literal
 
 from tinyaisense_wire import AudioFormat, JsonObject
 
 from .devices import DeviceConnection
+from .record import StreamRecording
 
 if TYPE_CHECKING:
     from .session import Session  # it holds its streams
@@ -29,6 +30,10 @@ class StreamEnd:
 
 class Stream:
     """One stream of a Session, from the device's `start` reply to its end."""
+
+    kind: ClassVar[Literal["speaker", "mic"]]
+    recording: StreamRecording | None = None
+    """Its WAV, if the hub records its Session."""
 
     on_end: Callable[[StreamEnd], None] | None = None
     """Called as the stream ends, before anything else hears of it."""
@@ -62,3 +67,15 @@ class Stream:
     def open(self) -> bool:
         """Whether the stream is neither stopping nor over."""
         return not self.stopping and not self.ended.done()
+
+    def record(self) -> None:
+        """Start its WAV, if the hub records its Session."""
+        if (recording := self.session.recording) is not None:
+            self.recording = recording.stream(
+                self.address, self.kind, self.stream_id, self.handle, FORMAT.rate
+            )
+
+    def report(self, stats: JsonObject) -> JsonObject:
+        """What the log line of its end carries besides its `stats`: `counters`, `gaps` and
+        whatever else its Kind has to tell."""
+        raise NotImplementedError

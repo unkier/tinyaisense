@@ -6,7 +6,7 @@ import secrets
 import time
 from collections.abc import AsyncGenerator, Callable, Coroutine
 from contextlib import asynccontextmanager
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from typing import TYPE_CHECKING, Any, Literal, Protocol
 
 from tinyaisense_wire import JsonObject
@@ -16,6 +16,7 @@ from .config import Timing
 from .errors import HubError
 from .idle import CallEnded, CallStarted, Idle
 from .keepalive import Tick
+from .record import Recorder, SessionRecording, TracedCall
 from .streams import Stream
 
 if TYPE_CHECKING:
@@ -112,6 +113,8 @@ class Session:
     joined: SessionSink | None = None
     """What also hears the Session's notifications, but not its audio: the MCP links that
     joined it, once one has."""
+    recording: SessionRecording | None = None
+    """Its dir under the record dir, if the hub records Sessions."""
     id: str = field(default_factory=lambda: secrets.token_urlsafe(16))
     since: int = field(default_factory=lambda: _now_ms())
     """Epoch ms."""
@@ -129,10 +132,7 @@ class Session:
     def notify(self, method: str, params: JsonObject, after: int | None = None) -> None:
         """Send a notification, stamped with `t`: now. `after` a stream handle, it follows
         the frames of it queued so far."""
-        params = params | {"t": _now_ms()}
-        self.sink.notify(method, params, after)
-        if self.joined is not None:
-            self.joined.notify(method, params)
+        self._send(method, params | {"t": _now_ms()}, after=after)
 
     def device_event(
         self, method: str, params: JsonObject, at: int | None, *, edge: bool = False
@@ -140,10 +140,14 @@ class Session:
         """Send a device Event, stamped with `t`: `at`, when it happened on the hub's
         monotonic clock in µs; now if None. A raw button `edge` counts toward the button
         latency stats."""
-        params = params | {"t": _now_ms() if at is None else epoch_ms(at)}
-        self.sink.notify(method, params, latency_from=at if edge else None)
-        if self.joined is not None:
-            self.joined.notify(method, params)
+        t = _now_ms() if at is None else epoch_ms(at)
+        self._send(method, params | {"t": t}, latency_from=at if edge else None)
+
+    def trace_call(self, via: Holder, method: str, params: JsonObject) -> TracedCall:
+        """Trace an agent's call, if the Session is recorded: then its reply, once it ends."""
+        if self.recording is None:
+            return TracedCall(None, 0)
+        return self.recording.call(via, method, params)
 
     def audio(self, handle: int, index: int, pcm: bytes) -> None:
         self.sink.audio(handle, index, pcm)
@@ -165,6 +169,19 @@ class Session:
     def new_utterance_id(self) -> int:
         self._last_utterance += 1
         return self._last_utterance
+
+    def _send(
+        self,
+        method: str,
+        params: JsonObject,
+        after: int | None = None,
+        latency_from: int | None = None,
+    ) -> None:
+        if self.recording is not None:
+            self.recording.notify(method, params)
+        self.sink.notify(method, params, after, latency_from)
+        if self.joined is not None:
+            self.joined.notify(method, params)
 
 
 class DeviceControl(Protocol):
@@ -188,8 +205,16 @@ class SpeechControl(Protocol):
 class Sessions:
     """The Session manager."""
 
-    def __init__(self, control: DeviceControl, speech: SpeechControl, timing: Timing) -> None:
+    def __init__(
+        self,
+        control: DeviceControl,
+        speech: SpeechControl,
+        timing: Timing,
+        recorder: Recorder | None = None,
+    ) -> None:
+        """`recorder` records every Session, if given."""
         self.current: Session | None = None
+        self._recorder = recorder
         self._control = control
         self._speech = speech
         self._idle_after = timing.mcp_idle_ms * 1000
@@ -301,6 +326,11 @@ class Sessions:
     def _start(self, session: Session) -> Session:
         self.current = session
         _log.info("Session %s started (%s)", session.id, session.holder)
+        if self._recorder is not None:
+            utterances = asdict(session.utterances)
+            session.recording = self._recorder.session(
+                session.id, session.holder, session.since, utterances
+            )
         self._control.session_started(session)
         return session
 
@@ -316,6 +346,8 @@ class Sessions:
         session.sink.ended(reason)
         if session.joined is not None:
             session.joined.ended(reason)
+        if session.recording is not None:
+            session.recording.close(reason)
 
     def _spawn(self, coroutine: Coroutine[Any, Any, None]) -> None:
         task = asyncio.create_task(coroutine)

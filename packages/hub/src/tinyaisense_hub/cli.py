@@ -14,6 +14,7 @@ from typing import Any
 import uvloop
 from tinyaisense_wire import MDNS_SERVICE
 
+from . import logs
 from .config import (
     ConfigError,
     config_path,
@@ -157,9 +158,7 @@ def _init(args: argparse.Namespace) -> int:
 
 def _serve(args: argparse.Namespace) -> int:
     config = load_config(config_path())
-    logging.basicConfig(
-        level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
-    )
+    logs.setup()
 
     async def serve() -> None:
         hub = Hub(

@@ -15,7 +15,9 @@ from .control import Control
 from .core import Core
 from .devices import Datagrams, Registry
 from .discovery import Advertiser
+from .lag import LoopMonitor
 from .owner import OwnerServer
+from .record import Recorder
 from .session import Sessions
 from .speech.layer import Speech
 from .state import StateStore
@@ -55,6 +57,7 @@ class Hub:
         self._http: HttpServer | None = None
         self._owner: OwnerServer | None = None
         self._advertiser: Advertiser | None = None
+        self._loop_lag = LoopMonitor(config.timing.loop_lag_ms * 1000)
         self.button_latency = Latency()
         """From each raw button edge on a device to its write on the agent's socket."""
 
@@ -137,7 +140,11 @@ class Hub:
             self._udp, datagrams = await loop.create_datagram_endpoint(
                 Datagrams, local_addr=(self._host or "0.0.0.0", port)
             )
-        sessions = Sessions(self._control, self._speech, self.config.timing)
+        recorder = None
+        if (record_dir := self.config.debug.record_dir) is not None:
+            recorder = Recorder(record_dir)
+            recorder.start()
+        sessions = Sessions(self._control, self._speech, self.config.timing, recorder)
         self._registry = Registry(
             StateStore(self._state_dir),
             udp=self._udp,
@@ -175,6 +182,7 @@ class Hub:
         if self._mdns is not None:
             self._advertiser = Advertiser(self._mdns, self._host, self.device_address[1])
             self._advertiser.start()
+        self._loop_lag.start()
 
     async def close(self) -> None:
         advertiser, owner, tcp = self._advertiser, self._owner, self._tcp
@@ -182,6 +190,7 @@ class Hub:
         control, speech = self._control, self._speech
         self._advertiser = self._owner = self._tcp = self._udp = self._registry = None
         self._control = self._speech = self._core = self._http = None
+        self._loop_lag.close()
         if advertiser is not None:
             await advertiser.close()
         if owner is not None:

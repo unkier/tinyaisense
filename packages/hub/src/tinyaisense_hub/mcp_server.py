@@ -33,6 +33,7 @@ from .config import Timing
 from .core import Core
 from .errors import HubError, HubErrorCode
 from .mcp_events import Follower, Inbox, Joined
+from .record import TracedCall
 from .session import Session, ThenListen, UtteranceOptIn
 
 _VOICE_LOOP = """\
@@ -614,7 +615,10 @@ class _Call:
         self.task.add_done_callback(self._claimed)
 
     async def _run(self, core: Core, caller: _Caller, tool: _Tool, args: JsonObject) -> _Outcome:
+        traced = TracedCall(None, 0)
+
         async def run() -> JsonObject:
+            nonlocal traced
             if caller.hub_session is None:
                 claim = core.mcp_call(caller.identity, Inbox)
             else:
@@ -623,10 +627,17 @@ class _Call:
                 if caller.hub_session is not None and session.joined is None:
                     session.joined = Joined(session)  # before it acts, to follow what it does
                 self.session = session
+                traced = session.trace_call("mcp", self._name, args)
                 self._claimed()
                 return await tool(session, args, self.stop)
 
-        return await _outcome(self._name, run())
+        try:
+            result, error = await _outcome(self._name, run())
+        except asyncio.CancelledError:
+            traced.cancelled()
+            raise
+        traced.replied(result, error=error)
+        return result, error
 
     def _claimed(self, _: object = None) -> None:
         if not self.claimed.done():

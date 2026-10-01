@@ -25,7 +25,11 @@ _log = logging.getLogger("tinyaisense_hub.speaker")
 class SpeakerStream(Stream):
     """One agent speaker stream. It takes the agent's audio while it's `open`."""
 
+    kind = "speaker"
+
     sent_bytes = 0
+    estimated = False
+    """Its stats are the hub's `estimate`."""
     first_sent: int | None = None
     """When the first frame went out, in µs on the hub's monotonic clock."""
     on_starved: Callable[[], None] | None = None
@@ -53,9 +57,17 @@ class SpeakerStream(Stream):
         """The last of the agent's audio, which the resampler still holds: none follows."""
         return b"" if self._resampler is None else self._resampler.flush()
 
+    def report(self, stats: JsonObject) -> JsonObject:
+        """The frames sent, and the gaps the device played: its underruns; None if its stats
+        are the hub's estimate, which can't know them."""
+        sent = -(-self.sent_bytes // FORMAT.frame_bytes)
+        gaps = None if self.estimated else stats["underruns"]
+        return {"counters": {"sent": sent}, "gaps": gaps}
+
     def estimate(self, now: int) -> JsonObject:
         """The stats, when the device can't report them: `played_ms` is the audio sent,
         capped by the time since the first frame went out."""
+        self.estimated = True
         played = 0
         if self.first_sent is not None:
             sent_ms = self.sent_bytes * FORMAT.frame_ms // FORMAT.frame_bytes
@@ -138,6 +150,8 @@ class Speakers:
                     if stream.first_sent is None:
                         stream.first_sent = now
                     stream.sent_bytes += len(payload)
+                    if stream.recording is not None:
+                        stream.recording.write(payload)
                     stream.conn.send_frame(stream.stream_id, seq, payload)
                 case Drain(stream, last_seq):
                     self._drain(stream, last_seq)

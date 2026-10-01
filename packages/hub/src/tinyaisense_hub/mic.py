@@ -13,6 +13,7 @@ from .assembler import Deliver, Finished, Frame, Last, MicAssembler
 from .devices import DeviceConnection
 from .keepalive import Tick
 from .resampler import Resampler
+from .stats import Spread
 from .streams import FORMAT, Stream, StreamEnd
 
 if TYPE_CHECKING:
@@ -49,6 +50,7 @@ class MicStream(Stream):
     `last_seq`, the stream is `finished` once its tail is in, or once it has waited `tail` µs
     for it."""
 
+    kind = "mic"
     listener: Listener | None = None
     """What hears it, for a listen."""
     held = False
@@ -75,6 +77,9 @@ class MicStream(Stream):
         Utterance's, for a listen's; None if they don't."""
         self.dropped = 0
         """Frames the device dropped from its queue, from its `stop` reply."""
+        self.mouth_to_hub = Spread()
+        """From each frame's first sample, by the device clock, to the hub taking it into the
+        timeline."""
         self.finished: asyncio.Future[None] = asyncio.get_running_loop().create_future()
         self._assembler = MicAssembler(FORMAT, tail=tail)
         self._resampler = (
@@ -130,7 +135,12 @@ class MicStream(Stream):
             self._deliver(frame)
 
     def frame(self, frame: StreamFrame, now: int) -> None:
+        a = self._assembler
+        taken = a.frames - a.filled
         self._run(Frame(frame.seq, frame.payload), now)
+        # Only a frame taken into the timeline counts: not a duplicate, nor one too late.
+        if a.frames - a.filled > taken and (at := self.conn.clock.to_hub(frame.ts)) is not None:
+            self.mouth_to_hub.record(now - at)
 
     def stopped(self, reply: JsonObject | BaseException) -> None:
         """The device replied to `stop`, or said the Reflex stopped the stream: wait for the
@@ -157,16 +167,6 @@ class MicStream(Stream):
         self._alarm.cancel()
         if not self.finished.done():
             self.finished.set_result(None)
-            a = self._assembler
-            _log.info(
-                "%s: mic stream %d: %d frames, %d zero-filled, %d late, dropped %s",
-                self.address,
-                self.stream_id,
-                a.frames,
-                a.filled,
-                a.late,
-                dict(a.rejected),
-            )
 
     def stats(self, skipped: int) -> JsonObject:
         """`{frames, lost, dropped, skipped}`, given the frames the agent's link skipped. The
@@ -177,6 +177,18 @@ class MicStream(Stream):
             "lost": max(0, a.filled - self.dropped),
             "dropped": self.dropped,
             "skipped": skipped,
+        }
+
+    def report(self, stats: JsonObject) -> JsonObject:
+        """The frames zero-filled, the late ones and duplicates, and those dropped for breaking
+        the frame rules, by why; the gaps zero-filled; and the p50 and p99 of the time from
+        each frame's first sample to the hub, in ms, over the `count` frames whose time the
+        hub could tell."""
+        a = self._assembler
+        return {
+            "counters": {"zero_filled": a.filled, "late": a.late, "rejected": dict(a.rejected)},
+            "gaps": a.gaps,
+            "mouth_to_hub_ms": self.mouth_to_hub.to_json(),
         }
 
     def _tick(self, now: int) -> None:
@@ -198,6 +210,8 @@ class MicStream(Stream):
         self._alarm.set(self._assembler.next_deadline(), now)
 
     def _deliver(self, frame: Deliver) -> None:
+        if self.recording is not None:
+            self.recording.write(frame.pcm)
         if self.listener is not None:
             self.listener.hear(frame.pcm)
         if self.audio is not None:

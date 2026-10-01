@@ -1,7 +1,7 @@
 """The hub's always-on stats, for the owner's `stats`."""
 
 import math
-from collections import deque
+from collections import Counter, deque
 from collections.abc import Sequence
 
 from tinyaisense_wire import JsonObject
@@ -44,6 +44,38 @@ class Latency:
                 {"le_ms": le, "count": count} for le, count in zip(bounds, counts, strict=True)
             ],
         }
+
+
+class Spread:
+    """Latency samples, in bins of 0.1 ms: quantiles in bounded memory, however many."""
+
+    BIN_US = 100
+    """How wide a bin is, in µs."""
+
+    def __init__(self) -> None:
+        self._bins: Counter[int] = Counter()
+        self.count = 0
+        """How many samples."""
+
+    def record(self, us: int) -> None:
+        """One sample, in µs. A negative one, from clock sync error, counts as 0."""
+        self._bins[max(0, us) // self.BIN_US] += 1
+        self.count += 1
+
+    def to_json(self) -> JsonObject:
+        """`{p50, p99, count}`: each quantile in ms, the bin of its nearest-rank sample, or
+        None with no samples."""
+        out: JsonObject = {"p50": None, "p99": None, "count": self.count}
+        ranks = {
+            name: max(1, math.ceil(p * self.count)) for name, p in (("p50", 0.5), ("p99", 0.99))
+        }
+        seen = 0
+        for at in sorted(self._bins):
+            seen += self._bins[at]
+            for name, rank in ranks.items():
+                if out[name] is None and seen >= rank:
+                    out[name] = round(at * self.BIN_US / 1000, 1)
+        return out
 
 
 def nearest_rank[T](ordered: Sequence[T], p: float) -> T | None:
