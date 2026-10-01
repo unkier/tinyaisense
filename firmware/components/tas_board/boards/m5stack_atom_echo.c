@@ -80,7 +80,17 @@ static void mic_stop(void) {
 
 static bool mic_read(int16_t *pcm, size_t samples, uint32_t timeout_ms) {
     size_t got;
-    return i2s_channel_read(mic_chan, pcm, samples * sizeof *pcm, &got, timeout_ms) == ESP_OK;
+    if (i2s_channel_read(mic_chan, pcm, samples * sizeof *pcm, &got, timeout_ms) != ESP_OK) {
+        return false;
+    }
+    // ESP32's I2S packs 16-bit mono samples two to a 32-bit word, the later one first; left so,
+    // each tone gets a mirror at 8 kHz minus it. `samples` is even: every frame advertised is.
+    for (size_t i = 0; i + 1 < samples; i += 2) {
+        int16_t later = pcm[i];
+        pcm[i] = pcm[i + 1];
+        pcm[i + 1] = later;
+    }
+    return true;
 }
 
 static const tas_speaker_hw_t speaker = {
