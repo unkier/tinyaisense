@@ -82,8 +82,11 @@ uint32_t ctrl_connections_lost(void);
 
 // ---- commands.c
 
+void commands_init(const tas_board_t *board);
 // Answers `cmd` in `reply`, which comes ok with an empty result. Never blocks.
 void commands_handle(const tas_msg_t *cmd, tas_arena_t *arena, tas_msg_t *reply);
+// The Connection ended: ends what of each capability's belonged to it, e.g. an LED claim.
+void commands_disconnected(void);
 
 // ---- status.c
 
@@ -91,6 +94,8 @@ void status_start(const tas_board_t *board);
 void status_set_wifi(bool configured, bool up);
 void status_set_conn(ctrl_state_t state);
 void status_set_hub(tas_status_t layer);
+// Shows identify for `s` seconds from now, cutting short any earlier one.
+void status_identify(uint32_t s);
 tas_status_t status_shown(void);
 // Renders `look` on the Status LED once, for use before the led task runs.
 void status_render_look(const tas_board_t *board, const tas_look_t *look, uint64_t t_ms);

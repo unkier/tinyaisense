@@ -25,18 +25,6 @@ typedef struct {
     uint16_t count; // led: how many LEDs it has
 } tas_cap_t;
 
-typedef struct {
-    uint8_t r, g, b;
-} tas_rgb_t;
-
-// How an LED looks: what led.set takes.
-typedef struct {
-    tas_rgb_t color;
-    uint8_t brightness; // 0-100, scaled by the Board's cap
-    tas_pattern_t pattern;
-    uint16_t period_ms;
-} tas_look_t;
-
 // Capabilities of which at most one is active at a time, e.g. a half-duplex mic and speaker.
 typedef struct {
     const char *const *ids;

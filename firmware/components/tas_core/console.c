@@ -15,6 +15,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "tas_conn.h"
+#include "tas_kinds.h"
 
 #define TAG "console"
 #define UART CONFIG_ESP_CONSOLE_UART_NUM
@@ -103,6 +104,11 @@ static int cmd_status(int argc, char **argv) {
            (unsigned)ctrl_connections_lost());
     printf("paired    %s\n", c.has_token ? "yes" : "no");
     printf("status    %s\n", tas_status_name(status_shown()));
+    for (size_t i = 0; i < board->cap_count; i++) {
+        const tas_cap_t *cap = &board->caps[i];
+        if (cap->kind != TAS_KIND_SPEAKER) continue;
+        printf("volume    %u, %s\n", tas_kinds_volume(cap), cap->id);
+    }
     printf("heap      %u B free, %u B lowest\n", (unsigned)esp_get_free_heap_size(),
            (unsigned)esp_get_minimum_free_heap_size());
     printf("uptime    %llu s\n", (unsigned long long)(esp_timer_get_time() / 1000000));

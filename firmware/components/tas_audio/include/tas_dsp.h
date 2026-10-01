@@ -40,3 +40,7 @@ typedef struct {
 // Call on every speaker stream start: it clears the filter.
 void tas_spk_cond_start(tas_spk_cond_t *spk, const tas_spk_cond_config_t *cfg);
 void tas_spk_cond_run(tas_spk_cond_t *spk, int16_t *pcm, size_t samples);
+
+// The speaker's software gain at volume `level` (docs/protocol/kinds/speaker.md#set_volume): 0
+// mutes, 1 is -40 dB and 100 is 0 dB, evenly spaced in dB between. Above 100 counts as 100.
+float tas_volume_gain(uint8_t level);

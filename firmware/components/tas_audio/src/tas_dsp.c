@@ -57,3 +57,10 @@ void tas_spk_cond_start(tas_spk_cond_t *spk, const tas_spk_cond_config_t *cfg) {
 void tas_spk_cond_run(tas_spk_cond_t *spk, int16_t *pcm, size_t samples) {
     for (size_t i = 0; i < samples; i++) pcm[i] = saturate(step(&spk->lowcut, pcm[i]));
 }
+
+float tas_volume_gain(uint8_t level) {
+    if (level == 0) return 0.0f;
+    if (level > 100) level = 100;
+    // -40 dB at 1, as a power of 10: dB / 20.
+    return powf(10.0f, -2.0f * (float)(100 - level) / 99.0f);
+}

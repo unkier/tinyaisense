@@ -1,3 +1,5 @@
+#include <stdlib.h>
+
 #include "kind_modules.h"
 
 const tas_kind_module_t *tas_kind_module(tas_kind_t kind) {
@@ -21,4 +23,17 @@ tas_json_t *tas_kind_audio_params(uint32_t rate, tas_arena_t *arena) {
     format = tas_json_put(arena, format, "frame_ms", frame_ms);
     tas_json_t *formats = tas_json_push(tas_json_array(arena), format);
     return tas_json_put(arena, tas_json_object(arena), "formats", formats);
+}
+
+size_t tas_kind_add(tas_kind_instances_t *instances, const tas_cap_t *cap) {
+    if (instances->count == TAS_KINDS_MAX_INSTANCES) abort();
+    instances->caps[instances->count] = cap;
+    return instances->count++;
+}
+
+size_t tas_kind_find(const tas_kind_instances_t *instances, const tas_cap_t *cap) {
+    for (size_t i = 0; i < instances->count; i++) {
+        if (instances->caps[i] == cap) return i;
+    }
+    abort();
 }

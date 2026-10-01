@@ -1,0 +1,9 @@
+{
+  "name": "tas_led",
+  "version": "0.0.0",
+  "description": "tinyaisense pure-C led Kind: the agent's LED claim and what each LED shows. No IDF calls.",
+  "dependencies": {"tas_wire": "*", "tas_status": "*"},
+  "build": {
+    "flags": ["-std=c11", "-Wall", "-Wextra", "-Werror"]
+  }
+}

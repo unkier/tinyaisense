@@ -180,3 +180,24 @@ int tas_mirror_encode(uint32_t conn_id, uint16_t flags, const tas_msg_t *event, 
 // The frame rules of docs/protocol/audio.md, for a pcm_s16le stream frame of `size` bytes.
 tas_wire_err_t tas_frame_check(size_t size, uint32_t rate, uint32_t channels, uint32_t frame_ms,
                                bool final);
+
+// ---- Command args
+
+// Reading a command's args by its contract (packages/wire/src/tinyaisense_wire/contracts/): a
+// member of the wrong type or out of range breaks it, and the reply is invalid_args. Unknown
+// members are ignored.
+typedef enum {
+    TAS_ARG_ABSENT,
+    TAS_ARG_OK,
+    TAS_ARG_BAD,
+} tas_arg_t;
+
+// The member `key` of `args`: an integer in [min, max]. `1.0` and `true` aren't integers.
+tas_arg_t tas_arg_int(const tas_json_t *args, const char *key, int64_t min, int64_t max,
+                      int64_t *out);
+// The member `key` of `args`: one of the `count` strings in `names`, as its index.
+tas_arg_t tas_arg_enum(const tas_json_t *args, const char *key, const char *const *names,
+                       size_t count, size_t *out);
+
+// Fails the reply `reply` with `code` and `message`, which must outlive it: literals.
+void tas_reply_fail(tas_msg_t *reply, const char *code, const char *message);

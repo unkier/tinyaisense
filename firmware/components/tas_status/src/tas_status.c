@@ -47,3 +47,12 @@ uint8_t tas_pattern_level(tas_pattern_t pattern, uint32_t period_ms, uint64_t t_
     uint32_t linear = up >= half ? 255 : up * 255 / half;
     return (uint8_t)(linear * linear / 255);
 }
+
+tas_rgb_t tas_look_rgb(const tas_look_t *look, uint8_t brightness_cap, uint64_t t_ms) {
+    // The brightness level rounds to the nearest, as the Simulator's does.
+    uint32_t full = (look->brightness * brightness_cap + 50) / 100;
+    uint32_t level = tas_pattern_level(look->pattern, look->period_ms, t_ms) * full / 255;
+    return (tas_rgb_t){(uint8_t)(look->color.r * level / 255),
+                       (uint8_t)(look->color.g * level / 255),
+                       (uint8_t)(look->color.b * level / 255)};
+}

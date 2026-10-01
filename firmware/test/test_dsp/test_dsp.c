@@ -102,6 +102,18 @@ static void test_the_speaker_low_cut_is_300_hz(void) {
     TEST_ASSERT_DOUBLE_WITHIN(0.05 * 1104, 1104, speaker_amplitude(100, 10000));  // -19 dB
 }
 
+static void test_volume_0_mutes_1_is_minus_40_db_and_100_is_unity(void) {
+    TEST_ASSERT_EQUAL_FLOAT(0.0f, tas_volume_gain(0));
+    TEST_ASSERT_FLOAT_WITHIN(1e-5f, 0.01f, tas_volume_gain(1));
+    TEST_ASSERT_EQUAL_FLOAT(1.0f, tas_volume_gain(100));
+}
+
+static void test_volume_steps_evenly_in_db_between(void) {
+    // -40 dB * 50/99 and * 20/99, as the Simulator's curve gives them.
+    TEST_ASSERT_FLOAT_WITHIN(1e-5f, 0.0977010f, tas_volume_gain(50));
+    TEST_ASSERT_FLOAT_WITHIN(1e-5f, 0.3944206f, tas_volume_gain(80));
+}
+
 int main(void) {
     UNITY_BEGIN();
     RUN_TEST(test_the_mic_is_silent_for_20_ms_after_each_enable);
@@ -110,5 +122,7 @@ int main(void) {
     RUN_TEST(test_the_mic_removes_dc);
     RUN_TEST(test_loud_input_saturates_instead_of_wrapping);
     RUN_TEST(test_the_speaker_low_cut_is_300_hz);
+    RUN_TEST(test_volume_0_mutes_1_is_minus_40_db_and_100_is_unity);
+    RUN_TEST(test_volume_steps_evenly_in_db_between);
     return UNITY_END();
 }

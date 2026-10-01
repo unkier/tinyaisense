@@ -1,0 +1,12 @@
+menu "tinyaisense Kinds"
+
+    config TAS_SPEAKER_VOLUME
+        int "Speaker volume at boot"
+        range 0 100
+        default 80
+        help
+            Each speaker's volume until the hub sets one with set_volume, on its log curve: 0
+            mutes, 1 is -40 dB and 100 is 0 dB. The device never stores the hub's volume. Keep
+            it the same as the Simulator's default_volume.
+
+endmenu

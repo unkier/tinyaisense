@@ -31,7 +31,7 @@ static tas_conn_t conn;         // 12 KB, so kept off the stack
 static atomic_int kick_fd = -1; // -1 until ctrl_start: kicks before then are moot
 static atomic_uint kicks;
 static atomic_int state = CTRL_IDLE;
-static atomic_uint lost; // welcomed Connections that ended
+static atomic_uint lost; // Connections that ended, welcomed or not
 
 static portMUX_TYPE describe_mux = portMUX_INITIALIZER_UNLOCKED;
 static char peer_name[TAS_CONN_MAX_NAME + 1], peer_addr[HUB_ADDR_MAX];
@@ -263,7 +263,8 @@ static uint32_t connection(const struct sockaddr_in *hub, tas_backoff_t *backoff
     tas_conn_close(&conn, "closed"); // frees what it holds; `why` stays
     close(tcp);
     close(udp);
-    if (seen == TAS_CONN_WELCOMED) atomic_fetch_add(&lost, 1);
+    commands_disconnected();
+    atomic_fetch_add(&lost, 1);
     set_state(CTRL_IDLE, "", "");
     return kicked;
 }

@@ -1,6 +1,6 @@
 #pragma once
 // The Status (docs/protocol/kinds/device.md#status): the layers that apply now, and the one the
-// device shows. Plus the patterns that the Status and the led Kind animate with. Pure C.
+// device shows. Plus the looks and patterns that the Status and the led Kind animate with. Pure C.
 
 #include <stdbool.h>
 #include <stddef.h>
@@ -50,3 +50,19 @@ typedef enum {
 
 // The pattern's level at `t_ms`, 0-255.
 uint8_t tas_pattern_level(tas_pattern_t pattern, uint32_t period_ms, uint64_t t_ms);
+
+typedef struct {
+    uint8_t r, g, b;
+} tas_rgb_t;
+
+// How an LED looks: what led.set takes.
+typedef struct {
+    tas_rgb_t color;
+    uint8_t brightness; // 0-100, scaled by the Board's cap
+    tas_pattern_t pattern;
+    uint16_t period_ms;
+} tas_look_t;
+
+// The color `look` gives an LED at `t_ms` into its pattern, its brightness scaled so that 100 is
+// `brightness_cap` (0-255).
+tas_rgb_t tas_look_rgb(const tas_look_t *look, uint8_t brightness_cap, uint64_t t_ms);

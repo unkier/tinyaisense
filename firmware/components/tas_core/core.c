@@ -63,6 +63,7 @@ void tas_core_start(const tas_board_t *board) {
         const tas_cap_t *cap = &board->caps[i];
         tas_kind_module(cap->kind)->init(cap);
     }
+    commands_init(board);
     const tas_manifest_t *manifest = manifest_build(board);
     status_start(board);
     net_start();
