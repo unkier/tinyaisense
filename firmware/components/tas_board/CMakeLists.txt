@@ -5,6 +5,6 @@ endif()
 
 idf_component_register(SRCS ${board_src}
                        INCLUDE_DIRS "include"
-                       REQUIRES tas_audio
-                       PRIV_REQUIRES esp_driver_gpio)
-target_compile_options(${COMPONENT_LIB} PRIVATE -std=c11 -Wall -Wextra -Werror)
+                       REQUIRES tas_audio tas_status
+                       PRIV_REQUIRES esp_driver_gpio log)
+target_compile_options(${COMPONENT_LIB} PRIVATE -std=gnu11 -Wall -Wextra -Werror)

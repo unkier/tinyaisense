@@ -125,7 +125,7 @@ On every push to main, the model tier (`.github/workflows/model.yml`) runs `benc
 
 ## Firmware
 
-The firmware in `firmware/` is an ESP-IDF 5.5 project in plain C11, built with PlatformIO; `idf.py build` works too. Each Board gets its own binary, picked by a Kconfig choice. The pure-C audio code in `firmware/components/tas_audio` (DSP, ramps, the speaker jitter buffer and the DMA-patch planner) makes no IDF calls, so it's tested on the PC under ASan and UBSan:
+The firmware in `firmware/` is an ESP-IDF 5.5 project in C11, built with PlatformIO; `idf.py build` works too. Each Board gets its own binary, picked by a Kconfig choice. The pure-C code makes no IDF calls, so it's tested on the PC under ASan and UBSan: the audio code in `tas_audio` (DSP, ramps, the speaker jitter buffer and the DMA-patch planner), the wire codec in `tas_wire` against the golden vectors, the Connection in `tas_conn` (handshake, keepalive, protocol errors, backoff) and the Status priorities in `tas_status`:
 
 ```sh
 cd firmware
@@ -133,3 +133,5 @@ pio test -e native            # the pure-C libraries, with Unity
 pio run -e m5stack-atom-echo  # the Atom Echo binary; add `-t upload` to flash it
 pio check -e m5stack-atom-echo -e native --fail-on-defect=low --fail-on-defect=medium --fail-on-defect=high
 ```
+
+A device is set up over its serial console (`pio device monitor -e m5stack-atom-echo`): `wifi <ssid> [password]` stores the WiFi and reboots, `hub <host:port>` sets a static hub where mDNS can't reach and `hub auto` goes back to mDNS, `token clear` forgets the Pairing, `status` shows the device, its WiFi and its Connection, and `reboot` reboots. The settings live in NVS; dev builds can bake defaults in with `pio run -t menuconfig`, under "tinyaisense settings". Holding the button through boot for 5 s, while the LED blinks white, erases every setting.

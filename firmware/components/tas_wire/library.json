@@ -1,0 +1,8 @@
+{
+  "name": "tas_wire",
+  "version": "0.0.0",
+  "description": "tinyaisense pure-C wire codec: TCP frames, strict and canonical JSON messages, UDP datagrams. No IDF calls.",
+  "build": {
+    "flags": ["-std=c11", "-Wall", "-Wextra", "-Werror"]
+  }
+}

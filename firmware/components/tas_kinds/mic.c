@@ -7,4 +7,9 @@ static void init(const tas_cap_t *cap) {
     ESP_LOGI("mic", "%s ready", cap->id);
 }
 
-const tas_kind_module_t tas_mic_module = {.name = "mic", .init = init};
+static tas_json_t *params(const tas_board_t *board, const tas_cap_t *cap, tas_arena_t *arena) {
+    (void)cap;
+    return tas_kind_audio_params(board->mic_cond.rate, arena);
+}
+
+const tas_kind_module_t tas_mic_module = {.name = "mic", .init = init, .params = params};

@@ -1,0 +1,9 @@
+{
+  "name": "tas_conn",
+  "version": "0.0.0",
+  "description": "tinyaisense pure-C Connection logic, sans-IO: the handshake, keepalive and reconnect backoff. No IDF calls.",
+  "dependencies": {"tas_wire": "*"},
+  "build": {
+    "flags": ["-std=c11", "-Wall", "-Wextra", "-Werror"]
+  }
+}

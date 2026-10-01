@@ -1,0 +1,22 @@
+menu "tinyaisense settings"
+
+    # Dev builds can bake their settings in (e.g. with `pio run -t menuconfig`, which writes the
+    # gitignored sdkconfig.<env>). NVS overrides them once the console sets them.
+
+    config TAS_WIFI_SSID
+        string "WiFi SSID"
+        default ""
+        help
+            The WiFi to join until the console's `wifi` sets one. Empty: none.
+
+    config TAS_WIFI_PASSWORD
+        string "WiFi password"
+        default ""
+
+    config TAS_HUB
+        string "Hub"
+        default "auto"
+        help
+            Where the hub is until the console's `hub` sets it: "auto" for mDNS, or host:port.
+
+endmenu

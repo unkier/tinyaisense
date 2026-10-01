@@ -4,10 +4,12 @@
 // board file, its Kconfig choice entry and CMake line, a boards/<board>.defaults and a PlatformIO
 // env; the core and the Kind modules don't change.
 
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
 #include "tas_dsp.h"
+#include "tas_status.h"
 
 typedef enum {
     TAS_KIND_MIC,
@@ -20,7 +22,20 @@ typedef enum {
 typedef struct {
     const char *id; // unique on the device, e.g. "speaker"
     tas_kind_t kind;
+    uint16_t count; // led: how many LEDs it has
 } tas_cap_t;
+
+typedef struct {
+    uint8_t r, g, b;
+} tas_rgb_t;
+
+// How an LED looks: what led.set takes.
+typedef struct {
+    tas_rgb_t color;
+    uint8_t brightness; // 0-100, scaled by the Board's cap
+    tas_pattern_t pattern;
+    uint16_t period_ms;
+} tas_look_t;
 
 // Capabilities of which at most one is active at a time, e.g. a half-duplex mic and speaker.
 typedef struct {
@@ -37,7 +52,13 @@ typedef struct {
     tas_mic_cond_config_t mic_cond;
     tas_spk_cond_config_t spk_cond;
     uint8_t led_brightness_cap; // what LED brightness 100 maps to, 0-255
-    void (*init)(void);         // pins the Board needs set before anything else runs
+    const char *status_led;     // the led capability that shows the Status
+    const tas_look_t *status_looks; // how it shows each tas_status_t, bar TAS_STATUS_CLAIM
+    void (*init)(void);         // pins and drivers, set up before anything else runs
+    // Buffers one LED's color, already scaled; led_show sends a capability's LEDs out.
+    void (*led_set)(const tas_cap_t *cap, size_t index, tas_rgb_t rgb);
+    void (*led_show)(const tas_cap_t *cap);
+    bool (*reset_button_down)(void); // whether the factory-reset button is held now
 } tas_board_t;
 
 // The Board this binary was built for.
