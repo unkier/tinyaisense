@@ -9,4 +9,18 @@ menu "tinyaisense Kinds"
             mutes, 1 is -40 dB and 100 is 0 dB. The device never stores the hub's volume. Keep
             it the same as the Simulator's default_volume.
 
+    config TAS_SPEAKERS_MAX
+        int "Speakers a Board may have"
+        range 1 4
+        default 1
+        help
+            Each speaker's playout holds about 8 KB of static buffers.
+
+    config TAS_TEST_HOOKS
+        bool "Test hooks"
+        default n
+        help
+            Debug builds only: console commands that drive the Kinds for tests by hand and in
+            the loop, e.g. a test tone and its cut, with the firmware's own timing of them.
+
 endmenu

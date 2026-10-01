@@ -3,7 +3,8 @@
 #include "esp_log.h"
 #include "kind_modules.h"
 
-static void init(const tas_cap_t *cap) {
+static void init(const tas_board_t *board, const tas_cap_t *cap) {
+    (void)board;
     ESP_LOGI("mic", "%s ready", cap->id);
 }
 

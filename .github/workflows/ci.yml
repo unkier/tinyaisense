@@ -90,7 +90,9 @@ jobs:
       - run: pio test -e native
       # -Wall -Wextra -Werror on every tinyaisense component.
       - run: pio run -e m5stack-atom-echo
-      # After the build: the esp32 check reads the generated IDF config.
+      # The debug build adds the test hooks.
+      - run: pio run -e m5stack-atom-echo-debug
+      # After the builds: the esp32 checks read the generated IDF config.
       - run: >-
-          pio check -e m5stack-atom-echo -e native
+          pio check -e m5stack-atom-echo -e m5stack-atom-echo-debug -e native
           --fail-on-defect=low --fail-on-defect=medium --fail-on-defect=high

@@ -61,7 +61,7 @@ void tas_core_start(const tas_board_t *board) {
     factory_reset_if_held(board);
     for (size_t i = 0; i < board->cap_count; i++) {
         const tas_cap_t *cap = &board->caps[i];
-        tas_kind_module(cap->kind)->init(cap);
+        tas_kind_module(cap->kind)->init(board, cap);
     }
     commands_init(board);
     const tas_manifest_t *manifest = manifest_build(board);

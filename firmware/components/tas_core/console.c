@@ -180,5 +180,8 @@ void console_start(const tas_board_t *b, const tas_manifest_t *m) {
     for (size_t i = 0; i < sizeof commands / sizeof *commands; i++) {
         ESP_ERROR_CHECK(esp_console_cmd_register(&commands[i]));
     }
+#if CONFIG_TAS_TEST_HOOKS
+    tas_kinds_test_commands(board);
+#endif
     xTaskCreate(console_task, "console", CONSOLE_STACK, NULL, CONSOLE_PRIORITY, NULL);
 }

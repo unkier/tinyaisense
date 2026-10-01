@@ -1,0 +1,2 @@
+# Debug builds add this to a Board's defaults: the test hooks, for tests by hand and in the loop.
+CONFIG_TAS_TEST_HOOKS=y

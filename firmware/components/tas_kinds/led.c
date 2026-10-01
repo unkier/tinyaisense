@@ -12,7 +12,8 @@ static portMUX_TYPE mux = portMUX_INITIALIZER_UNLOCKED;
 static tas_kind_instances_t instances;
 static tas_led_t leds[TAS_KINDS_MAX_INSTANCES];
 
-static void init(const tas_cap_t *cap) {
+static void init(const tas_board_t *board, const tas_cap_t *cap) {
+    (void)board;
     if (cap->count > TAS_LED_MAX) abort();
     tas_led_init(&leds[tas_kind_add(&instances, cap)], cap->count);
     ESP_LOGI("led", "%s ready", cap->id);
