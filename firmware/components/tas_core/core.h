@@ -4,7 +4,8 @@
 //   config.c    the settings in NVS namespace `tas`, with Kconfig defaults
 //   console.c   the serial console
 //   net.c       WiFi and finding the hub (mDNS or the static `hub`)
-//   ctrl.c      the ctrl task: the Connection, around tas_conn
+//   ctrl.c      the ctrl task: the Connection, around tas_conn, and the Kinds' events
+//   udp.c       the UDP socket: stream frames both ways
 //   commands.c  the hub's commands
 //   status.c    the Status layers, and the led task that renders them
 //   manifest.c  the Manifest this device sends
@@ -15,6 +16,7 @@
 
 #include "lwip/sockets.h"
 #include "tas_board.h"
+#include "tas_kinds.h"
 #include "tas_status.h"
 #include "tas_wire.h"
 
@@ -72,6 +74,7 @@ typedef enum {
 // Why the ctrl task should look up from what it's doing.
 #define CTRL_KICK_RECONNECT (1u << 0) // drop the Connection and find the hub again, now
 #define CTRL_KICK_WIFI_DOWN (1u << 1) // drop the Connection
+#define CTRL_KICK_EVENTS (1u << 2)    // a Kind module emitted an event
 
 void ctrl_start(const tas_manifest_t *manifest);
 void ctrl_kick(uint32_t why);
@@ -79,14 +82,32 @@ ctrl_state_t ctrl_state(void);
 // The hub-given name and its address while there's a Connection, "" otherwise.
 void ctrl_describe(char *name, size_t name_size, char *hub, size_t hub_size);
 uint32_t ctrl_connections_lost(void);
+// Queues a Kind module's event for the Connection. Never blocks: with none welcomed, or the queue
+// full, it's dropped.
+void ctrl_emit(const tas_kind_event_t *event);
 
 // ---- commands.c
 
 void commands_init(const tas_board_t *board);
-// Answers `cmd` in `reply`, which comes ok with an empty result. Never blocks.
+// Answers `cmd` in `reply`, which comes ok with an empty result. Never blocks for long: a mic's
+// stop waits a few ms for its last frames to go out.
 void commands_handle(const tas_msg_t *cmd, tas_arena_t *arena, tas_msg_t *reply);
-// The Connection ended: ends what of each capability's belonged to it, e.g. an LED claim.
-void commands_disconnected(void);
+
+// ---- udp.c
+
+// Binds the socket and starts the udp_rx and udp_tx tasks. Call it once the network stack is up.
+void udp_start(void);
+uint16_t udp_port(void);
+// A Connection was welcomed: datagrams flow to and from `hub_ip`, tagged `conn_id`.
+void udp_welcomed(struct in_addr hub_ip, uint16_t hub_port, uint32_t conn_id);
+// The Connection closed: no more datagrams in or out.
+void udp_closed(void);
+// A mic has queued frames: wakes udp_tx.
+void udp_frames_ready(void);
+// Sends every mic frame queued now, in order, and returns once they're out.
+void udp_send_frames(void);
+// The port and what came of the datagrams, for the console.
+void udp_describe(char *buf, size_t size);
 
 // ---- status.c
 

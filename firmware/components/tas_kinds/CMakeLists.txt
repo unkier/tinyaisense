@@ -1,4 +1,4 @@
-set(srcs "mic.c" "speaker.c" "button.c" "led.c" "kinds.c")
+set(srcs "mic.c" "speaker.c" "button.c" "led.c" "kinds.c" "exclusive.c")
 if(CONFIG_TAS_TEST_HOOKS)
     list(APPEND srcs "test_hooks.c")
 endif()

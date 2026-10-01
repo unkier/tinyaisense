@@ -1,13 +1,12 @@
 // The Connection, driven as the ctrl task drives it: bytes from the hub in, the outbox out.
 
+#include <stdio.h>
 #include <string.h>
 #include <unity.h>
 
 #include "tas_conn.h"
 
 #define T0 1000000ULL // the device clock when TCP came up
-
-static tas_conn_t conn;
 static tas_arena_t arena; // the test's own messages
 
 // What the hooks saw.
@@ -24,12 +23,25 @@ static void on_token(void *ctx, const char *token) {
     }
 }
 
-// Answers `status` like the device does; fails anything else.
+static tas_conn_t conn;
+
+// What `state` the last `status` asked for, read after any event it sent.
+static char status_state[16];
+
+// Answers `status` like the device does, and with `"event":true` sends an event first, as the
+// device sends those queued before a command; fails anything else.
 static void on_command(void *ctx, const tas_msg_t *cmd, tas_arena_t *a, tas_msg_t *reply) {
     (void)ctx;
     (void)a;
     commands++;
-    if (!tas_str_eq(cmd->cmd.name, "status")) {
+    if (tas_str_eq(cmd->cmd.name, "status")) {
+        const tas_json_t *event = tas_json_get(cmd->cmd.args, "event");
+        if (event && event->type == TAS_JSON_TRUE) {
+            tas_conn_event(&conn, "button", "down", 6000, (const uint8_t *)"{}", 2);
+        }
+        const tas_json_t *state = tas_json_get(cmd->cmd.args, "state");
+        snprintf(status_state, sizeof status_state, "%s", state ? state->text.ptr : "");
+    } else {
         reply->reply.ok = false;
         reply->reply.code = tas_str("unsupported");
         reply->reply.message = tas_str("no such command");
@@ -239,6 +251,68 @@ static void test_a_command_before_welcome_is_a_protocol_error(void) {
     TEST_ASSERT_EQUAL_INT(0, commands);
 }
 
+// An event's data, as a Kind module writes it.
+#define DRAINED "{\"stream\":3,\"played_ms\":1200,\"lost\":0,\"underruns\":0,\"underrun_ms\":0}"
+
+static void test_events_go_out_in_order_counted_from_zero(void) {
+    welcomed();
+
+    tas_conn_event(&conn, "speaker", "drained", 5000, (const uint8_t *)DRAINED, strlen(DRAINED));
+    tas_conn_event(&conn, "button", "down", 6000, (const uint8_t *)"{}", 2);
+
+    tas_msg_t event;
+    expect_sent(TAS_MSG_EVENT, &event);
+    TEST_ASSERT_EQUAL_UINT32(0, event.event.seq);
+    TEST_ASSERT_TRUE(tas_str_eq(event.event.cap, "speaker"));
+    TEST_ASSERT_TRUE(tas_str_eq(event.event.name, "drained"));
+    TEST_ASSERT_EQUAL_UINT64(5000, event.event.ts);
+    TEST_ASSERT_EQUAL_INT64(1200, tas_json_get(event.event.data, "played_ms")->integer);
+    TEST_ASSERT_EQUAL_size_t(5, event.event.data->items.count);
+    expect_sent(TAS_MSG_EVENT, &event);
+    TEST_ASSERT_EQUAL_UINT32(1, event.event.seq);
+    TEST_ASSERT_TRUE(tas_str_eq(event.event.name, "down"));
+    expect_nothing_sent();
+}
+
+static void test_an_event_sent_while_answering_a_command_goes_out_before_its_reply(void) {
+    welcomed();
+
+    hub_says("{\"type\":\"cmd\",\"id\":5,\"name\":\"status\","
+             "\"args\":{\"event\":true,\"state\":\"agent\"}}");
+
+    tas_msg_t msg;
+    expect_sent(TAS_MSG_EVENT, &msg);
+    TEST_ASSERT_TRUE(tas_str_eq(msg.event.name, "down"));
+    expect_sent(TAS_MSG_REPLY, &msg);
+    TEST_ASSERT_EQUAL_UINT32(5, msg.reply.id);
+    TEST_ASSERT_EQUAL_STRING("agent", status_state); // the command outlived the event
+}
+
+static void test_no_event_goes_out_before_welcome(void) {
+    tas_msg_t hello;
+    open_link(NULL);
+    expect_sent(TAS_MSG_HELLO, &hello);
+    hub_says("{\"type\":\"pending\"}");
+
+    tas_conn_event(&conn, "button", "down", 6000, (const uint8_t *)"{}", 2);
+
+    expect_nothing_sent();
+}
+
+static void test_each_connection_counts_its_events_from_zero(void) {
+    welcomed();
+    tas_conn_event(&conn, "button", "down", 6000, (const uint8_t *)"{}", 2);
+    tas_conn_close(&conn, "dropped");
+
+    welcomed();
+    tas_conn_event(&conn, "button", "up", 7000, (const uint8_t *)"{}", 2);
+
+    tas_msg_t event;
+    expect_sent(TAS_MSG_EVENT, &event);
+    TEST_ASSERT_EQUAL_UINT32(0, event.event.seq);
+    TEST_ASSERT_TRUE(tas_str_eq(event.event.name, "up"));
+}
+
 static void test_invalid_json_closes_the_connection(void) {
     welcomed();
 
@@ -346,6 +420,10 @@ int main(void) {
     RUN_TEST(test_any_other_hub_error_closes_and_keeps_the_token);
     RUN_TEST(test_a_command_gets_a_reply_with_its_id);
     RUN_TEST(test_a_command_before_welcome_is_a_protocol_error);
+    RUN_TEST(test_events_go_out_in_order_counted_from_zero);
+    RUN_TEST(test_an_event_sent_while_answering_a_command_goes_out_before_its_reply);
+    RUN_TEST(test_no_event_goes_out_before_welcome);
+    RUN_TEST(test_each_connection_counts_its_events_from_zero);
     RUN_TEST(test_invalid_json_closes_the_connection);
     RUN_TEST(test_a_bad_message_closes_the_connection);
     RUN_TEST(test_a_frame_over_the_limit_closes_as_soon_as_its_header_is_in);

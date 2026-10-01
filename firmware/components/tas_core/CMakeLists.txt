@@ -1,5 +1,5 @@
 idf_component_register(SRCS "core.c" "config.c" "console.c" "net.c" "ctrl.c" "commands.c"
-                            "status.c" "manifest.c"
+                            "status.c" "manifest.c" "udp.c"
                        INCLUDE_DIRS "include"
                        REQUIRES tas_board
                        PRIV_REQUIRES tas_kinds tas_led tas_wire tas_conn tas_status log heap

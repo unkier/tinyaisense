@@ -16,6 +16,13 @@ menu "tinyaisense Kinds"
         help
             Each speaker's playout holds about 8 KB of static buffers.
 
+    config TAS_MICS_MAX
+        int "Mics a Board may have"
+        range 1 4
+        default 1
+        help
+            Each mic's 200 ms send queue holds about 7 KB of static buffers.
+
     config TAS_TEST_HOOKS
         bool "Test hooks"
         default n

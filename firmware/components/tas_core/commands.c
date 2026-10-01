@@ -9,7 +9,7 @@
 #include "tas_kinds.h"
 
 // The firmware's tasks, for diag's stack_hwm.
-static const char *const TASKS[] = {"ctrl", "led", "console"};
+static const char *const TASKS[] = {"ctrl", "udp_rx", "udp_tx", "spk", "mic", "led", "console"};
 
 static const tas_board_t *board;
 
@@ -102,11 +102,4 @@ void commands_handle(const tas_msg_t *cmd, tas_arena_t *arena, tas_msg_t *reply)
         return tas_reply_fail(reply, "unsupported", "the capability has no such command");
     }
     module->command(cap, cmd, arena, reply);
-}
-
-void commands_disconnected(void) {
-    for (size_t i = 0; i < board->cap_count; i++) {
-        const tas_kind_module_t *module = tas_kind_module(board->caps[i].kind);
-        if (module->disconnected) module->disconnected(&board->caps[i]);
-    }
 }

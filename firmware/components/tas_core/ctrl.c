@@ -1,6 +1,6 @@
 // The ctrl task: the only TCP writer. It finds the hub, runs one Connection at a time through
 // tas_conn, and reconnects with backoff. It waits in select() on the socket plus an eventfd that
-// other tasks kick.
+// other tasks kick, e.g. when a Kind module queues an event.
 
 #include <errno.h>
 #include <fcntl.h>
@@ -15,6 +15,7 @@
 #include "esp_timer.h"
 #include "esp_vfs_eventfd.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/queue.h"
 #include "freertos/task.h"
 #include "tas_backoff.h"
 #include "tas_conn.h"
@@ -25,6 +26,7 @@
 #define CTRL_STACK 6144
 #define CONNECT_TIMEOUT_US 3000000
 #define BREATHE_US 1000000 // the longest a wait goes between watchdog feeds
+#define EVENTS_QUEUED 16
 
 static const tas_manifest_t *manifest;
 static tas_conn_t conn;         // 12 KB, so kept off the stack
@@ -32,6 +34,11 @@ static atomic_int kick_fd = -1; // -1 until ctrl_start: kicks before then are mo
 static atomic_uint kicks;
 static atomic_int state = CTRL_IDLE;
 static atomic_uint lost; // Connections that ended, welcomed or not
+
+// The Kind modules' events, on their way to the Connection.
+static QueueHandle_t events;
+static StaticQueue_t events_buf;
+static uint8_t events_storage[EVENTS_QUEUED * sizeof(tas_kind_event_t)];
 
 static portMUX_TYPE describe_mux = portMUX_INITIALIZER_UNLOCKED;
 static char peer_name[TAS_CONN_MAX_NAME + 1], peer_addr[HUB_ADDR_MAX];
@@ -64,7 +71,7 @@ static uint32_t take_kicks(int fd) {
     return atomic_exchange(&kicks, 0);
 }
 
-// Waits up to `ms` for a kick. The kicks that came, or 0.
+// Waits up to `ms` for a kick that matters without a Connection. The kicks that came, or 0.
 static uint32_t wait_for_kick(uint32_t ms) {
     int fd = atomic_load(&kick_fd);
     uint64_t end = now_us() + (uint64_t)ms * 1000;
@@ -72,9 +79,28 @@ static uint32_t wait_for_kick(uint32_t ms) {
         fd_set rd;
         FD_ZERO(&rd);
         FD_SET(fd, &rd);
-        if (breathe_select(fd + 1, &rd, NULL, end - now) > 0) return take_kicks(fd);
+        if (breathe_select(fd + 1, &rd, NULL, end - now) <= 0) continue;
+        uint32_t kicked = take_kicks(fd) & ~CTRL_KICK_EVENTS;
+        if (kicked) return kicked;
     }
     return 0;
+}
+
+void ctrl_emit(const tas_kind_event_t *event) {
+    if (ctrl_state() != CTRL_WELCOMED) return;
+    if (xQueueSend(events, event, 0) != pdTRUE) {
+        ESP_LOGW(TAG, "event queue full: dropped %s.%s", event->cap, event->name);
+        return;
+    }
+    ctrl_kick(CTRL_KICK_EVENTS);
+}
+
+// Hands the events queued to the Connection, in order.
+static void send_events(void) {
+    static tas_kind_event_t event; // only the ctrl task's
+    while (xQueueReceive(events, &event, 0) == pdTRUE) {
+        tas_conn_event(&conn, event.cap, event.name, event.ts, event.data, event.len);
+    }
 }
 
 ctrl_state_t ctrl_state(void) {
@@ -112,26 +138,13 @@ static void on_token(void *ctx, const char *token) {
 
 static void on_command(void *ctx, const tas_msg_t *cmd, tas_arena_t *arena, tas_msg_t *reply) {
     (void)ctx;
+    send_events(); // those of the commands before, e.g. a drain's drained, come before this reply
     commands_handle(cmd, arena, reply);
 }
 
 static const tas_conn_hooks_t hooks = {.command = on_command, .token = on_token};
 
 // ---- One Connection
-
-static int open_udp(uint16_t *port) {
-    int s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-    struct sockaddr_in addr = {.sin_family = AF_INET, .sin_addr.s_addr = htonl(INADDR_ANY)};
-    socklen_t len = sizeof addr;
-    if (s < 0 || bind(s, (struct sockaddr *)&addr, sizeof addr) < 0 ||
-        getsockname(s, (struct sockaddr *)&addr, &len) < 0) {
-        ESP_LOGE(TAG, "UDP socket: %d", errno);
-        if (s >= 0) close(s);
-        return -1;
-    }
-    *port = ntohs(addr.sin_port);
-    return s;
-}
 
 // Connects without blocking for longer than the watchdog allows. -1 if it can't.
 static int open_tcp(const struct sockaddr_in *hub) {
@@ -196,7 +209,8 @@ static void receive(int tcp) {
 }
 
 // Tells the rest of the device what came of the Connection, once per step.
-static void track(tas_conn_state_t *seen, tas_backoff_t *backoff, const char *addr) {
+static void track(tas_conn_state_t *seen, tas_backoff_t *backoff, const struct sockaddr_in *hub,
+                  const char *addr) {
     if (conn.state == *seen || conn.state == TAS_CONN_CLOSED) return;
     *seen = conn.state;
     if (*seen == TAS_CONN_PENDING) {
@@ -205,6 +219,7 @@ static void track(tas_conn_state_t *seen, tas_backoff_t *backoff, const char *ad
     } else if (*seen == TAS_CONN_WELCOMED) {
         ESP_LOGI(TAG, "welcomed as %s", conn.name);
         tas_backoff_reset(backoff);
+        udp_welcomed(hub->sin_addr, conn.hub_udp_port, conn.conn_id);
         set_state(CTRL_WELCOMED, conn.name, addr);
     }
 }
@@ -214,16 +229,11 @@ static uint32_t connection(const struct sockaddr_in *hub, tas_backoff_t *backoff
     char addr[HUB_ADDR_MAX];
     inet_ntoa_r(hub->sin_addr, addr, sizeof addr);
     snprintf(addr + strlen(addr), sizeof addr - strlen(addr), ":%u", ntohs(hub->sin_port));
-    uint16_t udp_port;
-    int udp = open_udp(&udp_port);
-    if (udp < 0) return 0;
     int tcp = open_tcp(hub);
-    if (tcp < 0) {
-        close(udp);
-        return 0;
-    }
+    if (tcp < 0) return 0;
+    xQueueReset(events);
     config_t config = config_get();
-    tas_conn_open(&conn, manifest, config.has_token ? config.token : NULL, udp_port, &hooks,
+    tas_conn_open(&conn, manifest, config.has_token ? config.token : NULL, udp_port(), &hooks,
                   now_us());
     ESP_LOGI(TAG, "connected to %s, hello sent%s", addr, config.has_token ? "" : " (unpaired)");
     set_state(CTRL_HELLO, "", addr);
@@ -250,20 +260,21 @@ static uint32_t connection(const struct sockaddr_in *hub, tas_backoff_t *backoff
             break;
         }
         if (n > 0 && FD_ISSET(kick, &rd)) {
-            kicked = take_kicks(kick);
+            kicked = take_kicks(kick) & ~CTRL_KICK_EVENTS;
             if (kicked & CTRL_KICK_RECONNECT) tas_conn_close(&conn, "settings changed");
             else if (kicked & CTRL_KICK_WIFI_DOWN) tas_conn_close(&conn, "WiFi lost");
             if (conn.state == TAS_CONN_CLOSED) break;
         }
+        send_events(); // those emitted before the commands that came in, before their replies
         if (n > 0 && FD_ISSET(tcp, &rd)) receive(tcp);
         tas_conn_tick(&conn, now_us());
-        track(&seen, backoff, addr);
+        track(&seen, backoff, hub, addr);
     }
     ESP_LOGW(TAG, "Connection closed: %s", conn.why);
     tas_conn_close(&conn, "closed"); // frees what it holds; `why` stays
     close(tcp);
-    close(udp);
-    commands_disconnected();
+    udp_closed();
+    tas_kinds_disconnected();
     atomic_fetch_add(&lost, 1);
     set_state(CTRL_IDLE, "", "");
     return kicked;
@@ -301,6 +312,8 @@ static void ctrl_task(void *arg) {
 
 void ctrl_start(const tas_manifest_t *m) {
     manifest = m;
+    events = xQueueCreateStatic(EVENTS_QUEUED, sizeof(tas_kind_event_t), events_storage,
+                                &events_buf);
     esp_vfs_eventfd_config_t config = ESP_VFS_EVENTD_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_vfs_eventfd_register(&config));
     int fd = eventfd(0, 0);

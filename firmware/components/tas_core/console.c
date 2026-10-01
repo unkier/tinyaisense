@@ -109,6 +109,9 @@ static int cmd_status(int argc, char **argv) {
         if (cap->kind != TAS_KIND_SPEAKER) continue;
         printf("volume    %u, %s\n", tas_kinds_volume(cap), cap->id);
     }
+    char udp[192];
+    udp_describe(udp, sizeof udp);
+    printf("udp       %s\n", udp);
     printf("heap      %u B free, %u B lowest\n", (unsigned)esp_get_free_heap_size(),
            (unsigned)esp_get_minimum_free_heap_size());
     printf("uptime    %llu s\n", (unsigned long long)(esp_timer_get_time() / 1000000));

@@ -199,5 +199,11 @@ tas_arg_t tas_arg_int(const tas_json_t *args, const char *key, int64_t min, int6
 tas_arg_t tas_arg_enum(const tas_json_t *args, const char *key, const char *const *names,
                        size_t count, size_t *out);
 
+// The member `key` of `args`: an audio format (docs/protocol/audio.md#format) of pcm_s16le mono at
+// `rate`, with a frame_ms that is one of the `count` in `frame_ms`. Its frame_ms in `out`. One the
+// capability doesn't advertise is TAS_ARG_BAD, as is one that breaks the contract.
+tas_arg_t tas_arg_format(const tas_json_t *args, const char *key, uint32_t rate,
+                         const uint32_t *frame_ms, size_t count, uint32_t *out);
+
 // Fails the reply `reply` with `code` and `message`, which must outlive it: literals.
 void tas_reply_fail(tas_msg_t *reply, const char *code, const char *message);

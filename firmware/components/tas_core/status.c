@@ -57,9 +57,13 @@ void status_identify(uint32_t s) {
 // The Status shown at `now`, with the Status LED claimed or not, and when it started showing if
 // it's identify: a new identify restarts the blink.
 static tas_status_t shown(bool claimed, uint64_t now, uint64_t *identify_from) {
+    bool listening = tas_kinds_streaming(TAS_KIND_MIC);
+    bool speaking = tas_kinds_streaming(TAS_KIND_SPEAKER);
     portENTER_CRITICAL(&mux);
     tas_status_layers_t layers = {
         .identify = now < identify_until_ms,
+        .listening = listening,
+        .speaking = speaking,
         .claimed = claimed,
         .no_config = !wifi_configured,
         .offline = wifi_configured && !wifi_up,

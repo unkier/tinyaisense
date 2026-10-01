@@ -41,6 +41,7 @@ typedef struct {
     uint16_t hub_udp_port;
 
     tas_conn_hooks_t hooks;
+    uint32_t event_seq; // the next event's
     uint64_t last_rx_us;
     tas_framer_t framer;
     tas_arena_t arena;
@@ -61,6 +62,13 @@ void tas_conn_ended(tas_conn_t *conn);
 // Checks the keepalive. Call it by tas_conn_deadline at the latest.
 void tas_conn_tick(tas_conn_t *conn, uint64_t now_us);
 uint64_t tas_conn_deadline(const tas_conn_t *conn);
+
+// Queues the event `name` of capability `cap`, which happened at device time `ts`. `data` is its
+// data object as JSON. Events are counted from 0 per Connection, and only go out once it's
+// welcomed: one sent before then is dropped, as is one whose data isn't a JSON object. The command
+// hook may send one, which goes out before its reply.
+void tas_conn_event(tas_conn_t *conn, const char *cap, const char *name, uint64_t ts,
+                    const uint8_t *data, size_t len);
 
 // The bytes waiting to go out, and how many of them went.
 const uint8_t *tas_conn_outbox(const tas_conn_t *conn, size_t *size);

@@ -80,6 +80,7 @@ tas_json_t *tas_json_object(tas_arena_t *arena);
 tas_json_t *tas_json_array(tas_arena_t *arena);
 tas_json_t *tas_json_int(tas_arena_t *arena, int64_t value);
 tas_json_t *tas_json_bool(tas_arena_t *arena, bool value);
+tas_json_t *tas_json_null(tas_arena_t *arena);
 tas_json_t *tas_json_string(tas_arena_t *arena, const char *value);
 // Appends `value` to `array`. Returns `array`, or NULL if either is NULL.
 tas_json_t *tas_json_push(tas_json_t *array, tas_json_t *value);

@@ -12,3 +12,8 @@ CONFIG_ESP_TASK_WDT_TIMEOUT_S=10
 CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU0=y
 CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU1=y
 CONFIG_ESP_INT_WDT=y
+# WiFi and lwIP stay on core 0; core 1 is the audio's: the spk and mic tasks.
+CONFIG_ESP_WIFI_TASK_PINNED_TO_CORE_0=y
+CONFIG_LWIP_TCPIP_TASK_AFFINITY_CPU0=y
+# Room for a speaker stream's 60 ms burst, and then some, while udp_rx catches up.
+CONFIG_LWIP_UDP_RECVMBOX_SIZE=16

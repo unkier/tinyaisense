@@ -49,7 +49,7 @@ The `stream` byte names the stream a frame belongs to.
 ## Conditioning
 
 Conditioning runs on the device, so the wire carries clean, speech-level PCM and the hub does none.
-- **Mic:** a 100 Hz 2nd-order high-pass, then +15 dB of saturating gain. The first 20 ms after the mic is enabled are zeroed.
+- **Mic:** a 100 Hz 2nd-order high-pass, then +15 dB of saturating gain. The first 50 ms after the mic is enabled are zeroed, while it settles.
 - **Speaker:** a 300 Hz 2nd-order low-cut.
 
 ## Mic stream

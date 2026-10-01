@@ -41,10 +41,14 @@ typedef struct {
     bool (*write)(const int16_t *pcm);
 } tas_speaker_hw_t;
 
-// How a mic records. Reading it comes with the mic's streams.
+// How a mic records: an I2S RX channel of mono s16 at mic_cond's rate, which runs only while the
+// mic streams. One task at a time drives it.
 typedef struct {
-    void (*start)(void);
+    void (*start)(void); // starts the channel, with nothing captured yet
     void (*stop)(void);
+    // Reads the next `samples` samples captured, waiting up to `timeout_ms` for the DMA to
+    // capture them. False if it timed out.
+    bool (*read)(int16_t *pcm, size_t samples, uint32_t timeout_ms);
 } tas_mic_hw_t;
 
 // One capability: how it appears in the Manifest, and the hardware behind it.

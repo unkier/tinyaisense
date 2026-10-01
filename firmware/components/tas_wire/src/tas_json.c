@@ -419,6 +419,10 @@ tas_json_t *tas_json_bool(tas_arena_t *arena, bool value) {
     return node(arena, value ? TAS_JSON_TRUE : TAS_JSON_FALSE);
 }
 
+tas_json_t *tas_json_null(tas_arena_t *arena) {
+    return node(arena, TAS_JSON_NULL);
+}
+
 tas_json_t *tas_json_string(tas_arena_t *arena, const char *value) {
     size_t len = strlen(value);
     char *text = copy(arena, value, len);

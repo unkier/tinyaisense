@@ -78,6 +78,11 @@ static void mic_stop(void) {
     ESP_ERROR_CHECK(i2s_channel_disable(mic_chan));
 }
 
+static bool mic_read(int16_t *pcm, size_t samples, uint32_t timeout_ms) {
+    size_t got;
+    return i2s_channel_read(mic_chan, pcm, samples * sizeof *pcm, &got, timeout_ms) == ESP_OK;
+}
+
 static const tas_speaker_hw_t speaker = {
     .descs = SPK_DESCS,
     .frames = SPK_FRAMES,
@@ -89,7 +94,7 @@ static const tas_speaker_hw_t speaker = {
     .write = speaker_write,
 };
 
-static const tas_mic_hw_t mic = {.start = mic_start, .stop = mic_stop};
+static const tas_mic_hw_t mic = {.start = mic_start, .stop = mic_stop, .read = mic_read};
 
 static const tas_cap_t caps[] = {
     {.id = "mic", .kind = TAS_KIND_MIC, .mic = &mic},
@@ -206,7 +211,9 @@ static const tas_board_t board = {
     .cap_count = sizeof caps / sizeof *caps,
     .exclusive = exclusive,
     .exclusive_count = sizeof exclusive / sizeof *exclusive,
-    .mic_cond = {.rate = RATE, .highpass_hz = 100, .gain_db = 15, .warmup_ms = 20},
+    // The SPM1423's DC still drifts for ~45 ms after the channel starts: a thump through the
+    // high-pass at about -25 dBFS, measured on the Echo.
+    .mic_cond = {.rate = RATE, .highpass_hz = 100, .gain_db = 15, .warmup_ms = 50},
     .spk_cond = {.rate = RATE, .lowcut_hz = 300},
     .led_brightness_cap = 64,
     .status_led = "led",

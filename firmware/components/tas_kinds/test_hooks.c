@@ -4,7 +4,6 @@
 //   tone [hz] [gaps]     a test tone on the speaker until cut; gaps holds back 100 ms in 500 ms
 //   cut [disable]        cuts it by DMA patch, or by stopping the channel: the click to compare
 //   cutbench [n]         n cuts (100) at random DMA phase, and how long they took
-//   switch mic|speaker   hands an exclusive group's shared pins over, timing the Board's hook
 //
 // The tone goes the way a speaker stream will: a feeder task pushes 10 ms frames into the
 // speaker's jitter buffer, paced as the hub paces (docs/protocol/audio.md): a 60 ms burst at the
@@ -19,7 +18,6 @@
 #include "esp_random.h"
 #include "esp_rom_sys.h"
 #include "esp_task_wdt.h"
-#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "kind_modules.h"
@@ -38,8 +36,7 @@
 #define CUT_TARGET_US 7000 // p99, from the call to silence
 
 static const tas_board_t *board;
-static const tas_cap_t *spk_cap, *mic_cap; // the first of each
-static bool mic_on;                         // the mic has the shared pins
+static const tas_cap_t *spk_cap; // the first speaker
 
 typedef struct {
     bool on, gaps;
@@ -60,7 +57,7 @@ static const tas_cap_t *find(tas_kind_t kind) {
 static void feeder_task(void *arg) {
     (void)arg;
     ESP_ERROR_CHECK(esp_task_wdt_add(NULL));
-    int16_t frame[TAS_SPEAKER_MAX_FRAME];
+    int16_t frame[TAS_KINDS_MAX_FRAME];
     uint8_t stream = 0;
     uint32_t seq = 0, tick = 0;
     bool burst = false;
@@ -120,8 +117,7 @@ static bool tone_start(uint32_t hz, bool gaps) {
 
 static bool speaker_ready(void) {
     if (!spk_cap) printf("this Board has no speaker\n");
-    else if (mic_on) printf("the mic has the pins: switch speaker first\n");
-    return spk_cap && !mic_on;
+    return spk_cap;
 }
 
 static void print_ms(uint32_t us) {
@@ -141,7 +137,7 @@ static int cmd_tone(int argc, char **argv) {
         return 1;
     }
     if (!tone_start(hz, gaps)) {
-        printf("the speaker refused the stream\n");
+        printf("the speaker refused the stream: busy\n");
         return 1;
     }
     return 0;
@@ -210,38 +206,6 @@ static int cmd_cutbench(int argc, char **argv) {
     return pass ? 0 : 1;
 }
 
-static int cmd_switch(int argc, char **argv) {
-    bool to_mic = argc == 2 && !strcmp(argv[1], "mic");
-    if (argc != 2 || (!to_mic && strcmp(argv[1], "speaker"))) {
-        printf("usage: switch mic|speaker\n");
-        return 1;
-    }
-    if (!spk_cap || !mic_cap || !board->exclusive_switch) {
-        printf("this Board has no mic and speaker to switch between\n");
-        return 1;
-    }
-    if (to_mic == mic_on) {
-        printf("the %s has the pins already\n", argv[1]);
-        return 0;
-    }
-    if (to_mic) {
-        tas_speaker_cut(spk_cap, false);
-        tone_stop();
-        vTaskDelay(pdMS_TO_TICKS(10)); // the cut plays out
-    }
-    int64_t t0 = esp_timer_get_time();
-    if (!to_mic) mic_cap->mic->stop();
-    int64_t t1 = esp_timer_get_time();
-    board->exclusive_switch(to_mic ? mic_cap : spk_cap);
-    int64_t t2 = esp_timer_get_time();
-    if (to_mic) mic_cap->mic->start();
-    int64_t t3 = esp_timer_get_time();
-    mic_on = to_mic;
-    printf("switch hook %u us; with the mic's channel %u us\n", (unsigned)(t2 - t1),
-           (unsigned)(t3 - t0));
-    return 0;
-}
-
 static const esp_console_cmd_t commands[] = {
     {.command = "tone", .help = "Play a test tone on the speaker until cut; gaps makes it underrun",
      .hint = "[hz] [gaps]", .func = cmd_tone},
@@ -249,14 +213,11 @@ static const esp_console_cmd_t commands[] = {
      .hint = "[disable]", .func = cmd_cut},
     {.command = "cutbench", .help = "Time cuts at random DMA phase", .hint = "[n]",
      .func = cmd_cutbench},
-    {.command = "switch", .help = "Hand the shared pins to the mic or the speaker",
-     .hint = "mic|speaker", .func = cmd_switch},
 };
 
 void tas_kinds_test_commands(const tas_board_t *b) {
     board = b;
     spk_cap = find(TAS_KIND_SPEAKER);
-    mic_cap = find(TAS_KIND_MIC);
     for (size_t i = 0; i < sizeof commands / sizeof *commands; i++) {
         ESP_ERROR_CHECK(esp_console_cmd_register(&commands[i]));
     }

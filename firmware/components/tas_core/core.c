@@ -59,14 +59,14 @@ void tas_core_start(const tas_board_t *board) {
     ESP_LOGI(TAG, "board %s", board->name);
     config_init();
     factory_reset_if_held(board);
-    for (size_t i = 0; i < board->cap_count; i++) {
-        const tas_cap_t *cap = &board->caps[i];
-        tas_kind_module(cap->kind)->init(board, cap);
-    }
+    static const tas_kinds_core_t kinds_core = {
+        .emit = ctrl_emit, .frames_ready = udp_frames_ready, .send_frames = udp_send_frames};
+    tas_kinds_init(board, &kinds_core);
     commands_init(board);
     const tas_manifest_t *manifest = manifest_build(board);
     status_start(board);
     net_start();
+    udp_start();
     ctrl_start(manifest);
     console_start(board, manifest);
 }

@@ -114,6 +114,24 @@ uint64_t tas_conn_deadline(const tas_conn_t *conn) {
     return conn->last_rx_us + TAS_CONN_DEAD_US;
 }
 
+void tas_conn_event(tas_conn_t *conn, const char *cap, const char *name, uint64_t ts,
+                    const uint8_t *data, size_t len) {
+    if (conn->state != TAS_CONN_WELCOMED) return;
+    // Its own arena: a command being answered may still hold the Connection's.
+    tas_arena_t arena = {.limit = TAS_CONN_ARENA_LIMIT};
+    tas_msg_t event = {.type = TAS_MSG_EVENT};
+    tas_json_t *tree;
+    if (tas_json_parse(data, len, &arena, &tree) == TAS_JSON_OK) {
+        event.event.seq = conn->event_seq++;
+        event.event.cap = tas_str(cap);
+        event.event.name = tas_str(name);
+        event.event.ts = ts;
+        event.event.data = tree;
+        send(conn, &event);
+    }
+    tas_arena_free(&arena);
+}
+
 const uint8_t *tas_conn_outbox(const tas_conn_t *conn, size_t *size) {
     *size = conn->out_len;
     return conn->out;
