@@ -27,6 +27,7 @@ class SimulatorFactory:
         dead_after_ms: int = DEAD_AFTER_MS,
         mdns_service: str = MDNS_SERVICE,
         output_latency_ms: int = OUTPUT_LATENCY_MS,
+        trace: Path | None = None,
     ) -> Simulator:
         sim = Simulator(
             hub,
@@ -35,6 +36,7 @@ class SimulatorFactory:
             dead_after_ms=dead_after_ms,
             mdns_service=mdns_service,
             output_latency_ms=output_latency_ms,
+            trace=trace,
         )
         self._sims.append(sim)
         return sim

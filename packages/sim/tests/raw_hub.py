@@ -37,6 +37,8 @@ class RawConnection:
         self._writer = writer
         self._decoder = ControlDecoder()
         self._inbox: list[Message] = []
+        self.hello: Hello | None = None
+        """The device's `hello`, once `RawHub.accept` has read it."""
 
     def send(self, message: Message) -> None:
         self._writer.write(encode_control(message))
@@ -83,7 +85,9 @@ class RawHub:
     async def accept(self) -> RawConnection:
         """The next device Connection, once its `hello` is in."""
         connection = await self._connections.get()
-        assert isinstance(await connection.receive(), Hello)
+        hello = await connection.receive()
+        assert isinstance(hello, Hello)
+        connection.hello = hello
         return connection
 
     async def close(self) -> None:

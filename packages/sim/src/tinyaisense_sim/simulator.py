@@ -11,7 +11,6 @@ import logging
 import os
 import random
 import socket
-import time
 from collections import Counter, deque
 from collections.abc import Callable
 from importlib.metadata import version
@@ -51,13 +50,15 @@ from tinyaisense_wire import (
 from . import sources
 from .backoff import Backoff
 from .button import FIRST_STREAM, LAST_STREAM, Edge, Reflex, SimButton
+from .clock import DeviceClock
 from .discovery import Mdns, Resolve
 from .faults import ConnectionSocket, Faults
-from .led import Light, SimLed
+from .led import OFF, Light, SimLed
 from .mic import SimMic
 from .profiles import PROFILES, Board
 from .speaker import SimSpeaker
 from .status import Status, StatusLayers
+from .timeline import Entry, Timeline, Trace
 
 FIRMWARE = f"sim-{version('tinyaisense-sim')}"
 DEAD_AFTER_MS = 6000
@@ -69,7 +70,7 @@ _CLOSED_STREAMS = 16
 MIRROR_GAP_MS = 5
 """An event's second UDP mirror goes out this long after its first."""
 
-DeviceState = Literal["connecting", "pending", "online", "closed"]
+DeviceState = Literal["connecting", "pending", "online", "rebooting", "closed"]
 
 _log = logging.getLogger("tinyaisense_sim")
 
@@ -91,6 +92,7 @@ class Simulator:
         dead_after_ms: int = DEAD_AFTER_MS,
         mdns_service: str = MDNS_SERVICE,
         output_latency_ms: int = OUTPUT_LATENCY_MS,
+        trace: Path | None = None,
     ) -> None:
         """`hub` is the hub's device address, `host:port`.
 
@@ -98,7 +100,8 @@ class Simulator:
         Tokens live in `state_dir` if given, and only in memory otherwise. A device drops a
         Connection that brings no frame for `dead_after_ms`. A speaker's audio is heard
         `output_latency_ms` after it leaves the jitter buffer. `seed` drives every random
-        choice, the UDP faults included.
+        choice, the UDP faults included. Every device's timeline goes to the JSONL file
+        `trace` too, if given.
         """
         self._mdns: Mdns | None = None
         if hub is None:
@@ -114,24 +117,27 @@ class Simulator:
         self._dead_after = dead_after_ms / 1000
         self._output_latency_ms = output_latency_ms
         self._devices: list[SimDevice] = []
+        self._trace = None if trace is None else Trace(trace)
 
     @property
     def devices(self) -> tuple[SimDevice, ...]:
         return tuple(self._devices)
 
-    async def add(self, board: str, name: str) -> SimDevice:
-        """Start a simulated `board` device, identified by its instance `name`.
+    async def add(self, board: str | Board, name: str) -> SimDevice:
+        """Start a simulated `board` device, identified by its instance `name`. `board` is a
+        profile's name, or a Board, e.g. from `from_manifest`.
 
         Returns once the hub has answered it with `welcome` or `pending`. Until then the
         device retries as firmware would, forever: bound the wait with `asyncio.timeout`.
         """
-        if board not in PROFILES:
-            raise ValueError(f"unknown board {board!r}; known: {', '.join(PROFILES)}")
-        profile = PROFILES[board]
+        if isinstance(board, str):
+            if board not in PROFILES:
+                raise ValueError(f"unknown board {board!r}; known: {', '.join(PROFILES)}")
+            board = PROFILES[board]
         device = SimDevice(
             name,
-            profile,
-            profile.manifest(device_id_for(name), FIRMWARE),
+            board,
+            board.manifest(device_id_for(name), FIRMWARE),
             self._resolve,
             self._udp_host,
             self._tokens,
@@ -141,6 +147,7 @@ class Simulator:
             random.Random(f"{self._seed}:{name}:udp-up"),
             self._dead_after,
             self._output_latency_ms,
+            Timeline(name, self._trace),
             self._devices.remove,
         )
         self._devices.append(device)
@@ -153,6 +160,9 @@ class Simulator:
             await device.close()
         if self._mdns is not None:
             await self._mdns.close()
+        if self._trace is not None:
+            self._trace.close()
+            self._trace = None
 
 
 class SimDevice:
@@ -171,6 +181,7 @@ class SimDevice:
         udp_up_rng: random.Random,
         dead_after: float,
         output_latency_ms: int,
+        timeline: Timeline,
         on_close: Callable[[SimDevice], None],
     ) -> None:
         self.instance = instance
@@ -184,7 +195,19 @@ class SimDevice:
         """From `welcome`, while the Connection lasts."""
         self.reconnects = 0
         """Connections the hub answered, after the first."""
-        self.faults = Faults(udp_rng, udp_up_rng, self._mic_tx_resumed)
+        self._timeline = timeline
+        self._last_status: tuple[DeviceState, Status] | None = None
+        """The state and Status the timeline last noted."""
+        self._clock = DeviceClock()
+        self.faults = Faults(
+            udp_rng,
+            udp_up_rng,
+            self._clock,
+            mic_tx_resumed=self._mic_tx_resumed,
+            wifi_changed=self._wifi_changed,
+            reboot=self._reboot,
+            noted=lambda fault, args: timeline.note("fault", {"fault": fault} | args),
+        )
         self.stats: Counter[str] = Counter()
         """Datagrams dropped, by why: `bad_source`, `bad_conn_id`, `unknown_stream`, or a
         datagram or frame check's error code. Closed streams' late frames aren't counted."""
@@ -195,7 +218,6 @@ class SimDevice:
         self._backoff = Backoff(rng)
         self._dead_after = dead_after
         self._on_close = on_close
-        self._boot_ns = time.monotonic_ns()
         self._changed = asyncio.Event()
         self._udp: asyncio.DatagramTransport | None = None
         self._conn: ConnectionSocket | None = None
@@ -207,6 +229,15 @@ class SimDevice:
         self._event_seq = 0
         self._closed_streams: deque[int] = deque(maxlen=_CLOSED_STREAMS)
         self._task: asyncio.Task[None] | None = None
+        """Runs the device's Connections, while it's up."""
+        self._hub: tuple[str, int] | None = None
+        """Where the hub is, once resolved, until a reboot."""
+        self._wifi = asyncio.Event()
+        """Set while WiFi is up."""
+        self._wifi.set()
+        self._boot_task: asyncio.Task[None] | None = None
+        """Brings the device back up, while it reboots."""
+        self._reset_reason = "poweron"
         self._answered_before = False
         """Whether the hub has answered any Connection yet."""
         self._connections_lost = 0
@@ -230,7 +261,10 @@ class SimDevice:
         }
         self._mics = {
             cap.id: SimMic(
-                self._clock, self._send_frame, lambda: self.faults.mic_tx_stall, self._mic_changed
+                self._clock,
+                self._send_frame,
+                lambda: self.faults.mic_tx_stall,
+                self._mic_changed,
             )
             for cap in manifest.capabilities
             if cap.kind == "mic"
@@ -263,9 +297,29 @@ class SimDevice:
         return self._layers.shown
 
     @property
+    def timeline(self) -> list[Entry]:
+        """What happened to the device, in order: its latest `TIMELINE_MAX` entries."""
+        return list(self._timeline.entries)
+
+    @property
     def udp_port(self) -> int:
         assert self._udp is not None, "the device isn't running"
         return cast(tuple[str, int], self._udp.get_extra_info("sockname"))[1]
+
+    @property
+    def speakers(self) -> dict[str, SimSpeaker]:
+        """Every speaker capability, by id."""
+        return dict(self._speakers)
+
+    @property
+    def mics(self) -> dict[str, SimMic]:
+        """Every mic capability, by id."""
+        return dict(self._mics)
+
+    @property
+    def buttons(self) -> dict[str, SimButton]:
+        """Every button capability, by id."""
+        return dict(self._buttons)
 
     @property
     def speaker(self) -> SimSpeaker:
@@ -315,8 +369,11 @@ class SimDevice:
             self._buttons[button].release()
 
     def lights(self, cap: str = "led") -> tuple[Light, ...]:
-        """What each LED of the led capability `cap` shows now, the Status included."""
+        """What each LED of the led capability `cap` shows now, the Status included: all off
+        while the device is down."""
         led = self._leds[cap]
+        if self.state in ("rebooting", "closed"):
+            return (OFF,) * led.count
         return led.lights(self.status if led is self._status_led else None)
 
     async def wait_for(self, predicate: Callable[[], bool]) -> None:
@@ -325,6 +382,7 @@ class SimDevice:
             await self._changed.wait()
 
     async def start(self) -> None:
+        self._note_status()
         # The UDP socket is bound before the first `hello`, which announces its port.
         loop = asyncio.get_running_loop()
         transport, _ = await loop.create_datagram_endpoint(
@@ -337,22 +395,78 @@ class SimDevice:
         """Power the device off."""
         if self.state == "closed":
             return
-        if self._task is not None:
-            self._task.cancel()
+        if self._boot_task is not None:
+            self._boot_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
-                await self._task
-        if self._udp is not None:
-            self._udp.close()
-        if self._identify_timer is not None:
-            self._identify_timer.cancel()
-        self._idle()
+                await self._boot_task
+        await self._power_down()
+        self.faults.power_off()
         self._close_vanished()
+        for speaker in self._speakers.values():
+            speaker.close()
         self._set_state("closed")
         self._on_close(self)
 
+    async def _power_down(self) -> None:
+        """Stop everything: the Connection, the UDP socket and every capability."""
+        # A WiFi drop while it stops swaps in the task that runs the device again.
+        while (task := self._task) is not None:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+            if self._task is task:
+                self._task = None
+        if self._udp is not None:
+            self._udp.close()
+            self._udp = None
+        self.faults.udp_down.lose_in_flight()
+        self.faults.udp_up.lose_in_flight()
+        if self._identify_timer is not None:
+            self._identify_timer.cancel()
+            self._identify_timer = None
+        self.faults.connection = None
+        self.conn_id = None
+        self._idle()
+
+    def _reboot(self, down_ms: float, reason: str) -> None:
+        if self._boot_task is None and self.state != "closed":
+            self._set_state("rebooting")
+            self._boot_task = asyncio.create_task(
+                self._rebooted(down_ms / 1000, reason), name=f"sim reboot {self.instance}"
+            )
+
+    async def _rebooted(self, down: float, reason: str) -> None:
+        if self._conn is not None:
+            self._conn.vanished = True  # the stack is gone: nothing goes out, not even a FIN
+        await self._power_down()
+        self._set_state("rebooting")
+        await asyncio.sleep(down)
+        # The new stack answers the hub's next segment on an old Connection with an RST.
+        for connection in self._vanished:
+            connection.reset()
+        self._vanished.clear()
+        self._clock.boot(self.faults.clock_offset_us)
+        self._reset_reason = reason
+        self._connections_lost = 0
+        self._backoff.welcomed()
+        self._device_stream = LAST_STREAM
+        self._hub = None
+        self._layers = StatusLayers(connecting=True, offline=self.faults.wifi_down)
+        for speaker in self._speakers.values():
+            speaker.level = self._board.default_volume
+        self._set_state("connecting")
+        await self.start()
+        self._boot_task = None
+
     def _changed_now(self) -> None:
+        self._note_status()
         self._changed.set()
         self._changed = asyncio.Event()
+
+    def _note_status(self) -> None:
+        if (now := (self.state, self.status)) != self._last_status:
+            self._last_status = now
+            self._timeline.note("status", {"state": self.state, "status": self.status})
 
     def _set_state(self, state: DeviceState) -> None:
         self.state = state
@@ -365,27 +479,55 @@ class SimDevice:
             connection.close()
         self._vanished.clear()
 
-    async def _run(self) -> None:
-        hub: tuple[str, int] | None = None
+    async def _run(self, lost: bool = False) -> None:
+        """Connect, and reconnect for ever. With `lost`, a Connection was just lost."""
         while True:
+            if lost:
+                retry = self._backoff.failed()
+                await asyncio.sleep(retry.delay)
+                if retry.resolve:
+                    self._hub = None
+            lost = True
+            await self._wifi.wait()
             try:
-                if hub is None:
-                    hub = await self._resolve()
-                await self._connection(hub)
+                if self._hub is None:
+                    self._hub = await self._resolve()
+                await self._connection(self._hub)
             except (OSError, WireError) as e:
                 _log.info("%s: connection failed: %s", self.instance, e)
-            self.faults.connection = None
-            self.conn_id = None
-            self._idle()
-            self._set_state("connecting")
-            retry = self._backoff.failed()
-            await asyncio.sleep(retry.delay)
-            if retry.resolve:
-                hub = None
+            self._dropped()
+
+    def _dropped(self) -> None:
+        """The Connection is over, or never got going."""
+        self.faults.connection = None
+        self.conn_id = None
+        self._idle()
+        self._set_state("connecting")
+
+    def _wifi_changed(self) -> None:
+        """WiFi went down or came back. A drop ends the Connection at once."""
+        down = self.faults.wifi_down
+        self._layers.offline = down
+        if not down:
+            self._wifi.set()
+        elif self._wifi.is_set():
+            self._wifi.clear()
+            if self._task is not None:
+                if self._conn is not None:
+                    self._conn.vanished = True  # nothing gets through any more, either way
+                old, self._task = self._task, asyncio.create_task(self._lost(self._task))
+                old.cancel()
+                self._dropped()
+        self._changed_now()
+
+    async def _lost(self, run: asyncio.Task[None]) -> None:
+        """Run the device again, once its `run` has stopped."""
+        await asyncio.wait([run])
+        await self._run(lost=True)
 
     async def _connection(self, hub: tuple[str, int]) -> None:
         """One Connection, from connect to drop."""
-        connection = ConnectionSocket(*await asyncio.open_connection(*hub))
+        connection = ConnectionSocket(*await asyncio.open_connection(*hub), self._sent)
         try:
             self.faults.connection = connection
             self._conn = connection
@@ -415,6 +557,7 @@ class SimDevice:
                     if isinstance(message, (Pending, Welcome)) and not answered:
                         answered = True
                         self._answered(connection)
+                    self._timeline.note("rx", {"msg": message.to_json()})
                     self._receive(message, connection)
             decoder.close()
         finally:
@@ -426,6 +569,9 @@ class SimDevice:
                 self._vanished.append(connection)
             else:
                 connection.close()
+
+    def _sent(self, message: Message) -> None:
+        self._timeline.note("tx", {"msg": message.to_json()})
 
     def _answered(self, connection: ConnectionSocket) -> None:
         """The hub answered this Connection's `hello`, with `pending` or `welcome`."""
@@ -439,7 +585,7 @@ class SimDevice:
     def _receive(self, message: Message, connection: ConnectionSocket) -> None:
         match message:
             case Ping():
-                connection.send(Pong(message.t, self._clock()))
+                connection.send(Pong(message.t, self._clock.now()))
             case Pending():
                 self._set_state("pending")
             case Welcome():
@@ -484,7 +630,7 @@ class SimDevice:
         """Send an Event on the Connection, if it's up; with `mirror`, over UDP too, twice."""
         if self._conn is None or self.state != "online" or self.conn_id is None:
             return
-        event = Event(self._event_seq, cap, name, self._clock(), data)
+        event = Event(self._event_seq, cap, name, self._clock.now(), data)
         self._event_seq += 1
         if mirror:
             self._mirror(event, self.conn_id)
@@ -506,6 +652,7 @@ class SimDevice:
     def _edge(self, cap: str, edge: Edge) -> None:
         """Send an edge, then run the Reflex. A press made offline, or held across a
         reconnect, is ignored until the next one."""
+        self._timeline.note("edge", {"cap": cap, "edge": edge})
         if edge == "down":
             if self.state != "online":
                 return
@@ -668,7 +815,7 @@ class SimDevice:
             self._closed_streams.append(stream)
             self._emit(cap, "drained", {"stream": stream} | stats)
 
-        return SimSpeaker(level, output_latency_ms, drained, self._speaker_changed)
+        return SimSpeaker(self._clock, level, output_latency_ms, drained, self._speaker_changed)
 
     def _speaker_changed(self) -> None:
         self._layers.speaking = any(s.stream is not None for s in self._speakers.values())
@@ -785,18 +932,14 @@ class SimDevice:
     def _diag(self) -> JsonObject:
         health = self._board.health
         return {
-            "uptime_s": self._clock() // 1_000_000,
-            "reset_reason": "poweron",
+            "uptime_s": self._clock.uptime_us // 1_000_000,
+            "reset_reason": self._reset_reason,
             "heap_free": health.heap_free,
             "heap_min": health.heap_min,
             "rssi": health.rssi,
             "reconnects": self._connections_lost,
             "stack_hwm": dict(health.stack_hwm),
         }
-
-    def _clock(self) -> int:
-        """The device clock: µs since boot."""
-        return (time.monotonic_ns() - self._boot_ns) // 1000
 
 
 class _Datagrams(asyncio.DatagramProtocol):

@@ -1,7 +1,9 @@
 """Board profiles: the Manifest each simulated Board sends, and how its hardware behaves."""
 
-from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+import contextlib
+import logging
+from collections.abc import Callable, Generator, Mapping
+from dataclasses import dataclass, replace
 
 from tinyaisense_wire import PROTOCOL, Capability, JsonObject, Manifest
 
@@ -49,27 +51,70 @@ def atom_echo(device_id: str, firmware: str) -> Manifest:
     )
 
 
-PROFILES: dict[str, Board] = {
+def sim_duplex(device_id: str, firmware: str) -> Manifest:
+    """The Atom Echo's capabilities with no exclusive group: its mic and speaker run at once."""
+    return replace(atom_echo(device_id, firmware), board="sim-duplex", exclusive=())
+
+
+_ECHO = Board(
+    atom_echo,
     # The firmware's Board file caps the Echo's LED the same way.
-    "m5stack-atom-echo": Board(
-        atom_echo,
-        led_brightness_cap=64,
-        default_volume=80,
-        # ~180 KB of heap, less the firmware's ~68 KB, and a stack per firmware task.
-        health=Health(
-            heap_free=112_640,
-            heap_min=98_304,
-            rssi=-61,
-            stack_hwm={
-                "reflex": 1480,
-                "spk": 2104,
-                "mic": 1872,
-                "udp_rx": 1536,
-                "udp_tx": 1424,
-                "ctrl": 2968,
-                "led": 912,
-            },
-        ),
+    led_brightness_cap=64,
+    default_volume=80,
+    # ~180 KB of heap, less the firmware's ~68 KB, and a stack per firmware task.
+    health=Health(
+        heap_free=112_640,
+        heap_min=98_304,
+        rssi=-61,
+        stack_hwm={
+            "reflex": 1480,
+            "spk": 2104,
+            "mic": 1872,
+            "udp_rx": 1536,
+            "udp_tx": 1424,
+            "ctrl": 2968,
+            "led": 912,
+        },
     ),
+)
+
+PROFILES: dict[str, Board] = {
+    "m5stack-atom-echo": _ECHO,
+    "sim-duplex": replace(_ECHO, manifest=sim_duplex),
 }
 """Every simulated Board, by name."""
+
+_PLACEHOLDER_ID = "020000000000"
+"""The device_id a Manifest from `from_manifest` is checked with."""
+
+
+def from_manifest(obj: JsonObject) -> Board:
+    """A Board that sends the Manifest `obj`, as JSON: its capabilities may be of any Kind, and
+    those of an unknown one answer every command with `unsupported`. Each device sends our
+    `protocol`, and its own `device_id` and `firmware`, whatever `obj` says. The rest is as on
+    the Echo, bar the LED, whose brightness has no cap.
+
+    Raises `WireError` if `obj` isn't a Manifest.
+    """
+    obj = obj | {"protocol": PROTOCOL, "device_id": _PLACEHOLDER_ID, "firmware": "sim"}
+    with _unlogged(logging.getLogger("tinyaisense_wire")):  # it's the hub's to ignore a Kind
+        template = Manifest.from_json(obj)
+
+    def manifest(device_id: str, firmware: str) -> Manifest:
+        return replace(template, device_id=device_id, firmware=firmware)
+
+    return replace(_ECHO, manifest=manifest, led_brightness_cap=255)
+
+
+@contextlib.contextmanager
+def _unlogged(logger: logging.Logger) -> Generator[None]:
+    """Nothing `logger` logs gets out."""
+
+    def quiet(record: logging.LogRecord) -> bool:
+        return False
+
+    logger.addFilter(quiet)
+    try:
+        yield
+    finally:
+        logger.removeFilter(quiet)

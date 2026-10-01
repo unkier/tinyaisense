@@ -6,6 +6,8 @@ from collections.abc import Callable
 
 from tinyaisense_wire import AudioFormat, JsonObject
 
+from .clock import SLACK_US, DeviceClock
+
 QUEUE_MS = 200
 """A stream's send queue: on overflow, the oldest frames are dropped."""
 
@@ -16,20 +18,20 @@ type SendFrame = Callable[[int, int, int, bytes], None]
 class SimMic:
     """One mic capability.
 
-    It captures what it's fed, in real time: one frame per frame period while it streams,
-    silence once the fed audio runs out. Audio fed with `burst=True` is captured at once
-    instead. Each frame goes through the stream's 200 ms send queue, which the `mic_tx_stall`
-    fault holds up.
+    It captures what it's fed, in real time on the device clock: one frame per frame period
+    while it streams, silence once the fed audio runs out. Audio fed with `burst=True` is
+    captured at once instead. Each frame goes through the stream's 200 ms send queue, which the
+    `mic_tx_stall` fault holds up.
     """
 
     def __init__(
         self,
-        clock: Callable[[], int],
+        clock: DeviceClock,
         send: SendFrame,
         stalled: Callable[[], bool],
         changed: Callable[[], None],
     ) -> None:
-        """`clock()` is the device clock in µs; `stalled()` whether sending is held up;
+        """`stalled()` is whether sending is held up;
         `changed()` is called whenever the mic starts or stops, or has heard all it was fed."""
         self._clock = clock
         self._send = send
@@ -71,7 +73,7 @@ class SimMic:
         """Open stream id `stream`. The caller checks that the mic is idle."""
         assert self._capture is None
         self._capture = _Capture(
-            stream, format, self._clock(), self._paced, self._send, self._stalled, self._changed
+            stream, format, self._clock, self._paced, self._send, self._stalled, self._changed
         )
         self._capture.burst(self._burst)
         self._changed()
@@ -105,7 +107,7 @@ class _Capture:
         self,
         stream: int,
         format: AudioFormat,
-        started: int,
+        clock: DeviceClock,
         paced: bytearray,
         send: SendFrame,
         stalled: Callable[[], bool],
@@ -117,8 +119,11 @@ class _Capture:
         """The next frame's seq."""
         self.dropped = 0
         self._format = format
-        self._started = started
+        self._clock = clock
+        self._started = clock.now()
         """The device clock at the first sample."""
+        self._period = format.frame_ms * 1000
+        """In device µs."""
         self._paced = paced
         self._send = send
         self._stalled = stalled
@@ -126,7 +131,6 @@ class _Capture:
         self._queue: deque[tuple[int, int, bytes]] = deque()
         self._queue_frames = QUEUE_MS // format.frame_ms
         self._loop = asyncio.get_running_loop()
-        self._start = self._loop.time()
         self._timer: asyncio.TimerHandle | None = None
         self._arm()
 
@@ -153,7 +157,7 @@ class _Capture:
 
     def _tick(self) -> None:
         # Every frame whose period has ended, catching up on a late wakeup.
-        due = int((self._loop.time() - self._start) / self._period)
+        due = (self._clock.now() + SLACK_US - self._started) // self._period
         size = self._format.frame_bytes
         fed = bool(self._paced)
         while self.seq < due:
@@ -166,7 +170,7 @@ class _Capture:
     def _captured(self, pcm: bytes) -> None:
         """A frame is in from the DMA: queue it and send."""
         frame = pcm.ljust(self._format.frame_bytes, b"\0")
-        ts = self._started + self.seq * self._format.frame_ms * 1000
+        ts = self._started + self.seq * self._period
         self._queue.append((self.seq, ts, frame))
         if len(self._queue) > self._queue_frames:
             self._queue.popleft()
@@ -178,9 +182,5 @@ class _Capture:
         """Wake up when the next frame's period ends."""
         if self._timer is not None:
             self._timer.cancel()
-        at = self._start + (self.seq + 1) * self._period
-        self._timer = self._loop.call_at(at, self._tick)
-
-    @property
-    def _period(self) -> float:
-        return self._format.frame_ms / 1000
+        at = self._started + (self.seq + 1) * self._period
+        self._timer = self._loop.call_later(self._clock.delay(at), self._tick)

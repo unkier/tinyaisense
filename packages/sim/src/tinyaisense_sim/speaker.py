@@ -3,11 +3,13 @@
 import asyncio
 from collections import deque
 from collections.abc import Callable
-from dataclasses import asdict, dataclass
+from dataclasses import asdict
 
 from tinyaisense_wire import AudioFormat, JsonObject
 
+from .clock import SLACK_US, DeviceClock
 from .jitter import JitterBuffer, Stats
+from .sinks import Capture, CapturedFrame, Sink
 
 
 def volume_gain(level: int) -> float:
@@ -18,29 +20,17 @@ def volume_gain(level: int) -> float:
     return 10 ** (-40 * (100 - level) / 99 / 20)
 
 
-@dataclass(frozen=True, slots=True)
-class CapturedFrame:
-    """One frame the speaker played, before its volume."""
-
-    stream: int
-    seq: int
-    pcm: bytes
-    """Silence, a whole frame of it, for a lost frame."""
-    at: float
-    """When its first sample was heard, on the event loop's clock."""
-    lost: bool
-
-
 class SimSpeaker:
     """One speaker capability. Its volume lasts until the device powers off.
 
-    Playout runs on a real-time clock: the jitter buffer gives up one frame per frame period
-    from `start` on, and what it gives up is heard `output_latency_ms` later, once through the
-    DMA.
+    Playout runs in real time on the device clock: the jitter buffer gives up one frame per
+    frame period from `start` on, and what it gives up is heard `output_latency_ms` later, once
+    through the DMA.
     """
 
     def __init__(
         self,
+        clock: DeviceClock,
         level: int,
         output_latency_ms: int,
         drained: Callable[[int, JsonObject], None],
@@ -50,16 +40,22 @@ class SimSpeaker:
         `changed()` whenever the speaker starts, stops or plays a frame."""
         self.level = level
         """The volume, 0 to 100."""
-        self.captured: list[CapturedFrame] = []
-        """Every frame played since power-on, as it enters the DMA: the latest may not have
-        been heard yet."""
+        self.sink: Sink = Capture()
+        """Where the audio goes: see `sinks`."""
         self.first_frame_at: float | None = None
         """When the latest stream's first frame came in off the network, on the event loop's
         clock: None until it does."""
+        self._clock = clock
         self._latency = output_latency_ms / 1000
         self._drained = drained
         self._changed = changed
         self._playout: _Playout | None = None
+
+    @property
+    def captured(self) -> list[CapturedFrame]:
+        """Every frame played since power-on, as it enters the DMA, into the capture sink: the
+        latest may not have been heard yet. Empty with another sink."""
+        return self.sink.frames if isinstance(self.sink, Capture) else []
 
     @property
     def gain(self) -> float:
@@ -80,7 +76,9 @@ class SimSpeaker:
         """Open stream id `stream`. The caller checks that nothing is playing."""
         assert self._playout is None
         self.first_frame_at = None
-        self._playout = _Playout(stream, format, prefill_ms, self._latency, self._pulled)
+        self._playout = _Playout(
+            stream, format, prefill_ms, self._clock, self._latency, self._pulled
+        )
         self._changed()
 
     def push(self, seq: int, pcm: bytes) -> None:
@@ -111,15 +109,18 @@ class SimSpeaker:
             return _stats(Stats())
         self._finish(playout)
         now = asyncio.get_running_loop().time()
-        # What was still in the DMA is never heard.
-        while self.captured and self.captured[-1].at > now:
-            self.captured.pop()
+        self.sink.cut(now)  # what was still in the DMA is never heard
         return _stats(playout.heard_by(now))
 
     def cut(self) -> None:
         """The Connection is over: stop, and tell nobody."""
         if self._playout is not None:
             self.stop()
+
+    def close(self) -> None:
+        """The device is off."""
+        self.cut()
+        self.sink.close()
 
     def _finish(self, playout: _Playout) -> None:
         playout.cancel()
@@ -128,7 +129,7 @@ class SimSpeaker:
 
     def _pulled(self, playout: _Playout, frame: CapturedFrame | None) -> None:
         if frame is not None:
-            self.captured.append(frame)
+            self.sink.play(frame, self.gain)
             self._changed()
         elif playout is self._playout:  # done: heard to the end once through the DMA
             self._finish(playout)
@@ -143,16 +144,20 @@ class _Playout:
         stream: int,
         format: AudioFormat,
         prefill_ms: int,
+        clock: DeviceClock,
         latency: float,
         pulled: Callable[[_Playout, CapturedFrame | None], None],
     ) -> None:
         self.stream = stream
         self.buffer = JitterBuffer(format, prefill_ms)
         self._format = format
+        self._clock = clock
         self._latency = latency
         self._pulled = pulled
         self._loop = asyncio.get_running_loop()
-        self._start = self._loop.time()
+        self._started = clock.now()
+        self._period = format.frame_ms * 1000
+        """In device µs."""
         self._pulls = 0
         self._pending: deque[tuple[float, Stats]] = deque()
         """The stats after each pull, from when it's heard, until then."""
@@ -172,13 +177,13 @@ class _Playout:
             self._timer = None
 
     def _tick(self) -> None:
-        period = self._format.frame_ms / 1000
         now = self._loop.time()
         # Catch up on the periods a late wakeup missed. A frame can't play before now, since
         # it may have only just arrived.
-        due = int((now - self._start) / period) + 1
+        due = (self._clock.now() + SLACK_US - self._started) // self._period + 1
         while self._pulls < due:
-            at = max(self._start + self._pulls * period, now) + self._latency
+            at = now + self._clock.delay(self._started + self._pulls * self._period)
+            at += self._latency
             self._pulls += 1
             pulled = self.buffer.pull()
             if pulled.outcome == "done":
@@ -189,7 +194,8 @@ class _Playout:
                 pcm = pulled.pcm or bytes(self._format.frame_bytes)
                 frame = CapturedFrame(self.stream, pulled.seq, pcm, at, pulled.outcome == "lost")
                 self._pulled(self, frame)
-        self._timer = self._loop.call_at(self._start + self._pulls * period, self._tick)
+        next_pull = self._clock.delay(self._started + self._pulls * self._period)
+        self._timer = self._loop.call_later(next_pull, self._tick)
 
     def _done(self) -> None:
         self._timer = None
