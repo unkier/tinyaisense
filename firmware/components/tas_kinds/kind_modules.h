@@ -3,6 +3,7 @@
 
 #include "tas_jbuf.h"
 #include "tas_kinds.h"
+#include "tas_reflex.h"
 
 #define TAS_KINDS_MAX_INSTANCES 4 // the most capabilities of one Kind a Board may have
 #define TAS_KIND_FRAME_MS_COUNT 2
@@ -72,8 +73,31 @@ typedef enum {
 } tas_speaker_cut_t;
 
 // Ends the open stream and silences the speaker at once: by DMA patch; or, if `hard` or the ring
-// isn't known yet, by stopping the channel. Never blocks for long, so the Reflex can call it. The
-// speaker logs when a patched cut went silent, timed from the call.
+// isn't known yet, by stopping the channel. Never blocks for long. The speaker logs when a patched
+// cut went silent, timed from the call.
 tas_speaker_cut_t tas_speaker_cut(const tas_cap_t *cap, bool hard);
+// The Reflex's cut: as tas_speaker_cut by DMA patch, but timed from the press at `edge_us`. False
+// if no stream was open; else its id, and what was heard of it.
+bool tas_speaker_reflex_cut(const tas_cap_t *cap, uint64_t edge_us, uint8_t *stream,
+                            tas_jbuf_stats_t *heard);
 // How long after the call the last patched cut went silent. False until the DMA gets there.
 bool tas_speaker_cut_silent_after(const tas_cap_t *cap, uint32_t *us);
+
+// ---- mic.c: the Reflex's streams, on device-range ids
+
+// The id of the stream the mic `cap` has open, hub or Reflex. False if none.
+bool tas_mic_stream(const tas_cap_t *cap, uint8_t *stream);
+// Opens the mic `cap` on the device-range `stream`, with `frame_ms` frames. False if a stream is
+// open, or an exclusive peer is active.
+bool tas_mic_open(const tas_cap_t *cap, uint8_t stream, uint32_t frame_ms);
+// Closes the mic `cap`'s stream `stream` once its last frame has gone out: a few ms. False if it
+// has no stream of that id open.
+bool tas_mic_close(const tas_cap_t *cap, uint8_t stream, tas_mic_end_t *end);
+
+// ---- button.c
+
+#if CONFIG_TAS_TEST_HOOKS
+// Injects an edge into the button `cap` as its interrupt would, now, with its pin held at `down`
+// until the next injection: up hands the pin back to the hardware.
+void tas_button_inject(const tas_cap_t *cap, bool down);
+#endif

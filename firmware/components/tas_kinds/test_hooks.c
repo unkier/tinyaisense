@@ -4,6 +4,8 @@
 //   tone [hz] [gaps]     a test tone on the speaker until cut; gaps holds back 100 ms in 500 ms
 //   cut [disable]        cuts it by DMA patch, or by stopping the channel: the click to compare
 //   cutbench [n]         n cuts (100) at random DMA phase, and how long they took
+//   btn down|up          an edge on the button, as its interrupt would see it; down holds the
+//                        pin down until up. The Reflex cut it makes logs how long it took.
 //
 // The tone goes the way a speaker stream will: a feeder task pushes 10 ms frames into the
 // speaker's jitter buffer, paced as the hub paces (docs/protocol/audio.md): a 60 ms burst at the
@@ -37,6 +39,7 @@
 
 static const tas_board_t *board;
 static const tas_cap_t *spk_cap; // the first speaker
+static const tas_cap_t *btn_cap; // the first button
 
 typedef struct {
     bool on, gaps;
@@ -206,6 +209,20 @@ static int cmd_cutbench(int argc, char **argv) {
     return pass ? 0 : 1;
 }
 
+static int cmd_btn(int argc, char **argv) {
+    bool down = argc == 2 && !strcmp(argv[1], "down");
+    if (argc != 2 || (!down && strcmp(argv[1], "up"))) {
+        printf("usage: btn down|up\n");
+        return 1;
+    }
+    if (!btn_cap) {
+        printf("this Board has no button\n");
+        return 1;
+    }
+    tas_button_inject(btn_cap, down);
+    return 0;
+}
+
 static const esp_console_cmd_t commands[] = {
     {.command = "tone", .help = "Play a test tone on the speaker until cut; gaps makes it underrun",
      .hint = "[hz] [gaps]", .func = cmd_tone},
@@ -213,11 +230,14 @@ static const esp_console_cmd_t commands[] = {
      .hint = "[disable]", .func = cmd_cut},
     {.command = "cutbench", .help = "Time cuts at random DMA phase", .hint = "[n]",
      .func = cmd_cutbench},
+    {.command = "btn", .help = "Press or let go of the button, as its interrupt would see it",
+     .hint = "down|up", .func = cmd_btn},
 };
 
 void tas_kinds_test_commands(const tas_board_t *b) {
     board = b;
     spk_cap = find(TAS_KIND_SPEAKER);
+    btn_cap = find(TAS_KIND_BUTTON);
     for (size_t i = 0; i < sizeof commands / sizeof *commands; i++) {
         ESP_ERROR_CHECK(esp_console_cmd_register(&commands[i]));
     }

@@ -37,7 +37,7 @@ static void on_command(void *ctx, const tas_msg_t *cmd, tas_arena_t *a, tas_msg_
     if (tas_str_eq(cmd->cmd.name, "status")) {
         const tas_json_t *event = tas_json_get(cmd->cmd.args, "event");
         if (event && event->type == TAS_JSON_TRUE) {
-            tas_conn_event(&conn, "button", "down", 6000, (const uint8_t *)"{}", 2);
+            tas_conn_event(&conn, 0, "button", "down", 6000, (const uint8_t *)"{}", 2);
         }
         const tas_json_t *state = tas_json_get(cmd->cmd.args, "state");
         snprintf(status_state, sizeof status_state, "%s", state ? state->text.ptr : "");
@@ -254,22 +254,23 @@ static void test_a_command_before_welcome_is_a_protocol_error(void) {
 // An event's data, as a Kind module writes it.
 #define DRAINED "{\"stream\":3,\"played_ms\":1200,\"lost\":0,\"underruns\":0,\"underrun_ms\":0}"
 
-static void test_events_go_out_in_order_counted_from_zero(void) {
+static void test_events_go_out_in_order_with_the_seq_they_were_queued_with(void) {
     welcomed();
 
-    tas_conn_event(&conn, "speaker", "drained", 5000, (const uint8_t *)DRAINED, strlen(DRAINED));
-    tas_conn_event(&conn, "button", "down", 6000, (const uint8_t *)"{}", 2);
+    tas_conn_event(&conn, 7, "speaker", "drained", 5000, (const uint8_t *)DRAINED,
+                   strlen(DRAINED));
+    tas_conn_event(&conn, 8, "button", "down", 6000, (const uint8_t *)"{}", 2);
 
     tas_msg_t event;
     expect_sent(TAS_MSG_EVENT, &event);
-    TEST_ASSERT_EQUAL_UINT32(0, event.event.seq);
+    TEST_ASSERT_EQUAL_UINT32(7, event.event.seq);
     TEST_ASSERT_TRUE(tas_str_eq(event.event.cap, "speaker"));
     TEST_ASSERT_TRUE(tas_str_eq(event.event.name, "drained"));
     TEST_ASSERT_EQUAL_UINT64(5000, event.event.ts);
     TEST_ASSERT_EQUAL_INT64(1200, tas_json_get(event.event.data, "played_ms")->integer);
     TEST_ASSERT_EQUAL_size_t(5, event.event.data->items.count);
     expect_sent(TAS_MSG_EVENT, &event);
-    TEST_ASSERT_EQUAL_UINT32(1, event.event.seq);
+    TEST_ASSERT_EQUAL_UINT32(8, event.event.seq);
     TEST_ASSERT_TRUE(tas_str_eq(event.event.name, "down"));
     expect_nothing_sent();
 }
@@ -294,23 +295,37 @@ static void test_no_event_goes_out_before_welcome(void) {
     expect_sent(TAS_MSG_HELLO, &hello);
     hub_says("{\"type\":\"pending\"}");
 
-    tas_conn_event(&conn, "button", "down", 6000, (const uint8_t *)"{}", 2);
+    tas_conn_event(&conn, 0, "button", "down", 6000, (const uint8_t *)"{}", 2);
 
     expect_nothing_sent();
 }
 
-static void test_each_connection_counts_its_events_from_zero(void) {
+static void test_an_events_mirror_carries_the_same_message_as_its_tcp_copy(void) {
     welcomed();
-    tas_conn_event(&conn, "button", "down", 6000, (const uint8_t *)"{}", 2);
-    tas_conn_close(&conn, "dropped");
+    tas_conn_event(&conn, 4, "button", "down", 6000, (const uint8_t *)"{}", 2);
+    size_t size;
+    const uint8_t *out = tas_conn_outbox(&conn, &size);
+    size_t len = (size_t)(out[2] | out[3] << 8);
 
-    welcomed();
-    tas_conn_event(&conn, "button", "up", 7000, (const uint8_t *)"{}", 2);
+    uint8_t buf[TAS_UDP_HEADER + TAS_MAX_UDP_PAYLOAD];
+    int n = tas_conn_mirror(77, 4, "button", "down", 6000, (const uint8_t *)"{}", 2, buf,
+                            sizeof buf);
 
-    tas_msg_t event;
-    expect_sent(TAS_MSG_EVENT, &event);
-    TEST_ASSERT_EQUAL_UINT32(0, event.event.seq);
-    TEST_ASSERT_TRUE(tas_str_eq(event.event.name, "up"));
+    TEST_ASSERT_GREATER_THAN_INT(0, n);
+    tas_dgram_t dgram;
+    TEST_ASSERT_EQUAL_INT(TAS_WIRE_OK, tas_dgram_decode(buf, (size_t)n, &dgram));
+    TEST_ASSERT_EQUAL_UINT8(TAS_DGRAM_MIRROR, dgram.kind);
+    TEST_ASSERT_EQUAL_UINT32(77, dgram.conn_id);
+    TEST_ASSERT_EQUAL_UINT32(4, dgram.seq);
+    TEST_ASSERT_EQUAL_UINT64(6000, dgram.ts);
+    TEST_ASSERT_EQUAL_size_t(len, dgram.len);
+    TEST_ASSERT_EQUAL_MEMORY(out + TAS_FRAME_HEADER, dgram.payload, len);
+}
+
+static void test_no_mirror_is_made_of_data_that_isnt_an_object(void) {
+    uint8_t buf[TAS_UDP_HEADER + TAS_MAX_UDP_PAYLOAD];
+    TEST_ASSERT_EQUAL_INT(-1, tas_conn_mirror(77, 4, "button", "down", 6000,
+                                              (const uint8_t *)"[]", 2, buf, sizeof buf));
 }
 
 static void test_invalid_json_closes_the_connection(void) {
@@ -420,10 +435,11 @@ int main(void) {
     RUN_TEST(test_any_other_hub_error_closes_and_keeps_the_token);
     RUN_TEST(test_a_command_gets_a_reply_with_its_id);
     RUN_TEST(test_a_command_before_welcome_is_a_protocol_error);
-    RUN_TEST(test_events_go_out_in_order_counted_from_zero);
+    RUN_TEST(test_events_go_out_in_order_with_the_seq_they_were_queued_with);
     RUN_TEST(test_an_event_sent_while_answering_a_command_goes_out_before_its_reply);
     RUN_TEST(test_no_event_goes_out_before_welcome);
-    RUN_TEST(test_each_connection_counts_its_events_from_zero);
+    RUN_TEST(test_an_events_mirror_carries_the_same_message_as_its_tcp_copy);
+    RUN_TEST(test_no_mirror_is_made_of_data_that_isnt_an_object);
     RUN_TEST(test_invalid_json_closes_the_connection);
     RUN_TEST(test_a_bad_message_closes_the_connection);
     RUN_TEST(test_a_frame_over_the_limit_closes_as_soon_as_its_header_is_in);

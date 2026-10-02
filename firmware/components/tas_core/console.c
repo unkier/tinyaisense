@@ -106,10 +106,14 @@ static int cmd_status(int argc, char **argv) {
     printf("status    %s\n", tas_status_name(status_shown()));
     for (size_t i = 0; i < board->cap_count; i++) {
         const tas_cap_t *cap = &board->caps[i];
-        if (cap->kind != TAS_KIND_SPEAKER) continue;
-        printf("volume    %u, %s\n", tas_kinds_volume(cap), cap->id);
+        if (cap->kind == TAS_KIND_SPEAKER) {
+            printf("volume    %u, %s\n", tas_kinds_volume(cap), cap->id);
+        } else if (cap->kind == TAS_KIND_BUTTON) {
+            printf("reflex    %s, %s\n", tas_kinds_reflex_armed(cap) ? "armed" : "disarmed",
+                   cap->id);
+        }
     }
-    char udp[192];
+    char udp[208];
     udp_describe(udp, sizeof udp);
     printf("udp       %s\n", udp);
     printf("heap      %u B free, %u B lowest\n", (unsigned)esp_get_free_heap_size(),

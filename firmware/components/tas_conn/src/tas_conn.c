@@ -114,22 +114,40 @@ uint64_t tas_conn_deadline(const tas_conn_t *conn) {
     return conn->last_rx_us + TAS_CONN_DEAD_US;
 }
 
-void tas_conn_event(tas_conn_t *conn, const char *cap, const char *name, uint64_t ts,
-                    const uint8_t *data, size_t len) {
+// The event message, its data parsed into `arena`. False if the data isn't a JSON object.
+static bool event_msg(uint32_t seq, const char *cap, const char *name, uint64_t ts,
+                      const uint8_t *data, size_t len, tas_arena_t *arena, tas_msg_t *event) {
+    tas_json_t *tree;
+    if (tas_json_parse(data, len, arena, &tree) != TAS_JSON_OK) return false;
+    *event = (tas_msg_t){.type = TAS_MSG_EVENT};
+    event->event.seq = seq;
+    event->event.cap = tas_str(cap);
+    event->event.name = tas_str(name);
+    event->event.ts = ts;
+    event->event.data = tree;
+    return true;
+}
+
+void tas_conn_event(tas_conn_t *conn, uint32_t seq, const char *cap, const char *name,
+                    uint64_t ts, const uint8_t *data, size_t len) {
     if (conn->state != TAS_CONN_WELCOMED) return;
     // Its own arena: a command being answered may still hold the Connection's.
     tas_arena_t arena = {.limit = TAS_CONN_ARENA_LIMIT};
-    tas_msg_t event = {.type = TAS_MSG_EVENT};
-    tas_json_t *tree;
-    if (tas_json_parse(data, len, &arena, &tree) == TAS_JSON_OK) {
-        event.event.seq = conn->event_seq++;
-        event.event.cap = tas_str(cap);
-        event.event.name = tas_str(name);
-        event.event.ts = ts;
-        event.event.data = tree;
-        send(conn, &event);
+    tas_msg_t event;
+    if (event_msg(seq, cap, name, ts, data, len, &arena, &event)) send(conn, &event);
+    tas_arena_free(&arena);
+}
+
+int tas_conn_mirror(uint32_t conn_id, uint32_t seq, const char *cap, const char *name,
+                    uint64_t ts, const uint8_t *data, size_t len, uint8_t *buf, size_t size) {
+    tas_arena_t arena = {.limit = TAS_CONN_ARENA_LIMIT};
+    tas_msg_t event;
+    int n = -1;
+    if (event_msg(seq, cap, name, ts, data, len, &arena, &event)) {
+        n = tas_mirror_encode(conn_id, 0, &event, buf, size);
     }
     tas_arena_free(&arena);
+    return n;
 }
 
 const uint8_t *tas_conn_outbox(const tas_conn_t *conn, size_t *size) {

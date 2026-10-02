@@ -106,10 +106,24 @@ static const tas_speaker_hw_t speaker = {
 
 static const tas_mic_hw_t mic = {.start = mic_start, .stop = mic_stop, .read = mic_read};
 
+static bool button_down(void) {
+    return gpio_get_level(PIN_BUTTON) == 0;
+}
+
+static void button_open(tas_button_isr_t isr, void *ctx) {
+    // The ISR service takes interrupts on the core that installs it.
+    esp_err_t err = gpio_install_isr_service(0);
+    if (err != ESP_ERR_INVALID_STATE) ESP_ERROR_CHECK(err); // installed already is fine
+    ESP_ERROR_CHECK(gpio_set_intr_type(PIN_BUTTON, GPIO_INTR_ANYEDGE));
+    ESP_ERROR_CHECK(gpio_isr_handler_add(PIN_BUTTON, isr, ctx));
+}
+
+static const tas_button_hw_t button = {.open = button_open, .down = button_down};
+
 static const tas_cap_t caps[] = {
     {.id = "mic", .kind = TAS_KIND_MIC, .mic = &mic},
     {.id = "speaker", .kind = TAS_KIND_SPEAKER, .speaker = &speaker},
-    {.id = "button", .kind = TAS_KIND_BUTTON},
+    {.id = "button", .kind = TAS_KIND_BUTTON, .button = &button},
     {.id = "led", .kind = TAS_KIND_LED, .count = 1},
 };
 
@@ -184,8 +198,8 @@ static void init(void) {
     gpio_set_direction(PIN_G0, GPIO_MODE_OUTPUT);
     gpio_set_level(PIN_G0, 1);
     // The button has an external pull-up; GPIO39 has no internal one.
-    gpio_config_t button = {.pin_bit_mask = 1ULL << PIN_BUTTON, .mode = GPIO_MODE_INPUT};
-    ESP_ERROR_CHECK(gpio_config(&button));
+    gpio_config_t pin = {.pin_bit_mask = 1ULL << PIN_BUTTON, .mode = GPIO_MODE_INPUT};
+    ESP_ERROR_CHECK(gpio_config(&pin));
     led_strip_config_t led = {
         .strip_gpio_num = PIN_LED,
         .max_leds = 1,
@@ -211,9 +225,6 @@ static void led_show(const tas_cap_t *cap) {
     if (err) ESP_LOGW("board", "LED refresh failed: %s", esp_err_to_name(err));
 }
 
-static bool reset_button_down(void) {
-    return gpio_get_level(PIN_BUTTON) == 0;
-}
 
 static const tas_board_t board = {
     .name = "m5stack-atom-echo",
@@ -232,7 +243,7 @@ static const tas_board_t board = {
     .exclusive_switch = exclusive_switch,
     .led_set = led_set,
     .led_show = led_show,
-    .reset_button_down = reset_button_down,
+    .reset_button_down = button_down,
 };
 
 const tas_board_t *tas_board(void) {

@@ -50,8 +50,9 @@ typedef struct {
     int16_t out[TAS_KINDS_MAX_FRAME * MAX_CHANNELS]; // a frame of playout, on every channel
     size_t out_len, out_pos;     // samples in out, and those already in the ring
     tas_jbuf_stats_t out_stats;  // the stream's stats once out has played
-    int64_t cut_us;              // when the last patched cut was called
-    bool cut_pending;            // and it hasn't gone silent yet
+    int64_t cut_us;              // when the last patched cut was called, or its press was
+    bool cut_by_reflex;          // and whether by the Reflex
+    bool cut_pending;            // it hasn't gone silent yet
     uint32_t silent_after_us;    // when it did, from cut_us; 0 until then
 } speaker_t;
 
@@ -159,7 +160,7 @@ static void emit_drained(const speaker_t *s, const tas_jbuf_stats_t *stats) {
     tas_jw_uint(&w, stats->underrun_ms);
     tas_jw_raw(&w, "}");
     event.len = w.len;
-    tas_kinds_core->emit(&event);
+    tas_kinds_core->emit(&event, false);
 }
 
 static void spk_task(void *arg) {
@@ -180,11 +181,12 @@ static void spk_task(void *arg) {
             emit_drained(s, &stats);
             end_stream(s);
         }
-        bool silent = cut_went_silent(s);
+        bool silent = cut_went_silent(s), by_reflex = s->cut_by_reflex;
         uint32_t silent_after_us = s->silent_after_us;
         xSemaphoreGive(s->lock);
         if (silent) {
-            ESP_LOGI(TAG, "%s cut: silent after %u us", s->cap->id, (unsigned)silent_after_us);
+            ESP_LOGI(TAG, "%s cut: silent after %u us%s", s->cap->id, (unsigned)silent_after_us,
+                     by_reflex ? ", from the press" : "");
         }
     }
 }
@@ -220,8 +222,8 @@ static void init(const tas_board_t *board, const tas_cap_t *cap) {
 // millisecond, and waiting for the lock or being preempted could take longer.
 static portMUX_TYPE patch_lock = portMUX_INITIALIZER_UNLOCKED;
 
-// As tas_speaker_cut, called at `called_us`, with the lock held.
-static tas_speaker_cut_t cut_locked(speaker_t *s, bool hard, int64_t called_us) {
+// As tas_speaker_cut, timed from `since_us`, with the lock held.
+static tas_speaker_cut_t cut_locked(speaker_t *s, bool hard, int64_t since_us) {
     if (!s->playing) return TAS_SPEAKER_IDLE;
     end_stream(s);
     s->silent_after_us = 0;
@@ -232,7 +234,7 @@ static tas_speaker_cut_t cut_locked(speaker_t *s, bool hard, int64_t called_us) 
         taskEXIT_CRITICAL(&patch_lock);
     }
     if (s->cut_pending) {
-        s->cut_us = called_us;
+        s->cut_us = since_us;
         return TAS_SPEAKER_PATCHED;
     }
     if (!hard) ESP_LOGW(TAG, "%s: the ring can't be patched: stopping the channel", s->cap->id);
@@ -245,12 +247,16 @@ static tas_speaker_cut_t cut_locked(speaker_t *s, bool hard, int64_t called_us) 
     return TAS_SPEAKER_STOPPED;
 }
 
-// As tas_speaker_cut, and the stats of what was heard of the stream it ended.
-static tas_speaker_cut_t cut(speaker_t *s, bool hard, tas_jbuf_stats_t *stats) {
-    int64_t called_us = esp_timer_get_time();
+// As tas_speaker_cut, timed from `since_us` (0 for the call) or, `by_reflex`, the press then;
+// and the stream it ended, with what was heard of it.
+static tas_speaker_cut_t cut(speaker_t *s, bool hard, int64_t since_us, bool by_reflex,
+                             uint8_t *stream, tas_jbuf_stats_t *stats) {
+    if (!since_us) since_us = esp_timer_get_time();
     xSemaphoreTake(s->lock, portMAX_DELAY);
     *stats = s->playing ? heard(s) : (tas_jbuf_stats_t){0};
-    tas_speaker_cut_t how = cut_locked(s, hard, called_us);
+    *stream = s->stream;
+    tas_speaker_cut_t how = cut_locked(s, hard, since_us);
+    if (how == TAS_SPEAKER_PATCHED) s->cut_by_reflex = by_reflex;
     xSemaphoreGive(s->lock);
     // The DMA may have reached the ramp while the patch was going in, before on_sent knew of it.
     if (how == TAS_SPEAKER_PATCHED) xTaskNotifyGive(s->task);
@@ -328,8 +334,14 @@ static tas_frame_result_t frame_in(const tas_cap_t *cap, const tas_dgram_t *fram
 }
 
 tas_speaker_cut_t tas_speaker_cut(const tas_cap_t *cap, bool hard) {
+    uint8_t stream;
     tas_jbuf_stats_t stats;
-    return cut(speaker_of(cap), hard, &stats);
+    return cut(speaker_of(cap), hard, 0, false, &stream, &stats);
+}
+
+bool tas_speaker_reflex_cut(const tas_cap_t *cap, uint64_t edge_us, uint8_t *stream,
+                            tas_jbuf_stats_t *heard) {
+    return cut(speaker_of(cap), false, (int64_t)edge_us, true, stream, heard) != TAS_SPEAKER_IDLE;
 }
 
 bool tas_speaker_cut_silent_after(const tas_cap_t *cap, uint32_t *us) {
@@ -379,8 +391,9 @@ static void start(speaker_t *s, const tas_json_t *args, tas_arena_t *arena, tas_
 
 // `stop{}` → `{played_ms, lost, underruns, underrun_ms}`: what was heard.
 static void stop(speaker_t *s, tas_arena_t *a, tas_msg_t *reply) {
+    uint8_t stream;
     tas_jbuf_stats_t stats;
-    cut(s, false, &stats);
+    cut(s, false, 0, false, &stream, &stats);
     tas_json_t *r = tas_json_object(a);
     r = tas_json_put(a, r, "played_ms", tas_json_int(a, stats.played_ms));
     r = tas_json_put(a, r, "lost", tas_json_int(a, stats.lost));
@@ -434,8 +447,9 @@ static void command(const tas_cap_t *cap, const tas_msg_t *cmd, tas_arena_t *are
 
 // The Connection's stream ends with it, and nobody hears of it.
 static void disconnected(const tas_cap_t *cap) {
+    uint8_t stream;
     tas_jbuf_stats_t stats;
-    cut(speaker_of(cap), false, &stats);
+    cut(speaker_of(cap), false, 0, false, &stream, &stats);
 }
 
 uint8_t tas_kinds_volume(const tas_cap_t *cap) {

@@ -130,12 +130,10 @@ static bool frame_out(const tas_cap_t *cap, tas_mic_frame_t *frame) {
     return got;
 }
 
-// `start{stream, format}` → `{format}`.
-static void start(mic_t *m, const tas_json_t *args, tas_arena_t *arena, tas_msg_t *reply) {
-    uint8_t stream;
-    uint32_t frame_ms, rate = m->cond_cfg.rate;
-    if (!tas_kind_stream_args(args, rate, &stream, &frame_ms, reply)) return;
-    tas_micq_config_t cfg = {.rate = rate, .frame_ms = frame_ms, .capacity_ms = CAPACITY_MS};
+// Opens stream `stream` with `frame_ms` frames. NULL if it did; else why it's busy, a literal.
+static const char *open_stream(mic_t *m, uint8_t stream, uint32_t frame_ms) {
+    tas_micq_config_t cfg = {
+        .rate = m->cond_cfg.rate, .frame_ms = frame_ms, .capacity_ms = CAPACITY_MS};
     const char *busy = NULL;
     xSemaphoreTake(m->lock, portMAX_DELAY);
     if (m->open) {
@@ -150,31 +148,66 @@ static void start(mic_t *m, const tas_json_t *args, tas_arena_t *arena, tas_msg_
         m->gen++;
     }
     xSemaphoreGive(m->lock);
+    if (!busy) xTaskNotifyGive(m->task);
+    return busy;
+}
+
+// Closes the open stream, if it's `only` (or any, for 0), once its last frame has gone out: a few
+// ms. False if none such was open.
+static bool close_stream(mic_t *m, uint8_t only, tas_mic_end_t *end) {
+    xSemaphoreTake(m->lock, portMAX_DELAY);
+    bool closing = m->open && (!only || m->stream == only);
+    if (closing) {
+        m->open = false;
+        m->gen++;
+    }
+    xSemaphoreGive(m->lock);
+    *end = (tas_mic_end_t){0};
+    if (!closing) return false;
+    tas_kinds_core->send_frames();
+    xSemaphoreTake(m->lock, portMAX_DELAY);
+    end->any = tas_micq_last_seq(&m->queue, &end->last_seq);
+    end->dropped = m->queue.dropped;
+    xSemaphoreGive(m->lock);
+    tas_kind_release(m->cap);
+    return true;
+}
+
+bool tas_mic_stream(const tas_cap_t *cap, uint8_t *stream) {
+    mic_t *m = mic_of(cap);
+    xSemaphoreTake(m->lock, portMAX_DELAY);
+    bool open = m->open;
+    *stream = m->stream;
+    xSemaphoreGive(m->lock);
+    return open;
+}
+
+bool tas_mic_open(const tas_cap_t *cap, uint8_t stream, uint32_t frame_ms) {
+    return !open_stream(mic_of(cap), stream, frame_ms);
+}
+
+bool tas_mic_close(const tas_cap_t *cap, uint8_t stream, tas_mic_end_t *end) {
+    return close_stream(mic_of(cap), stream, end);
+}
+
+// `start{stream, format}` → `{format}`.
+static void start(mic_t *m, const tas_json_t *args, tas_arena_t *arena, tas_msg_t *reply) {
+    uint8_t stream;
+    uint32_t frame_ms, rate = m->cond_cfg.rate;
+    if (!tas_kind_stream_args(args, rate, &stream, &frame_ms, reply)) return;
+    const char *busy = open_stream(m, stream, frame_ms);
     if (busy) return tas_reply_fail(reply, "busy", busy);
-    xTaskNotifyGive(m->task);
     tas_kind_format_reply(rate, frame_ms, arena, reply);
 }
 
-// `stop{}` → `{last_seq, dropped}`, once the stream's last frame has gone out: a few ms.
+// `stop{}` → `{last_seq, dropped}`, once the stream's last frame has gone out: a few ms. It stops
+// a hub stream or the Reflex's.
 static void stop(mic_t *m, tas_arena_t *a, tas_msg_t *reply) {
-    xSemaphoreTake(m->lock, portMAX_DELAY);
-    bool was_open = m->open;
-    m->open = false;
-    m->gen++;
-    xSemaphoreGive(m->lock);
-    uint32_t last_seq = 0, dropped = 0;
-    bool any = false;
-    if (was_open) {
-        tas_kinds_core->send_frames();
-        xSemaphoreTake(m->lock, portMAX_DELAY);
-        any = tas_micq_last_seq(&m->queue, &last_seq);
-        dropped = m->queue.dropped;
-        xSemaphoreGive(m->lock);
-        tas_kind_release(m->cap);
-    }
+    tas_mic_end_t end;
+    close_stream(m, 0, &end);
     tas_json_t *r = tas_json_object(a);
-    r = tas_json_put(a, r, "last_seq", any ? tas_json_int(a, last_seq) : tas_json_null(a));
-    r = tas_json_put(a, r, "dropped", tas_json_int(a, dropped));
+    r = tas_json_put(a, r, "last_seq", end.any ? tas_json_int(a, end.last_seq) : tas_json_null(a));
+    r = tas_json_put(a, r, "dropped", tas_json_int(a, end.dropped));
     if (!r) return tas_reply_fail(reply, "failed", "out of memory");
     reply->reply.result = r;
 }

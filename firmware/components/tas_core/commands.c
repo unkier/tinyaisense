@@ -9,7 +9,8 @@
 #include "tas_kinds.h"
 
 // The firmware's tasks, for diag's stack_hwm.
-static const char *const TASKS[] = {"ctrl", "udp_rx", "udp_tx", "spk", "mic", "led", "console"};
+static const char *const TASKS[] = {"ctrl", "udp_rx", "udp_tx", "reflex",
+                                    "spk", "mic", "led", "console"};
 
 static const tas_board_t *board;
 

@@ -1,0 +1,9 @@
+{
+  "name": "tas_reflex",
+  "version": "0.0.0",
+  "description": "tinyaisense pure-C button Kind: confirming edges, and the Reflex. No IDF calls.",
+  "dependencies": {"tas_wire": "*", "tas_audio": "*", "tas_status": "*"},
+  "build": {
+    "flags": ["-std=c11", "-Wall", "-Wextra", "-Werror"]
+  }
+}

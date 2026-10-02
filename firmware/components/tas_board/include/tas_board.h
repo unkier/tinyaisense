@@ -51,6 +51,17 @@ typedef struct {
     bool (*read)(int16_t *pcm, size_t samples, uint32_t timeout_ms);
 } tas_mic_hw_t;
 
+// The button's ISR, on either edge.
+typedef void (*tas_button_isr_t)(void *ctx);
+
+// How a button reads.
+typedef struct {
+    // Registers `isr` for both edges and enables it. Call it once, from a task on the core that
+    // should run it.
+    void (*open)(tas_button_isr_t isr, void *ctx);
+    bool (*down)(void); // whether it's down now
+} tas_button_hw_t;
+
 // One capability: how it appears in the Manifest, and the hardware behind it.
 typedef struct {
     const char *id; // unique on the device, e.g. "speaker"
@@ -58,6 +69,7 @@ typedef struct {
     uint16_t count;                  // led: how many LEDs it has
     const tas_speaker_hw_t *speaker; // speaker: its hardware
     const tas_mic_hw_t *mic;         // mic: its hardware
+    const tas_button_hw_t *button;   // button: its hardware
 } tas_cap_t;
 
 // Capabilities of which at most one is active at a time, e.g. a half-duplex mic and speaker.

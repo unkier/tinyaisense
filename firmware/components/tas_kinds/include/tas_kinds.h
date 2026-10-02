@@ -22,9 +22,9 @@ typedef struct {
 
 // What the Kind modules need of the core. Each may be called from any task.
 typedef struct {
-    // Queues `event` for the Connection. Never blocks: with none welcomed, or the queue full, it's
-    // dropped.
-    void (*emit)(const tas_kind_event_t *event);
+    // Queues `event` for the Connection, and with `mirror` its UDP mirror. Never blocks for long:
+    // with none welcomed, or the queue full, it's dropped, and it returns false.
+    bool (*emit)(const tas_kind_event_t *event, bool mirror);
     // A mic has queued a frame: wake the sender.
     void (*frames_ready)(void);
     // Sends every mic frame queued now, in order, and returns once they're out: a few ms.
@@ -97,3 +97,6 @@ uint8_t tas_kinds_volume(const tas_cap_t *cap);
 // Registers the debug builds' console commands. Call it once the console is initialized.
 void tas_kinds_test_commands(const tas_board_t *board);
 #endif
+
+// Whether the Reflex of the button capability `cap` is armed, for the console.
+bool tas_kinds_reflex_armed(const tas_cap_t *cap);

@@ -82,9 +82,10 @@ ctrl_state_t ctrl_state(void);
 // The hub-given name and its address while there's a Connection, "" otherwise.
 void ctrl_describe(char *name, size_t name_size, char *hub, size_t hub_size);
 uint32_t ctrl_connections_lost(void);
-// Queues a Kind module's event for the Connection. Never blocks: with none welcomed, or the queue
-// full, it's dropped.
-void ctrl_emit(const tas_kind_event_t *event);
+// Queues a Kind module's event for the Connection, counting it, and with `mirror` hands it to
+// udp_mirror too. Never blocks for long: with none welcomed, or the queue full, it's dropped, and it
+// returns false.
+bool ctrl_emit(const tas_kind_event_t *event, bool mirror);
 
 // ---- commands.c
 
@@ -102,6 +103,9 @@ uint16_t udp_port(void);
 void udp_welcomed(struct in_addr hub_ip, uint16_t hub_port, uint32_t conn_id);
 // The Connection closed: no more datagrams in or out.
 void udp_closed(void);
+// Sends the UDP mirror of the Connection's event `seq` twice, ~5 ms apart, from udp_tx. Never
+// blocks: with none welcomed, or too many waiting, it's dropped.
+void udp_mirror(uint32_t seq, const tas_kind_event_t *event);
 // A mic has queued frames: wakes udp_tx.
 void udp_frames_ready(void);
 // Sends every mic frame queued now, in order, and returns once they're out.

@@ -6,5 +6,5 @@ endif()
 idf_component_register(SRCS ${srcs}
                        INCLUDE_DIRS "include"
                        REQUIRES tas_board tas_wire tas_led
-                       PRIV_REQUIRES log esp_timer freertos console)
+                       PRIV_REQUIRES tas_reflex log esp_timer freertos console)
 target_compile_options(${COMPONENT_LIB} PRIVATE -std=gnu11 -Wall -Wextra -Werror)

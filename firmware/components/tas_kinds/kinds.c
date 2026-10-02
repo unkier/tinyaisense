@@ -33,11 +33,22 @@ void tas_kinds_init(const tas_board_t *b, const tas_kinds_core_t *core) {
     }
 }
 
-void tas_kinds_disconnected(void) {
+// Tells the buttons, or the other capabilities, that the Connection ended.
+static void disconnect(bool buttons) {
     for (size_t i = 0; i < board->cap_count; i++) {
-        const tas_kind_module_t *module = tas_kind_module(board->caps[i].kind);
-        if (module->disconnected) module->disconnected(&board->caps[i]);
+        const tas_cap_t *cap = &board->caps[i];
+        const tas_kind_module_t *module = tas_kind_module(cap->kind);
+        if ((cap->kind == TAS_KIND_BUTTON) == buttons && module->disconnected) {
+            module->disconnected(cap);
+        }
     }
+}
+
+void tas_kinds_disconnected(void) {
+    // The buttons first: once a press being handled is done, the Reflex is disarmed, so what that
+    // press opened is ended with the rest.
+    disconnect(true);
+    disconnect(false);
     taskENTER_CRITICAL(&closed_lock);
     tas_closed_clear(&closed);
     taskEXIT_CRITICAL(&closed_lock);
