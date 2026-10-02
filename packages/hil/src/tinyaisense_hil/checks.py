@@ -3,16 +3,21 @@ a report can show them all: none means it passed.
 
 - The interrupt samples, against the hub's own `stats` and against the serial line.
 - The soak's diag, against its invariants.
+- The POD's lag, against the acoustic rig's error budget.
+- Cut clicks, with the check itself held to its positive control.
 """
 
 import itertools
 import math
+import statistics
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Literal, cast
 
 from tinyaisense_hub.bench.gates import percentile
 from tinyaisense_wire import JsonObject
+
+from .acoustic import CLICK_DB
 
 P99_AGREE_MS = 2.0
 """How far the agent's p99 may be from the hub's: the agent's samples add the SDK's read, and
@@ -128,4 +133,71 @@ def soak_findings(diags: Sequence[Diag]) -> list[str]:
             findings.append(f"the Echo reset between {before.at_s:.0f} s and {after.at_s:.0f} s")
     if reconnects := last.reconnects - first.reconnects:
         findings.append(f"the Echo counted {reconnects} reconnects")
+    return findings
+
+
+@dataclass(frozen=True, slots=True)
+class CutSample:
+    """A Reflex cut by an injected press, while the speaker played a `tone` or `speech`: in ms
+    from the press until the Echo went silent, by its own timing, `inf` if it didn't log it; and
+    until the POD heard it, with the POD's lag taken off, for a tone, None if not known. How far
+    it clicked, in dB over the noise floor, `inf` if its end wasn't heard."""
+
+    playing: Literal["tone", "speech"]
+    silent_ms: float
+    heard_ms: float | None
+    click_db: float
+
+
+LAG_BUDGET_MS = 5.0
+"""How far the POD's lag may be off at a cut, from its median, at the 95th percentile: the
+acoustic rig's error budget."""
+
+
+def pod_lag(lags_ms: Sequence[float]) -> float:
+    """The POD's lag, the median of its `lags_ms` at the cuts it heard; `inf` if none."""
+    heard = [lag for lag in lags_ms if math.isfinite(lag)]
+    return float(statistics.median(heard)) if heard else math.inf
+
+
+def calibration_findings(lags_ms: Sequence[float]) -> list[str]:
+    """Check the POD's lag at each cut it was calibrated by, `inf` at a cut it didn't hear: how
+    much later it heard the tone end, by PortAudio's ADC time, than the Echo went silent, by its
+    press's `t` and the firmware's own timing. It must have heard most cuts, and its lag must
+    hold within `LAG_BUDGET_MS` of its median."""
+    heard = [lag for lag in lags_ms if math.isfinite(lag)]
+    if 2 * len(heard) <= len(lags_ms):
+        return [f"the POD heard only {len(heard)} of {len(lags_ms)} cuts' tone end"]
+    lag = pod_lag(heard)
+    off = percentile([abs(each - lag) for each in heard], 95)
+    if off > LAG_BUDGET_MS:
+        return [
+            f"the POD's lag is off its median, {lag:.1f} ms, by up to {off:.1f} ms at the 95th "
+            f"percentile: over the ±{LAG_BUDGET_MS:g} ms budget"
+        ]
+    return []
+
+
+def click_findings(runs_db: Sequence[Sequence[float]], control_db: Sequence[float]) -> list[str]:
+    """Check each run's tone cuts for clicks: each cut's energy over 2 kHz after the ramp, in dB
+    over the noise floor, `inf` if its end wasn't heard. A run misses if any cut clicked, over
+    `CLICK_DB`, or wasn't heard; the cuts click if most runs miss. And the check holds only if it
+    hears most of the positive control's cuts, `control_db`, click: not all, for a channel
+    stopped at the right moment steps little."""
+    findings: list[str] = []
+    missed = [run for run in runs_db if max(run, default=math.inf) > CLICK_DB]
+    if 2 * len(missed) > len(runs_db):
+        cuts = [db for run in missed for db in run]
+        loudest = max((db for db in cuts if math.isfinite(db)), default=math.nan)
+        unheard = sum(math.isinf(db) for db in cuts)
+        findings.append(
+            f"a cut clicked or went unheard in {len(missed)} of {len(runs_db)} runs: the loudest "
+            f"{loudest:.1f} dB over the noise floor, {unheard} cuts' end not heard"
+        )
+    clicked = sum(db > CLICK_DB for db in control_db)
+    if 2 * clicked <= len(control_db):
+        findings.append(
+            f"the click check heard only {clicked} of {len(control_db)} of the positive "
+            f"control's clicks, by stopping the I2S channel: it can't be trusted to hear one"
+        )
     return findings

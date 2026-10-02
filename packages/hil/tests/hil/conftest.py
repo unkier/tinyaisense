@@ -22,7 +22,7 @@ from tinyaisense_hil.report import HilReport
 from tinyaisense_hil.rig import Rig, RigError, find_rig, load_rig
 from tinyaisense_hub.bench.hub import free_ports, hub_version
 from tinyaisense_hub.bench.report import machine
-from tinyaisense_hub.config import state_dir
+from tinyaisense_hub.config import SpeechConfig, state_dir
 
 BOOT_S = 30
 """How long the Echo may take to answer on its console, and to join the WiFi."""
@@ -49,9 +49,12 @@ class Hil:
     firmware: dict[str, object] = field(default_factory=dict[str, object])
     rig: dict[str, object] = field(default_factory=dict[str, object])
 
-    def hub(self) -> contextlib.AbstractAsyncContextManager[HilHub]:
-        """A HIL hub, and a Session on it once the Echo is online."""
-        return hil_hub(self.status.device_id, self.host, self.ports, self.state)
+    def hub(
+        self, speech: SpeechConfig | None = None
+    ) -> contextlib.AbstractAsyncContextManager[HilHub]:
+        """A HIL hub, with the `speech` engines, none by default, and a Session on it once the
+        Echo is online."""
+        return hil_hub(self.status.device_id, self.host, self.ports, self.state, speech)
 
 
 @pytest.fixture(scope="session")
@@ -110,6 +113,8 @@ def hil(rig: Rig, tmp_path_factory: pytest.TempPathFactory) -> Iterator[Hil]:
                 "state": str(state),
                 "pio": rig.pio,
                 "serial_log": serial_log.name,
+                "pod": rig.pod,
+                "mouth": rig.mouth,
             },
         )
 

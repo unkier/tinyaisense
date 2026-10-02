@@ -7,7 +7,7 @@ import time
 from collections.abc import Callable, Iterator
 
 import pytest
-from tinyaisense_hil.console import Console, ConsoleError, EchoStatus, parse_status
+from tinyaisense_hil.console import Console, ConsoleError, Cut, EchoStatus, parse_status
 
 STATUS = """\
 device    f4650b08536c, m5stack-atom-echo, firmware 4766d3c-dirty, elf 2bc1ea9f43e7fce6
@@ -148,3 +148,26 @@ def test_a_command_with_no_prompt_back_times_out_and_the_next_runs(
     with pytest.raises(ConsoleError, match="no prompt"):
         console.run("reboot", timeout=0.2)
     assert console.status().uptime_s == 1234
+
+
+def test_the_speakers_cuts_are_taken_from_its_log_in_order(
+    echo: tuple[FakeEcho, Console],
+) -> None:
+    fake, console = echo
+    fake.log("\x1b[0;32mI (5000) speaker: speaker cut: silent after 4460 us, from the pr")
+    fake.log("ess\x1b[0m\r\n" + LOG)
+    fake.log("I (6000) speaker: speaker cut: silent after 812 us\r\n")
+
+    assert console.cut(0, timeout=1) == Cut("speaker", 4460, by_reflex=True)
+    assert console.cut(1, timeout=1) == Cut("speaker", 812, by_reflex=False)
+    assert console.cut(2, timeout=0.1) is None
+
+
+def test_a_cut_logged_while_a_command_runs_is_taken_too(echo: tuple[FakeEcho, Console]) -> None:
+    fake, console = echo
+    fake.answers["cut"] = lambda: "I (7000) speaker: speaker cut: silent after 900 us\n"
+    taken = console.cuts
+
+    console.run("cut")
+
+    assert console.cut(taken, timeout=1) == Cut("speaker", 900, by_reflex=False)

@@ -3,6 +3,7 @@ it, and an agent's Session on it: it notes each notification as it comes in, on 
 clock, which the hub's `t` is on too."""
 
 import asyncio
+import contextlib
 import json
 import math
 import random
@@ -17,9 +18,10 @@ from typing import Literal, cast
 import tinyaisense
 from tinyaisense_hub.bench.corpus import BenchError
 from tinyaisense_hub.bench.hub import HubProcess
-from tinyaisense_hub.config import Config
+from tinyaisense_hub.config import Config, SpeechConfig
 from tinyaisense_wire import JsonObject
 
+from .acoustic import MicFrame
 from .checks import Edge
 from .console import Console
 
@@ -41,11 +43,11 @@ def now_ms() -> float:
     return time.time_ns() / 1e6
 
 
-def tone(ms: int) -> bytes:
-    """`ms` of a quiet 1 kHz sine, s16le at `RATE`: the Echo's speaker barely plays under
-    500 Hz."""
+def tone(ms: int, level: float = 0.05) -> bytes:
+    """`ms` of a 1 kHz sine, quiet by default, s16le at `RATE`: the Echo's speaker barely plays
+    under 500 Hz."""
     n, step = RATE * ms // 1000, 2 * math.pi * 1000 / RATE
-    return struct.pack(f"<{n}h", *(round(32767 * 0.05 * math.sin(step * i)) for i in range(n)))
+    return struct.pack(f"<{n}h", *(round(32767 * level * math.sin(step * i)) for i in range(n)))
 
 
 def route(ip: str) -> tuple[str, str]:
@@ -60,12 +62,16 @@ def route(ip: str) -> tuple[str, str]:
 
 @asynccontextmanager
 async def hil_hub(
-    device_id: str, host: str, ports: tuple[int, int], state: Path | None
+    device_id: str,
+    host: str,
+    ports: tuple[int, int],
+    state: Path | None,
+    speech: SpeechConfig | None = None,
 ) -> AsyncGenerator[HilHub]:
     """A hub on `host`, listening on `ports` for devices and HTTP, from a copy of the `state`
-    the Echo `device_id` is paired in, with no speech engines; and a Session on it once the
-    Echo is online. Raises `BenchError` with the end of the hub's log."""
-    config = Config(agent_token="")
+    the Echo `device_id` is paired in, with the `speech` engines, none by default; and a
+    Session on it once the Echo is online. Raises `BenchError` with the end of the hub's log."""
+    config = Config(agent_token="", speech=speech or SpeechConfig())
     async with (
         HubProcess(config, host=host, ports=ports, state=state) as process,
         tinyaisense.connect(process.agent_url, process.token) as session,
@@ -146,11 +152,30 @@ class HilHub:
         handle = await self.start_tone(ms)
         return await self.session.stream_drain(handle)
 
-    async def start_tone(self, ms: int) -> int:
+    async def start_tone(self, ms: int, level: float = 0.05) -> int:
         """Start `ms` of a tone on the speaker, all sent at once, and return its handle."""
         handle = await self.session.stream_start(f"{self.device}/speaker")
-        await self.session.send_audio(handle, tone(ms))
+        await self.session.send_audio(handle, tone(ms, level))
         return handle
+
+    @asynccontextmanager
+    async def mic(self) -> AsyncGenerator[list[MicFrame]]:
+        """A raw mic stream, at 16 kHz, while in it: its frames, as the agent gets each."""
+        handle = await self.session.stream_start(f"{self.device}/mic")
+        frames: list[MicFrame] = []
+
+        async def read() -> None:
+            async for frame in self.session.audio(handle):
+                frames.append(MicFrame(frame.index, now_ms(), frame.pcm))
+
+        reader = asyncio.create_task(read())
+        try:
+            yield frames
+        finally:
+            with contextlib.suppress(tinyaisense.ApiError):
+                await self.session.stream_stop(handle)
+            await asyncio.wait([reader], timeout=2)
+            reader.cancel()
 
     async def record(self, ms: int) -> JsonObject:
         """Run a mic stream for `ms`, reading its frames, and return its end."""

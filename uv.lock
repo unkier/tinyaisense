@@ -1399,17 +1399,21 @@ name = "tinyaisense-hil"
 version = "0.1.0"
 source = { editable = "packages/hil" }
 dependencies = [
+    { name = "numpy" },
     { name = "pyserial" },
+    { name = "sounddevice" },
     { name = "tinyaisense" },
-    { name = "tinyaisense-hub" },
+    { name = "tinyaisense-hub", extra = ["bench"] },
     { name = "tinyaisense-wire" },
 ]
 
 [package.metadata]
 requires-dist = [
+    { name = "numpy", specifier = ">=2.3" },
     { name = "pyserial", specifier = ">=3.5" },
+    { name = "sounddevice", specifier = ">=0.5" },
     { name = "tinyaisense", editable = "packages/sdk" },
-    { name = "tinyaisense-hub", editable = "packages/hub" },
+    { name = "tinyaisense-hub", extras = ["bench"], editable = "packages/hub" },
     { name = "tinyaisense-wire", editable = "packages/wire" },
 ]
 

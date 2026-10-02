@@ -20,6 +20,8 @@ def test_a_rig_needs_only_the_echos_serial_port(tmp_path: Path) -> None:
     assert rig.state is None
     assert rig.pio == "pio"
     assert rig.soak_minutes == 60
+    assert rig.pod is None
+    assert rig.mouth is None
 
 
 def test_a_rig_takes_every_setting(tmp_path: Path) -> None:
@@ -33,6 +35,8 @@ def test_a_rig_takes_every_setting(tmp_path: Path) -> None:
             state = "~/hub/state.json"
             pio = "~/.platformio/penv/bin/pio"
             soak_minutes = 5
+            pod = "Wavo POD: USB Audio"
+            mouth = "USB Audio Device"
             """,
         )
     )
@@ -44,6 +48,8 @@ def test_a_rig_takes_every_setting(tmp_path: Path) -> None:
         state=str(Path.home() / "hub/state.json"),
         pio=str(Path.home() / ".platformio/penv/bin/pio"),
         soak_minutes=5,
+        pod="Wavo POD: USB Audio",
+        mouth="USB Audio Device",
     )
 
 
@@ -57,6 +63,7 @@ def test_a_rig_takes_every_setting(tmp_path: Path) -> None:
         ('port = "/dev/ttyUSB0"\nhub_ip = "hub.local"', "hub_ip"),
         ('port = "/dev/ttyUSB0"\nstate = ""', "state"),
         ('port = "/dev/ttyUSB0"\nsoak_minutes = 0', "soak_minutes"),
+        ('port = "/dev/ttyUSB0"\npod = 5', "pod"),
         ('port = "/dev/ttyUSB0"\nsoak_minutes = true', "soak_minutes"),
         ("port = ", "hil.toml"),
     ],

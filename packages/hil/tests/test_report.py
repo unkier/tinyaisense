@@ -6,11 +6,20 @@ from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 
-from tinyaisense_hil.checks import Edge
-from tinyaisense_hil.report import HilReport, Interrupt, Soak
+import pytest
+from tinyaisense_hil.checks import CutSample, Edge
+from tinyaisense_hil.report import (
+    Calibration,
+    HilReport,
+    HubToSpeaker,
+    Interrupt,
+    MouthToHub,
+    Soak,
+    SpeakerCut,
+)
 from tinyaisense_hub.bench.gates import Gate
 
-from .test_checks import EDGES, SOAK, diag
+from .test_checks import CLEAN, CONTROL, EDGES, LAGS, SOAK, diag
 
 DATE = datetime(2026, 10, 2, 15, 30, tzinfo=UTC)
 LATENCY: dict[str, object] = {"count": 600, "p50_ms": 4.0, "p99_ms": 4.2, "max_ms": 4.4}
@@ -103,3 +112,77 @@ def test_a_report_is_written_as_markdown_and_json_named_by_its_date_and_commit(
     assert data["interrupt"]["gate"]["runs"][0]["value_ms"] == 4.5
     assert data["interrupt"]["hub_latency"]["p99_ms"] == 4.2
     assert data["soak"] is None
+
+
+def latency(key: str, title: str, ms: float, *runs: list[float]) -> Gate:
+    return Gate(key, title, 99, ms, [list(run) for run in runs])
+
+
+MOUTH = [80.0 + i % 30 for i in range(100)]
+"""A run's mouth→hub: 80 to 109 ms."""
+SAY = [150.0 + i % 40 for i in range(100)]
+CUTS = [
+    CutSample("tone" if i % 2 == 0 else "speech", 4.0 + 0.01 * i, 4.5, CLEAN[i % len(CLEAN)])
+    for i in range(100)
+]
+
+
+def acoustic(**parts: object) -> dict[str, object]:
+    """The acoustic rig's parts, all passing, but for `parts`."""
+    return {
+        "calibration": Calibration(LAGS),
+        "mouth_to_hub": MouthToHub(latency("mouth", "mouth→hub", 150, MOUTH, MOUTH, MOUTH), 27.3),
+        "hub_to_speaker": HubToSpeaker(
+            latency("say", "hub→speaker", 200, SAY, SAY, SAY),
+            voice="lessac",
+            reported={"say, xenia (ru)": [170.0, 210.0], "raw PCM": [80.0, 85.0]},
+            start_clicks_db=[1.0, 12.0],
+        ),
+        "speaker_cut": SpeakerCut(
+            latency("cut", "cut", 7, *[[c.silent_ms for c in CUTS]] * 3), [CUTS] * 3, CONTROL
+        ),
+    } | parts
+
+
+def test_the_acoustic_rigs_report_shows_each_gate_and_how_the_pod_was_calibrated() -> None:
+    passing = report(**acoustic())
+
+    md = passing.markdown()
+
+    assert passing.passed
+    for section in ("## POD calibration", "## mouth→hub", "## hub→speaker", "## Speaker cut"):
+        assert section in md
+    for shown in ("27.3 ms", "xenia (ru)", "raw PCM", "1 of 2", "4 of 5"):
+        assert shown in md
+
+
+def test_an_acoustic_part_fails_the_report_on_its_findings_or_its_gate() -> None:
+    clicking = [replace(cut, click_db=9.0) for cut in CUTS]
+    slow = [m + 100 for m in MOUTH]
+    failing = {
+        "calibration": Calibration([*LAGS[:-2], 33.0, 21.0]),
+        "speaker_cut": SpeakerCut(
+            latency("cut", "cut", 7, *[[c.silent_ms for c in CUTS]] * 3), [clicking] * 3, CONTROL
+        ),
+        "mouth_to_hub": MouthToHub(latency("mouth", "mouth→hub", 150, slow, slow, MOUTH), 27.3),
+    }
+
+    for part, failed in failing.items():
+        broken = report(**acoustic(**{part: failed}))
+        assert not broken.passed, part
+        assert ": FAIL" in broken.markdown().splitlines()[0]
+
+
+def test_the_acoustic_rigs_numbers_go_into_the_json() -> None:
+    data = report(**acoustic()).to_json()
+
+    assert data["calibration"]["lag_ms"] == pytest.approx(27.3)
+    assert data["mouth_to_hub"]["gate"]["runs"][0]["value_ms"] == 109.0
+    assert data["hub_to_speaker"]["reported"]["raw PCM"] == [80.0, 85.0]
+    assert data["speaker_cut"]["runs"][0]["cuts"][0] == {
+        "playing": "tone",
+        "silent_ms": 4.0,
+        "heard_ms": 4.5,
+        "click_db": 0.5,
+    }
+    assert data["speaker_cut"]["control_db"] == CONTROL

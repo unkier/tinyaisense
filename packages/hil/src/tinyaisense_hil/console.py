@@ -1,5 +1,6 @@
 """The Echo's serial console (firmware/components/tas_core/console.c), and the debug build's test
-hooks on it: `btn down|up` injects a press as the button's interrupt would see it.
+hooks on it: `btn down|up` injects a press as the button's interrupt would see it, and `tone`
+and `cut` play a tone and cut it. The speaker logs how long each cut took.
 
 It's opened with DTR and RTS low, so that opening it doesn't reset the Echo. A thread reads all
 the Echo prints; a command's answer is what follows its echo, up to the next prompt, without the
@@ -18,6 +19,7 @@ BAUD = 115200
 _LOGGED = re.compile(r"^[EWIDV] \(\d+\) ")
 _ANSI = re.compile(r"\x1b\[[0-9;]*m")
 _WELCOMED = re.compile(r"welcomed as (\S+),")
+_CUT = re.compile(r" (\S+) cut: silent after (\d+) us(, from the press)?$")
 _KEEP = 64 * 1024
 """How much of what the Echo printed to keep while no command waits for its answer: none of
 it is needed then, but it goes only past this, so that it isn't copied each time."""
@@ -70,6 +72,16 @@ def parse_status(text: str) -> EchoStatus:
     )
 
 
+@dataclass(frozen=True, slots=True)
+class Cut:
+    """A speaker cut, as the speaker logged it once silent: from the cut, or `by_reflex` from
+    the press that made it, until the ramped descriptor has played out."""
+
+    speaker: str
+    silent_us: int
+    by_reflex: bool
+
+
 class Console:
     """The console on serial `port`; `log` gets all the Echo prints. Close it to let go of the
     port, e.g. to flash."""
@@ -84,6 +96,9 @@ class Console:
         self._serial.open()
         self._log = log
         self._text = ""
+        self._line = ""
+        """What the Echo printed since its last whole line."""
+        self._cuts: list[Cut] = []
         self._changed = threading.Condition()
         self._running = threading.Lock()
         self._writing = threading.Lock()
@@ -115,6 +130,20 @@ class Console:
                     )
                 self._text = self._text[answer[1] :]
                 return answer[0]
+
+    @property
+    def cuts(self) -> int:
+        """How many speaker cuts the Echo has logged so far."""
+        with self._changed:
+            return len(self._cuts)
+
+    def cut(self, after: int, timeout: float) -> Cut | None:
+        """The speaker cut the Echo logs after the first `after`, once it has; None if it
+        doesn't within `timeout` s."""
+        with self._changed:
+            if self._changed.wait_for(lambda: len(self._cuts) > after, timeout):
+                return self._cuts[after]
+            return None
 
     def status(self) -> EchoStatus:
         return parse_status(self.run("status"))
@@ -163,8 +192,16 @@ class Console:
                 continue
             if self._log is not None:
                 self._log.write(data)
+            text = data.decode(errors="replace")
             with self._changed:
-                self._text += data.decode(errors="replace")
+                self._text += text
+                self._take_cuts(text)
                 if len(self._text) > _KEEP and not self._running.locked():
                     self._text = ""
                 self._changed.notify_all()
+
+    def _take_cuts(self, text: str) -> None:
+        *lines, self._line = (self._line + text).split("\n")
+        for line in lines:
+            if cut := _CUT.search(_ANSI.sub("", line).rstrip()):
+                self._cuts.append(Cut(cut.group(1), int(cut.group(2)), bool(cut.group(3))))

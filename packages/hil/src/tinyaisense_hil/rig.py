@@ -1,5 +1,6 @@
-"""The rig config, `hil.toml`, which git ignores: the Echo's serial port, and what to reach the
-Echo by. Only `port` is needed: the rest is found from the Echo's console and the route to it.
+"""The rig config, `hil.toml`, which git ignores: the Echo's serial port, what to reach the
+Echo by, and the acoustic rig's audio devices. Only `port` is needed: the rest is found from the
+Echo's console and the route to it, but the acoustic rig needs its `pod`.
 
     port = "/dev/ttyUSB0"           # the Echo's serial console
     echo_ip = "192.168.0.103"       # default: what the console's `status` says
@@ -7,6 +8,11 @@ Echo by. Only `port` is needed: the rest is found from the Echo's console and th
     state = "~/.local/state/tinyaisense/state.json"  # the hub state the Echo is paired in
     pio = "pio"                     # PlatformIO, to build and flash the debug build
     soak_minutes = 60
+    pod = "Wavo POD: USB Audio"     # the mic touching the Echo, as PortAudio names it
+    mouth = "USB Audio Device"      # the speaker by the Echo's mic; default: PortAudio's
+
+Name the audio devices by their ALSA hardware devices, `hw:`, not by PipeWire's or `default`:
+only those put their ADC times on CLOCK_MONOTONIC.
 """
 
 import ipaddress
@@ -33,6 +39,12 @@ class Rig:
     the Echo keeps its token. Default: the owner's hub's."""
     pio: str = "pio"
     soak_minutes: float = 60
+    pod: str | None = None
+    """The POD, the mic touching the Echo: the acoustic rig's reference ear. A PortAudio device
+    name, or a part of one only it has."""
+    mouth: str | None = None
+    """The PC speaker by the Echo's mic, which plays into it as a mouth; None for PortAudio's
+    default output."""
 
 
 def find_rig() -> Path:
@@ -66,6 +78,8 @@ def load_rig(path: Path) -> Rig:
         state=settings.path("state"),
         pio=settings.path("pio") or "pio",
         soak_minutes=settings.positive("soak_minutes", 60),
+        pod=settings.optional_string("pod"),
+        mouth=settings.optional_string("mouth"),
     )
     settings.done()
     return rig

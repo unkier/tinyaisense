@@ -4,9 +4,11 @@ version = "0.1.0"
 description = "tinyaisense HIL tier: the real Atom Echo, driven through the hub and the SDK"
 requires-python = ">=3.14"
 dependencies = [
+    "numpy>=2.3",
     "pyserial>=3.5",
+    "sounddevice>=0.5",
     "tinyaisense",
-    "tinyaisense-hub",
+    "tinyaisense-hub[bench]",
     "tinyaisense-wire",
 ]
 

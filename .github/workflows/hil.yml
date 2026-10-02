@@ -1,14 +1,15 @@
 # HIL tier: the real Atom Echo, on the hub PC's self-hosted runner, over its serial console and
-# the LAN. The Interrupt gate on injected presses, and the soak, on the debug build, flashed only
-# if the build changed. The rig: ~/.config/tinyaisense/hil.toml (see the README). Each run's
-# acceptance report goes to the `acceptance` branch, and into the run's summary.
+# the LAN. The Interrupt gate on injected presses, the acoustic gates by the POD and the PC
+# speaker, and the soak, on the debug build, flashed only if the build changed. The rig:
+# ~/.config/tinyaisense/hil.toml (see the README). Each run's acceptance report goes to the
+# `acceptance` branch, and into the run's summary.
 name: HIL
 
 on:
   workflow_dispatch:
     inputs:
       tests:
-        description: "Which tests, as pytest's -k takes them: e.g. interrupt or soak (default: all)"
+        description: "Which tests, as pytest's -k takes them: e.g. interrupt, acoustic or soak (default: all)"
         default: ""
       soak_minutes:
         description: How long the soak runs, in minutes
@@ -24,7 +25,7 @@ concurrency:
 
 jobs:
   hil:
-    name: interrupt, soak on the Echo
+    name: interrupt, acoustic, soak on the Echo
     runs-on: [self-hosted, tinyaisense-hub]
     timeout-minutes: 150
     permissions:
@@ -34,9 +35,10 @@ jobs:
         with:
           persist-credentials: false
       - uses: astral-sh/setup-uv@v10.2.0
-      - run: uv sync --locked --all-packages --no-default-groups --group test
-      # Fails if 2 of 3 runs of the Interrupt gate miss, or if the soak breaks an invariant. The
-      # report logs loadavg and the CPU governor.
+      # The acoustic gates speak with the local engines, their models cached on the hub PC.
+      - run: uv sync --locked --all-packages --no-default-groups --group test --extra local
+      # Fails if 2 of 3 runs of a gate miss, or if the soak breaks an invariant. The report logs
+      # loadavg and the CPU governor.
       - name: HIL
         env:
           TESTS: ${{ inputs.tests }}

@@ -1,9 +1,19 @@
 """What the HIL tier checks its numbers by: the interrupt samples against the hub's `stats` and
-the serial line, and the soak's diag against its invariants."""
+the serial line, the soak's diag against its invariants, the POD's lag against its error budget,
+and cut clicks against the positive control."""
 
 import math
 
-from tinyaisense_hil.checks import Diag, Edge, interrupt_findings, soak_findings
+import pytest
+from tinyaisense_hil.checks import (
+    Diag,
+    Edge,
+    calibration_findings,
+    click_findings,
+    interrupt_findings,
+    pod_lag,
+    soak_findings,
+)
 
 EDGES = [
     Edge("down" if i % 2 == 0 else "up", sent=1000.0 * i, t=1000 * i + 2, got=1000.0 * i + 6.5)
@@ -122,3 +132,51 @@ def test_the_echo_must_not_reconnect() -> None:
     (finding,) = soak_findings([*SOAK[:-1], diag(60, reconnects=1)])
 
     assert "1 reconnects" in finding
+
+
+LAGS = [27.0 + 0.1 * (i % 7) for i in range(20)]
+"""The POD's lag at 20 cuts: 27.0 to 27.6 ms."""
+
+
+def test_the_pods_lag_is_the_median_of_the_cuts_it_heard() -> None:
+    assert pod_lag([*LAGS, math.inf]) == pytest.approx(27.3)
+    assert calibration_findings([*LAGS, math.inf]) == []
+
+
+def test_the_pods_lag_must_hold_within_5_ms_of_its_median() -> None:
+    (finding,) = calibration_findings([*LAGS[:-2], 33.0, 21.0])
+
+    assert "5 ms" in finding
+
+
+def test_the_pod_must_have_heard_most_cuts() -> None:
+    (finding,) = calibration_findings([*LAGS[:9], *[math.inf] * 11])
+
+    assert "9 of 20" in finding
+
+
+CLEAN = [0.5, 1.2, -0.3, 2.1] * 5
+CONTROL = [12.0, 7.5, 20.1, 2.0, 9.9]
+
+
+def test_cuts_pass_unless_most_runs_have_a_cut_that_clicked() -> None:
+    clicked = [*CLEAN[:-1], 8.5]
+
+    assert click_findings([CLEAN, clicked, CLEAN], CONTROL) == []
+    (finding,) = click_findings([clicked, CLEAN, clicked], CONTROL)
+    assert "2 of 3 runs" in finding
+    assert "8.5 dB" in finding
+
+
+def test_a_cut_whose_end_wasnt_heard_isnt_shown_clean() -> None:
+    (finding,) = click_findings([[*CLEAN, math.inf]] * 3, CONTROL)
+
+    assert "3 of 3 runs" in finding
+
+
+def test_the_click_check_holds_only_if_it_hears_most_of_the_positive_controls_clicks() -> None:
+    (finding,) = click_findings([CLEAN] * 3, [12.0, 1.0, 2.0, 9.0, 0.5])
+
+    assert "2 of 5" in finding
+    assert click_findings([CLEAN] * 3, [12.0, 1.0, 20.0, 9.0, 0.5]) == []
+    assert len(click_findings([CLEAN] * 3, [])) == 1

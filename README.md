@@ -94,7 +94,7 @@ The device↔hub protocol is specified in [`docs/protocol/`](docs/protocol/READM
 
 Hub integration tests run the real hub in-process on ephemeral ports and drive it with simulated devices from the `simulator` pytest fixture, which `tinyaisense-sim` exports. A simulated device finds the hub over mDNS unless given its address, and `device.faults` breaks its Connection on demand: `rst()`, `close()`, `vanish()`, `stall_reads` and `send_garbage()`; `wifi_drop(ms)` takes its WiFi down, and `reboot(down_ms, reason)` powers it off and back on afresh. `drift_ppm` runs its crystal fast or slow, its clock and its audio both, and `clock_offset_us` is where its clock starts at the next boot. `device.faults.udp_down` and `udp_up` fault the datagrams from and to the hub, seeded from the Simulator's `seed` and live: Bernoulli `loss`, Gilbert–Elliott `bursts`, `delay_ms`, `jitter_ms`, `duplicate`, `drop(stream, seqs)` and `blackout(ms)`; `mic_tx_stall` holds the mic's frames in its 200 ms queue. `device.speaker.captured` records what the speaker played, with when each frame was heard; `speaker.sink` sends it elsewhere instead, `tinyaisense_sim.sinks.Null()` or `Wav(path)`. `device.timeline` lists what happened to the device, its Status, messages, button edges and faults, and the Simulator's `trace` writes every device's to a JSONL file. `device.mic.feed(pcm)` gives the mic something to hear, in real time or with `burst=True` at once, from `tinyaisense_sim.sources`: `silence`, `tone`, `wav` files and raw `pcm`, resampled to 16 kHz mono. `device.button` presses and clicks; while the hub has armed the Reflex (`device.armed`), a press cuts the speaker and opens the mic, as firmware does, and `await device.talk(pcm)` presses, lets the mic hear `pcm` in real time, then releases. Besides the Atom Echo, `sim-duplex` is an Echo whose speaker and mic work at once, and `from_manifest(obj)` makes a Board of any manifest. `test_chaos.py` soaks three devices in seeded faults; `TINYAISENSE_SOAK_S` and `TINYAISENSE_SOAK_SEED` run it longer, or otherwise. The mDNS tests need multicast on some interface, and each uses a service type of its own so that it never finds another hub on the LAN.
 
-Most speech tests use a fake speech plugin, whose TTS speaks text as tones that its STT decodes. The local engines are tested on real English and Russian speech from `packages/hub/tests/audio/`, and what the TTS engines say, Parakeet hears back; those tests are skipped unless the `[local]` extra is installed and `models fetch` has run. The polza.ai engines run against a fake polza.ai, `packages/hub/tests/fake_polza.py`, which speaks and hears the fake plugin's tones. The `typings/` stubs give pyright the parts of onnxruntime, sherpa-onnx, soxr and sounddevice that the hub and the Simulator use, since none of them ships types.
+Most speech tests use a fake speech plugin, whose TTS speaks text as tones that its STT decodes. The local engines are tested on real English and Russian speech from `packages/hub/tests/audio/`, and what the TTS engines say, Parakeet hears back; those tests are skipped unless the `[local]` extra is installed and `models fetch` has run. The polza.ai engines run against a fake polza.ai, `packages/hub/tests/fake_polza.py`, which speaks and hears the fake plugin's tones. The `typings/` stubs give pyright the parts of onnxruntime, sherpa-onnx, soxr and sounddevice that the hub, the Simulator and the HIL tier use, since none of them ships types.
 
 ### The Simulator
 
@@ -130,21 +130,32 @@ The HIL tier runs on a real Atom Echo, over its serial console and the LAN, as p
 
 - Interrupt: 200 `btn` edges injected on the console, 3 runs, while a speaker stream plays. From the edge on the Echo to the SDK, p99 ≤20 ms, cross-checked against the hub's own `stats` and the serial write.
 - Soak: an hour from a power-on reset, a round of speaker, mic and presses a minute. heap_min stays flat and ≥40 KB, nothing resets the Echo, every task keeps >512 B of stack, and the Echo never reconnects.
+- Acoustic, by the rig's reference ear, a USB mic (the POD) touching the Echo, and its mouth, a PC speaker by the Echo's mic. It makes noise.
+  - mouth→hub: 100 chirps a run, 3 runs. From a chirp's onset at the POD to the agent getting the mic frame it starts in, p99 ≤150 ms.
+  - hub→speaker: 100 `say`s in English (Piper's lessac) a run, 3 runs. From the `say` to its onset at the POD, p99 ≤200 ms. Russian (Silero's xenia), each engine's first `say`, raw PCM streams and how far a stream's start clicks are reported only.
+  - Speaker cut: 100 injected presses a run, 3 runs, cutting a 1 kHz tone and speech by turns. From the press to silence, by the firmware's own timing, p99 ≤7 ms; when the POD heard it is reported, a check that the lag held. No tone cut may click: energy over 2 kHz in the 20 ms after its ramp stays within 6 dB of the noise floor while the tone played. Speech cuts' clicks are reported. The positive control, cutting by stopping the I2S channel, must click more often than not.
 
-Nothing in it needs root, so it injects no network faults on the real Echo: the simulated devices' faults cover those. The Interrupt gate fails if 2 of its 3 runs miss. Each run writes a report into `./acceptance/` (`TINYAISENSE_HIL_OUT`), in Markdown and JSON, with the numbers, the firmware and hub versions, the rig, and the machine's CPU governor and load.
+  The POD hears ~29 ms later than PortAudio's ADC times say, so each session calibrates it first, by 20 Reflex cuts of a tone: from when the Echo went silent, by its own timing, to when the POD heard it. 95% of the lags must hold within ±5 ms of their median. The lag includes what the Echo's I2S FIFO holds, a few ms: hub→speaker comes out that much short and mouth→hub that much long.
 
-The rig config, `hil.toml` here or in `~/.config/tinyaisense/` (`TINYAISENSE_HIL_RIG`), needs only the Echo's serial port: the rest defaults to what the Echo's `status` and the route to it say:
+Nothing in it needs root, so it injects no network faults on the real Echo: the simulated devices' faults cover those. A gate fails if 2 of its 3 runs miss. Each run writes a report into `./acceptance/` (`TINYAISENSE_HIL_OUT`), in Markdown and JSON, with the numbers, the firmware and hub versions, the rig, and the machine's CPU governor and load.
+
+The rig config, `hil.toml` here or in `~/.config/tinyaisense/` (`TINYAISENSE_HIL_RIG`), needs only the Echo's serial port, and the POD for the acoustic tests: the rest defaults to what the Echo's `status` and the route to it say. Name the audio devices as PortAudio does their ALSA hardware devices, whose clock is CLOCK_MONOTONIC:
 
 ```toml
 port = "/dev/ttyUSB0"
 state = "~/.local/state/tinyaisense/state.json"   # the hub state the Echo is paired in: this default
 pio = "~/.platformio/penv/bin/pio"
 soak_minutes = 60
+pod = "Wavo POD: USB Audio"                        # the reference ear
+mouth = "USB Audio Device"                         # by the Echo's mic; PortAudio's default output if left out
 ```
+
+The acoustic tests speak with the local engines: `uv sync --all-packages --extra local`, and `tinyaisense-hub models fetch`.
 
 ```sh
 uv run pytest -m hil packages/hil/tests/hil         # everything, the soak included
 uv run pytest -m hil packages/hil/tests/hil -k interrupt
+uv run pytest -m hil packages/hil/tests/hil -k acoustic
 TINYAISENSE_HIL_SOAK_MINUTES=7 uv run pytest -m hil packages/hil/tests/hil -k soak
 ```
 
