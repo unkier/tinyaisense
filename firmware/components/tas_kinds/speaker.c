@@ -31,6 +31,9 @@
 #define MAX_CHANNELS 2
 #define CAPACITY_MS 200
 #define PREFILL_MS 40
+// How long the I2S FIFO takes to play out what the DMA moved into it, with margin: a peer taking
+// the pins any sooner makes the amp pop, as the HIL tier's POD heard at 1 ms.
+#define FIFO_DRAIN_US 5000
 
 typedef struct {
     const tas_cap_t *cap;
@@ -54,6 +57,7 @@ typedef struct {
     bool cut_by_reflex;          // and whether by the Reflex
     bool cut_pending;            // it hasn't gone silent yet
     uint32_t silent_after_us;    // when it did, from cut_us; 0 until then
+    int64_t silent_at_us;        // when the DMA last went silent: a stream ended, or a cut did
 } speaker_t;
 
 static tas_kind_instances_t instances;
@@ -129,12 +133,14 @@ static bool cut_went_silent(speaker_t *s) {
     if (!s->cut_pending || !tas_cut_silent_at(&s->cut, &at)) return false;
     s->cut_pending = false;
     s->silent_after_us = (uint32_t)(at - s->cut_us);
+    s->silent_at_us = at;
     return true;
 }
 
 // The stream is over, its id dead. With the lock held.
 static void end_stream(speaker_t *s) {
     s->playing = false;
+    s->silent_at_us = esp_timer_get_time();
     s->played_through = false;
     s->out_len = s->out_pos = 0;
     tas_kind_mark_closed(s->stream);
@@ -352,12 +358,15 @@ bool tas_speaker_cut_silent_after(const tas_cap_t *cap, uint32_t *us) {
     return *us != 0;
 }
 
-// A cut has played out.
+// The stream, or its cut, has played out: the DMA has gone silent, and the I2S FIFO after it. A
+// cut's silence is known as soon as the DMA reaches its ramp, but a peer that took the pins then
+// would make the amp pop.
 static bool quiet(const tas_cap_t *cap) {
     speaker_t *s = speaker_of(cap);
-    int64_t at;
     xSemaphoreTake(s->lock, portMAX_DELAY);
-    bool quiet = !s->playing && (!s->cut_pending || tas_cut_silent_at(&s->cut, &at));
+    int64_t at = s->silent_at_us;
+    bool quiet = !s->playing && (!s->cut_pending || tas_cut_silent_at(&s->cut, &at)) &&
+                 esp_timer_get_time() >= at + FIFO_DRAIN_US;
     xSemaphoreGive(s->lock);
     return quiet;
 }
