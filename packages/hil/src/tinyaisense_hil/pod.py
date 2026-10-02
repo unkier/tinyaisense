@@ -1,17 +1,19 @@
 """The acoustic rig's audio, through PortAudio: the POD recording all it hears, with the ADC time
-of each block, and the PC speaker playing into the Echo's mic as a mouth. Importing it loads
+of each block, and the PC speaker playing into the Echo's mic as a mouth. Opening either loads
 PortAudio."""
 
 import collections
 import threading
 import time
 from types import TracebackType
-from typing import Any, Self, cast
+from typing import TYPE_CHECKING, Any, Self, cast
 
 import numpy as np
-import sounddevice as sd
 
 from .acoustic import Heard, Timeline
+
+if TYPE_CHECKING:
+    from sounddevice import CallbackFlags
 
 RATE = 48000
 _CLOCK_SLACK_S = 1.0
@@ -27,8 +29,17 @@ class PodError(Exception):
     pass
 
 
+def _sounddevice():  # the module, which pyright infers
+    try:
+        import sounddevice
+    except OSError as e:  # sounddevice is in, PortAudio isn't
+        raise PodError(f"the acoustic rig needs PortAudio: {e}") from e
+    return sounddevice
+
+
 def _channels(device: str | None, kind: str) -> int:
     """How many channels to open `device` with: an ALSA hardware device takes only its own."""
+    sd = _sounddevice()
     try:
         info = cast(dict[str, Any], sd.query_devices(device, kind))
     except (ValueError, sd.PortAudioError) as e:
@@ -53,6 +64,7 @@ class Pod:
         self._skew_s = 0.0
         """How far PortAudio's clock was from CLOCK_MONOTONIC at the first block."""
         self._started = threading.Event()
+        sd = _sounddevice()
         try:
             self._stream = sd.InputStream(
                 samplerate=RATE,
@@ -99,7 +111,7 @@ class Pod:
             raise PodError("the POD has heard nothing yet")
         return Heard(np.concatenate(audio), RATE, Timeline.fit(blocks), lag_ms)
 
-    def _block(self, indata: Any, frames: int, times: Any, status: sd.CallbackFlags) -> None:
+    def _block(self, indata: Any, frames: int, times: Any, status: CallbackFlags) -> None:
         block = cast(np.ndarray, indata)[:, 0].copy()
         adc_ms = cast(float, times.inputBufferAdcTime) * 1000 + self._offset_ms
         if not self._started.is_set():
@@ -121,6 +133,7 @@ class Mouth:
         self._queue: collections.deque[np.ndarray] = collections.deque()
         self._playing = np.zeros(0, dtype=np.float32)
         self._lock = threading.Lock()
+        sd = _sounddevice()
         try:
             self._stream = sd.OutputStream(
                 samplerate=RATE,
@@ -151,7 +164,7 @@ class Mouth:
         with self._lock:
             self._queue.append(signal.astype(np.float32))
 
-    def _fill(self, outdata: Any, frames: int, times: Any, status: sd.CallbackFlags) -> None:
+    def _fill(self, outdata: Any, frames: int, times: Any, status: CallbackFlags) -> None:
         out = cast(np.ndarray, outdata)
         out.fill(0)
         filled = 0
