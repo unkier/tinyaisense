@@ -50,6 +50,7 @@ jobs:
       - run: >-
           uv run --no-sync pytest --cov-report=term-missing
           --cov=tinyaisense_wire --cov=tinyaisense_hub --cov=tinyaisense_sim --cov=tinyaisense
+          --cov=tinyaisense_hil
       - name: Coverage summary
         run: uv run --no-sync coverage report --format=markdown >> "$GITHUB_STEP_SUMMARY"
 

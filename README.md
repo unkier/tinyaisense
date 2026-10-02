@@ -80,6 +80,7 @@ The Python packages live in one uv workspace under `packages/`:
 | `tinyaisense-hub` | ≥3.14 | `packages/hub` |
 | `tinyaisense-sim` | ≥3.14 | `packages/sim` |
 | `tinyaisense` (SDK) | ≥3.11 | `packages/sdk` |
+| `tinyaisense-hil` (the HIL tier's harness) | ≥3.14 | `packages/hil` |
 
 ```sh
 uv sync --all-packages --extra local --extra polza --extra bench --extra audio
@@ -123,6 +124,34 @@ A gate fails only if 2 of its 3 runs miss. The bench skips, writing nothing, if 
 
 On every push to main, the model tier (`.github/workflows/model.yml`) runs `bench speech --load` on the hub PC, a self-hosted runner that `.github/runner/setup.sh` registers, and pushes its report to the `acceptance` branch.
 
+### The HIL tier
+
+The HIL tier runs on a real Atom Echo, over its serial console and the LAN, as pytest's `hil` marker; a plain `pytest` leaves it out. It builds the debug build (`m5stack-atom-echo-debug`, with the console's test hooks) and flashes it only if the Echo's `status` shows another ELF sha256. It then points the Echo's `hub` at a hub it runs as `serve --auto-approve` runs it, in a process of its own, from a copy of the hub state the Echo is paired in, so that the Echo keeps its token, and sets `hub` back after.
+
+- Interrupt: 200 `btn` edges injected on the console, 3 runs, while a speaker stream plays. From the edge on the Echo to the SDK, p99 ≤20 ms, cross-checked against the hub's own `stats` and the serial write.
+- Faults: netem on the Echo's traffic only, both ways: 2% loss, 5% loss in bursts, 30 ms jitter, and a 3 s blackout. Each keeps the Connection and every press; its streams play through, or deliver their timeline, losing about what the network does; and a press in the blackout still cuts the speaker, on the Echo itself.
+- Soak: an hour from a power-on reset, a round of speaker, mic and presses a minute under each lossy scenario in turn, and a 10 s blackout every 10 minutes to force a reconnect. heap_min stays flat and ≥40 KB, nothing resets the Echo, every task keeps >512 B of stack, and the Echo counts as many reconnects as were forced.
+
+The Interrupt gate fails if 2 of its 3 runs miss, and a fault scenario if 2 of its runs do. Each run writes a report into `./acceptance/` (`TINYAISENSE_HIL_OUT`), in Markdown and JSON, with the numbers, the firmware and hub versions, the rig, and the machine's CPU governor and load.
+
+The rig config, `hil.toml` here or in `~/.config/tinyaisense/` (`TINYAISENSE_HIL_RIG`), needs only the Echo's serial port: the rest defaults to what the Echo's `status` and the route to it say. netem needs root, so it goes through a wrapper that only shapes one IPv4 address's traffic, with one of the four scenarios, installed with a sudo rule for it alone:
+
+```toml
+port = "/dev/ttyUSB0"
+state = "~/.local/state/tinyaisense/state.json"   # the hub state the Echo is paired in: this default
+pio = "~/.platformio/penv/bin/pio"
+soak_minutes = 60
+```
+
+```sh
+packages/hil/netem/install.sh                       # once: asks for sudo; --remove takes it out
+uv run pytest -m hil packages/hil/tests/hil         # everything, the soak included
+uv run pytest -m hil packages/hil/tests/hil -k interrupt
+TINYAISENSE_HIL_SOAK_MINUTES=7 uv run pytest -m hil packages/hil/tests/hil -k soak
+```
+
+The HIL workflow (`.github/workflows/hil.yml`) runs it on the hub PC when dispatched by hand, and pushes its report to the `acceptance` branch.
+
 ## Firmware
 
 The firmware in `firmware/` is an ESP-IDF 5.5 project in C11, built with PlatformIO; `idf.py build` works too. Each Board gets its own binary, picked by a Kconfig choice. The pure-C code makes no IDF calls, so it's tested on the PC under ASan and UBSan: the audio code in `tas_audio` (DSP, ramps, the speaker jitter buffer and the DMA-patch planner), the wire codec in `tas_wire` against the golden vectors, the Connection in `tas_conn` (handshake, keepalive, protocol errors, backoff), the Status priorities and LED looks in `tas_status`, and the led Kind's claim in `tas_led`:
@@ -134,4 +163,4 @@ pio run -e m5stack-atom-echo  # the Atom Echo binary; add `-t upload` to flash i
 pio check -e m5stack-atom-echo -e native --fail-on-defect=low --fail-on-defect=medium --fail-on-defect=high
 ```
 
-A device is set up over its serial console (`pio device monitor -e m5stack-atom-echo`): `wifi <ssid> [password]` stores the WiFi and reboots, `hub <host:port>` sets a static hub where mDNS can't reach and `hub auto` goes back to mDNS, `token clear` forgets the Pairing, `status` shows the device, its WiFi, its Connection and its volume, and `reboot` reboots. The settings live in NVS; dev builds can bake defaults in with `pio run -t menuconfig`, under "tinyaisense settings". The speaker boots at the volume under "tinyaisense Kinds", 80 by default, until the hub sets one; the device never stores it. Holding the button through boot for 5 s, while the LED blinks white, erases every setting.
+A device is set up over its serial console (`pio device monitor -e m5stack-atom-echo`): `wifi <ssid> [password]` stores the WiFi and reboots, `hub <host:port>` sets a static hub where mDNS can't reach and `hub auto` goes back to mDNS, `token clear` forgets the Pairing, `status` shows the device, its firmware and the start of its ELF sha256, its WiFi, its Connection and its volume, and `reboot` reboots. The settings live in NVS; dev builds can bake defaults in with `pio run -t menuconfig`, under "tinyaisense settings". The speaker boots at the volume under "tinyaisense Kinds", 80 by default, until the hub sets one; the device never stores it. Holding the button through boot for 5 s, while the LED blinks white, erases every setting.

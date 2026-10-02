@@ -1,0 +1,69 @@
+# The acceptance reports in acceptance/, into the run's summary and onto the `acceptance` branch.
+# The job needs `contents: write`.
+name: Acceptance report
+description: Add the run's acceptance reports to its summary, and push them to the acceptance branch
+inputs:
+  token:
+    description: A token that can push to the repo
+    required: true
+  missing:
+    description: What the summary says when there's no report
+    required: true
+runs:
+  using: composite
+  steps:
+    - name: Summary
+      shell: bash
+      env:
+        MISSING: ${{ inputs.missing }}
+      run: |
+        shopt -s nullglob
+        reports=(acceptance/*.md)
+        if (( ${#reports[@]} )); then
+          cat "${reports[@]}" >> "$GITHUB_STEP_SUMMARY"
+        else
+          echo "$MISSING" >> "$GITHUB_STEP_SUMMARY"
+        fi
+    - name: Push the report to the acceptance branch
+      shell: bash
+      env:
+        GITHUB_TOKEN: ${{ inputs.token }}
+      run: |
+        set -euo pipefail
+        shopt -s nullglob
+        reports=(acceptance/*.md acceptance/*.json)
+        if (( ! ${#reports[@]} )); then
+          echo "no report to push"
+          exit 0
+        fi
+        # The token as checkout passes it: in git's environment, never on disk. And the bot
+        # as the author and committer, of the commit and of any rebase of it.
+        export GIT_CONFIG_COUNT=3
+        export GIT_CONFIG_KEY_0=http.https://github.com/.extraheader
+        GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GITHUB_TOKEN" | base64 -w0)"
+        export GIT_CONFIG_VALUE_0
+        export GIT_CONFIG_KEY_1=user.name GIT_CONFIG_VALUE_1="github-actions[bot]"
+        export GIT_CONFIG_KEY_2=user.email
+        export GIT_CONFIG_VALUE_2="41898282+github-actions[bot]@users.noreply.github.com"
+        remote="https://github.com/$GITHUB_REPOSITORY.git"
+        branch="$RUNNER_TEMP/acceptance-branch"
+        rm -rf "$branch"
+        if git ls-remote --exit-code --heads "$remote" acceptance > /dev/null; then
+          git clone --quiet --depth 1 --branch acceptance "$remote" "$branch"
+        else
+          git init --quiet --initial-branch acceptance "$branch"
+          git -C "$branch" remote add origin "$remote"
+        fi
+        mkdir -p "$branch/acceptance"
+        cp "${reports[@]}" "$branch/acceptance/"
+        cd "$branch"
+        git add acceptance
+        git commit --quiet -m "Acceptance report for ${GITHUB_SHA::12}"
+        for attempt in 1 2 3; do
+          if git push --quiet origin HEAD:acceptance; then
+            exit 0
+          fi
+          echo "push $attempt failed; rebasing on the branch as it is now"
+          git pull --quiet --rebase origin acceptance || git rebase --abort || true
+        done
+        exit 1

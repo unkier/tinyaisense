@@ -6,6 +6,7 @@
 
 #include "core.h"
 #include "driver/uart.h"
+#include "esp_app_desc.h"
 #include "esp_console.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
@@ -23,6 +24,9 @@
 #define CONSOLE_STACK 4096
 #define MAX_LINE 160
 #define PROMPT "tas> "
+// The start of the app's ELF sha256, in hex, as panics print it: the HIL tier tells builds apart
+// by it.
+#define ELF_SHA_HEX CONFIG_APP_RETRIEVE_LEN_ELF_SHA
 
 static const tas_board_t *board;
 static const tas_manifest_t *manifest;
@@ -90,12 +94,13 @@ static int cmd_status(int argc, char **argv) {
     (void)argc;
     (void)argv;
     config_t c = config_get();
-    char ip[16], name[TAS_CONN_MAX_NAME + 1], hub[HUB_ADDR_MAX];
+    char ip[16], name[TAS_CONN_MAX_NAME + 1], hub[HUB_ADDR_MAX], elf[ELF_SHA_HEX + 1];
     net_ip(ip, sizeof ip);
     ctrl_describe(name, sizeof name, hub, sizeof hub);
-    printf("device    %.*s, %s, firmware %.*s\n", (int)manifest->device_id.len,
+    esp_app_get_elf_sha256(elf, sizeof elf);
+    printf("device    %.*s, %s, firmware %.*s, elf %s\n", (int)manifest->device_id.len,
            manifest->device_id.ptr, board->name, (int)manifest->firmware.len,
-           manifest->firmware.ptr);
+           manifest->firmware.ptr, elf);
     if (!c.ssid[0]) printf("wifi      not set\n");
     else if (net_up()) printf("wifi      %s, %s, %d dBm\n", c.ssid, ip, net_rssi());
     else printf("wifi      %s, down\n", c.ssid);

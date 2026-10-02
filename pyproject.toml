@@ -43,7 +43,9 @@ typeCheckingMode = "strict"
 [tool.pytest]
 minversion = "9.0"
 testpaths = ["packages"]
-addopts = ["--import-mode=importlib"]
+# The HIL tier needs the hardware rig: `pytest -m hil` runs it instead.
+addopts = ["--import-mode=importlib", "-m", "not hil"]
+markers = ["hil: on the hardware rig, the real Echo (packages/hil); `-m hil` runs these"]
 strict = true
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"

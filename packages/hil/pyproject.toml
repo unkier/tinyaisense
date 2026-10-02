@@ -1,0 +1,20 @@
+[project]
+name = "tinyaisense-hil"
+version = "0.1.0"
+description = "tinyaisense HIL tier: the real Atom Echo, driven through the hub and the SDK"
+requires-python = ">=3.14"
+dependencies = [
+    "pyserial>=3.5",
+    "tinyaisense",
+    "tinyaisense-hub",
+    "tinyaisense-wire",
+]
+
+[tool.uv.sources]
+tinyaisense = { workspace = true }
+tinyaisense-hub = { workspace = true }
+tinyaisense-wire = { workspace = true }
+
+[build-system]
+requires = ["uv_build>=0.10.0,<0.11"]
+build-backend = "uv_build"

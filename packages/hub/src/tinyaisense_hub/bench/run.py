@@ -12,22 +12,14 @@ own loop, whose clock is the monotonic clock to the ns.
 
 import asyncio
 import contextlib
-import dataclasses
 import math
 import os
 import random
-import secrets
-import socket
-import subprocess
-import sys
-import tempfile
 import time
 from collections import Counter
 from collections.abc import Callable, Coroutine, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from importlib.metadata import version
-from pathlib import Path
 from types import TracebackType
 from typing import Any, Self, cast
 
@@ -35,11 +27,11 @@ import tinyaisense
 from tinyaisense_sim import SimDevice, Simulator
 from tinyaisense_wire import JsonObject
 
-from ..config import APP, Config, write_config
-from ..owner import SOCKET_NAME, OwnerClient
+from ..config import Config
 from ..streams import FORMAT
 from .corpus import BenchError, Sentence
 from .gates import Gate, word_errors
+from .hub import HubProcess, hub_version
 from .report import Heard, Load, Report, Spoke, machine
 
 BOARD = "m5stack-atom-echo"
@@ -55,8 +47,6 @@ HOLD_MS = (20.0, 60.0)
 """How long the interrupt gate waits before each press, and holds it: at random, within."""
 TAIL_MS = 1500
 """The silence a loading listen hears after its speech: its turn ends within it."""
-START_S = 300
-"""How long the hub may take to start: its engines load and warm up."""
 ONLINE_S = 5
 STT_S = 30
 TTS_S = 60
@@ -92,17 +82,17 @@ async def bench(
     or else `bench`. `report` hears how it goes. Raises `BenchError`."""
     stt = Gate("stt", "STT: last speech frame → final transcript", *STT_GATE)
     tts = Gate("tts", "TTS: text → first 10 ms frame at the device", *TTS_GATE)
-    hub_version, now = _hub_version(), datetime.now(UTC)
+    versions, now = hub_version(), datetime.now(UTC)
     result = Report(
-        name or _short(cast(str | None, hub_version.get("commit"))),
+        name or _short(cast(str | None, versions.get("commit"))),
         now,
-        hub_version,
+        versions,
         machine(),
         config.speech,
         gates=[stt, tts],
     )
     report(f"loadavg {result.machine['loadavg']}, governor {result.machine['governor']}")
-    async with _HubProcess(config) as hub, _Rig(hub) as rig:
+    async with HubProcess(config) as hub, _Rig(hub) as rig:
         device = await rig.device("bench")
         address = cast(str, device.name)
         for rep in range(reps):
@@ -138,171 +128,11 @@ async def bench(
     return result
 
 
-def _hub_version() -> JsonObject:
-    """The hub's version, and the commit it's built from if known, `-dirty` if it has changes
-    of its own."""
-    hub: JsonObject = {"version": version("tinyaisense-hub")}
-    if (commit := os.environ.get("GITHUB_SHA")) is not None:
-        hub["commit"] = commit[:12]
-        return hub
-    with contextlib.suppress(OSError, subprocess.CalledProcessError):
-        head = _git("rev-parse", "HEAD")[:12]
-        changed = _git("status", "--porcelain", "--untracked-files=no")
-        hub["commit"] = f"{head}-dirty" if changed else head
-    return hub
-
-
 def _short(commit: str | None) -> str:
     if commit is None:
         return "bench"
     head, dirty, _ = commit.partition("-dirty")
     return head[:7] + dirty
-
-
-def _git(*args: str) -> str:
-    """Raises `OSError` or `subprocess.CalledProcessError`, e.g. out of a git checkout."""
-    return subprocess.run(
-        ["git", *args], cwd=Path(__file__).parent, capture_output=True, text=True, check=True
-    ).stdout.strip()
-
-
-class _HubProcess:
-    """The hub under test, run as `serve --auto-approve --no-mdns` runs it, in a process of its
-    own, on loopback only and with an agent token of its own. It listens on free ports, and keeps
-    its state, runtime files and log in a temporary dir that's gone after: if it fails, the end
-    of its log goes into the `BenchError`."""
-
-    def __init__(self, config: Config) -> None:
-        self._config = dataclasses.replace(config, agent_token=secrets.token_urlsafe(32))
-        self._dir: tempfile.TemporaryDirectory[str] | None = None
-        self._process: asyncio.subprocess.Process | None = None
-        self.device_address = (_LOOPBACK, 0)
-        self.agent_url = ""
-
-    @property
-    def token(self) -> str:
-        return self._config.agent_token
-
-    async def __aenter__(self) -> Self:
-        # Short, so that the owner socket's path fits a sockaddr_un.
-        self._dir = tempfile.TemporaryDirectory(prefix="tas-bench-")
-        root = Path(self._dir.name)
-        device_port, http_port = _free_ports()
-        config = dataclasses.replace(self._config, device_port=device_port, http_port=http_port)
-        write_config(root / "config" / APP / "hub.toml", config)
-        self.device_address = (_LOOPBACK, device_port)
-        self.agent_url = f"ws://{_LOOPBACK}:{http_port}/agent"
-        env = os.environ | {
-            "XDG_CONFIG_HOME": str(root / "config"),
-            "XDG_STATE_HOME": str(root / "state"),
-            "XDG_RUNTIME_DIR": str(root / "run"),
-        }
-        (root / "run").mkdir(mode=0o700)
-        with self._log.open("wb") as log:
-            self._process = await asyncio.create_subprocess_exec(
-                sys.executable,
-                "-m",
-                "tinyaisense_hub",
-                "serve",
-                "--auto-approve",
-                "--no-mdns",
-                "--host",
-                _LOOPBACK,
-                env=env,
-                stdin=subprocess.DEVNULL,
-                stdout=log,
-                stderr=subprocess.STDOUT,
-            )
-        try:
-            await _within(self._started(), START_S, "the hub didn't start")
-        except BaseException as e:
-            await self.__aexit__(type(e), e, e.__traceback__)
-            raise
-        return self
-
-    async def __aexit__(
-        self,
-        exc_type: type[BaseException] | None,
-        exc: BaseException | None,
-        tb: TracebackType | None,
-    ) -> None:
-        process, self._process = self._process, None
-        if process is not None and process.returncode is None:
-            process.terminate()
-            try:
-                await asyncio.wait_for(process.wait(), 10)
-            except TimeoutError:
-                process.kill()
-                await process.wait()
-        try:
-            if process is not None and isinstance(exc, _FAILURES):
-                what = str(exc) if isinstance(exc, BenchError) else f"{type(exc).__name__}: {exc}"
-                raise BenchError(
-                    f"{what}\nThe hub, exit status {process.returncode}, logged last:\n"
-                    f"{self._log_tail()}"
-                ) from exc
-        finally:
-            if self._dir is not None:
-                self._dir.cleanup()
-                self._dir = None
-
-    @property
-    def _log(self) -> Path:
-        assert self._dir is not None
-        return Path(self._dir.name) / "hub.log"
-
-    def _log_tail(self, lines: int = 40) -> str:
-        return "\n".join(self._log.read_text(errors="replace").splitlines()[-lines:])
-
-    @property
-    def _owner_socket(self) -> Path:
-        assert self._dir is not None
-        return Path(self._dir.name) / "run" / APP / SOCKET_NAME
-
-    async def _started(self) -> None:
-        """Wait until the hub serves its owner socket, which it opens last. Raises
-        `BenchError` if it exits."""
-        assert self._process is not None
-        while self._process.returncode is None:
-            with contextlib.suppress(OSError):
-                async with OwnerClient(self._owner_socket):
-                    return
-            await asyncio.sleep(0.1)
-        raise BenchError("the hub exited")
-
-    async def button_latency(self) -> JsonObject:
-        """The hub's own button-latency stats."""
-        async with OwnerClient(self._owner_socket) as owner:
-            return cast(JsonObject, (await owner.stats())["button_latency"])
-
-
-_FAILURES = (BenchError, OSError, tinyaisense.ApiError, tinyaisense.SessionEnded)
-"""How the hub fails the bench, rather than the bench failing itself."""
-_LOOPBACK = "127.0.0.1"
-_PORTS = range(20000, 32768)
-"""Where to pick the hub's ports from: below Linux's ephemeral range, so that no socket the
-hub or the bench opens meanwhile takes one before the hub listens on it."""
-
-
-def _free_ports() -> tuple[int, int]:
-    """Two ports free on loopback: for devices, on TCP and UDP both, and for HTTP."""
-    rng = random.Random()
-    picked: list[int] = []
-    while len(picked) < 2:
-        port = rng.choice(_PORTS)
-        kinds = [socket.SOCK_STREAM, socket.SOCK_DGRAM][: 2 - len(picked)]
-        if port not in picked and all(_free(port, kind) for kind in kinds):
-            picked.append(port)
-    return picked[0], picked[1]
-
-
-def _free(port: int, kind: socket.SocketKind) -> bool:
-    with socket.socket(socket.AF_INET, kind) as sock:
-        try:
-            sock.bind((_LOOPBACK, port))
-        except OSError:
-            return False
-        return True
 
 
 @dataclass(eq=False, slots=True)
@@ -316,7 +146,7 @@ class _Rig:
     """The bench's side of the hub: a Simulator of its devices, and an agent's Session, which
     notes when each notification comes in."""
 
-    def __init__(self, hub: _HubProcess) -> None:
+    def __init__(self, hub: HubProcess) -> None:
         self._hub = hub
         self.sim = Simulator(hub.device_address)
         self._session: tinyaisense.Session | None = None

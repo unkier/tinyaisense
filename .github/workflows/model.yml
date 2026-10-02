@@ -11,9 +11,9 @@ on:
 permissions:
   contents: read
 
-# One bench at a time on the one hub PC: another would load it.
+# One job at a time on the one hub PC, the bench or the HIL tier: another would load it.
 concurrency:
-  group: model
+  group: hub-pc
   cancel-in-progress: false
 
 jobs:
@@ -40,57 +40,8 @@ jobs:
         run: |
           uv run --no-sync tinyaisense-hub init
           uv run --no-sync tinyaisense-hub bench speech --load --out acceptance
-      - name: Summary
+      - uses: ./.github/actions/acceptance
         if: always()
-        run: |
-          shopt -s nullglob
-          reports=(acceptance/*.md)
-          if (( ${#reports[@]} )); then
-            cat "${reports[@]}" >> "$GITHUB_STEP_SUMMARY"
-          else
-            echo "No report: the bench skipped, or didn't get to the end. See its log." \
-              >> "$GITHUB_STEP_SUMMARY"
-          fi
-      - name: Push the report to the acceptance branch
-        if: always()
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          shopt -s nullglob
-          reports=(acceptance/*.md acceptance/*.json)
-          if (( ! ${#reports[@]} )); then
-            echo "no report to push"
-            exit 0
-          fi
-          # The token as checkout passes it: in git's environment, never on disk. And the bot
-          # as the author and committer, of the commit and of any rebase of it.
-          export GIT_CONFIG_COUNT=3
-          export GIT_CONFIG_KEY_0=http.https://github.com/.extraheader
-          GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GITHUB_TOKEN" | base64 -w0)"
-          export GIT_CONFIG_VALUE_0
-          export GIT_CONFIG_KEY_1=user.name GIT_CONFIG_VALUE_1="github-actions[bot]"
-          export GIT_CONFIG_KEY_2=user.email
-          export GIT_CONFIG_VALUE_2="41898282+github-actions[bot]@users.noreply.github.com"
-          remote="https://github.com/$GITHUB_REPOSITORY.git"
-          branch="$RUNNER_TEMP/acceptance-branch"
-          rm -rf "$branch"
-          if git ls-remote --exit-code --heads "$remote" acceptance > /dev/null; then
-            git clone --quiet --depth 1 --branch acceptance "$remote" "$branch"
-          else
-            git init --quiet --initial-branch acceptance "$branch"
-            git -C "$branch" remote add origin "$remote"
-          fi
-          mkdir -p "$branch/acceptance"
-          cp "${reports[@]}" "$branch/acceptance/"
-          cd "$branch"
-          git add acceptance
-          git commit --quiet -m "Acceptance report for ${GITHUB_SHA::12}"
-          for attempt in 1 2 3; do
-            if git push --quiet origin HEAD:acceptance; then
-              exit 0
-            fi
-            echo "push $attempt failed; rebasing on the branch as it is now"
-            git pull --quiet --rebase origin acceptance || git rebase --abort || true
-          done
-          exit 1
+        with:
+          token: ${{ github.token }}
+          missing: "No report: the bench skipped, or didn't get to the end. See its log."
