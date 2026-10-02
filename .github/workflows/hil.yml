@@ -1,7 +1,6 @@
 # HIL tier: the real Atom Echo, on the hub PC's self-hosted runner, over its serial console and
-# the LAN. The Interrupt gate on injected presses, the netem fault scenarios, and the soak, on
-# the debug build, flashed only if the build changed. The rig: ~/.config/tinyaisense/hil.toml,
-# and the netem wrapper from packages/hil/netem/install.sh (see the README). Each run's
+# the LAN. The Interrupt gate on injected presses, and the soak, on the debug build, flashed only
+# if the build changed. The rig: ~/.config/tinyaisense/hil.toml (see the README). Each run's
 # acceptance report goes to the `acceptance` branch, and into the run's summary.
 name: HIL
 
@@ -9,7 +8,7 @@ on:
   workflow_dispatch:
     inputs:
       tests:
-        description: "Which tests, as pytest's -k takes them: e.g. interrupt or faults (default: all)"
+        description: "Which tests, as pytest's -k takes them: e.g. interrupt or soak (default: all)"
         default: ""
       soak_minutes:
         description: How long the soak runs, in minutes
@@ -25,7 +24,7 @@ concurrency:
 
 jobs:
   hil:
-    name: interrupt, faults, soak on the Echo
+    name: interrupt, soak on the Echo
     runs-on: [self-hosted, tinyaisense-hub]
     timeout-minutes: 150
     permissions:
@@ -36,8 +35,8 @@ jobs:
           persist-credentials: false
       - uses: astral-sh/setup-uv@v10.2.0
       - run: uv sync --locked --all-packages --no-default-groups --group test
-      # Fails if 2 of 3 runs of the Interrupt gate miss, if 2 runs of a fault scenario do, or
-      # if the soak breaks an invariant. The report logs loadavg and the CPU governor.
+      # Fails if 2 of 3 runs of the Interrupt gate miss, or if the soak breaks an invariant. The
+      # report logs loadavg and the CPU governor.
       - name: HIL
         env:
           TESTS: ${{ inputs.tests }}

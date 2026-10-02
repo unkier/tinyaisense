@@ -1,5 +1,5 @@
 """The HIL tier's acceptance report, in Markdown and JSON, over whatever of it ran: the Interrupt
-gate, the fault scenarios and the soak, with the firmware and hub versions, the rig and the
+gate and the soak, with the firmware and hub versions, the rig and the
 machine."""
 
 import json
@@ -13,17 +13,7 @@ from typing import cast
 from tinyaisense_hub.bench.gates import Gate, percentile
 from tinyaisense_wire import JsonObject
 
-from .checks import (
-    Diag,
-    Edge,
-    FaultRun,
-    fault_findings,
-    interrupt_findings,
-    soak_findings,
-)
-
-MISSES = 2
-"""How many runs of a fault scenario must miss, of up to 3, for it to fail: a flake doesn't."""
+from .checks import Diag, Edge, interrupt_findings, soak_findings
 
 
 @dataclass(slots=True)
@@ -48,15 +38,13 @@ class Soak:
     minutes: float
     cycles: int
     """Rounds of its workload."""
-    forced: int
-    """Reconnects it forced."""
     diags: list[Diag]
     errors: list[str] = field(default_factory=list[str])
     """What went wrong in its workload."""
 
     @property
     def findings(self) -> list[str]:
-        held = soak_findings(self.diags, self.forced) if self.diags else ["no diag came in"]
+        held = soak_findings(self.diags) if self.diags else ["no diag came in"]
         return [*held, *self.errors]
 
     @property
@@ -75,7 +63,6 @@ class HilReport:
     machine: JsonObject
     """From `tinyaisense_hub.bench.report.machine()`, at the start."""
     interrupt: Interrupt | None = None
-    faults: list[FaultRun] = field(default_factory=list[FaultRun])
     soak: Soak | None = None
     loadavg_after: tuple[float, float, float] | None = None
     errors: list[str] = field(default_factory=list[str])
@@ -94,7 +81,6 @@ class HilReport:
         return (
             not self.errors
             and (self.interrupt is None or self.interrupt.passed)
-            and all(_passed(runs) for runs in _scenarios(self.faults).values())
             and (self.soak is None or self.soak.passed)
         )
 
@@ -119,31 +105,11 @@ class HilReport:
             "loadavg_after": list(self.loadavg_after) if self.loadavg_after else None,
             "errors": self.errors,
             "interrupt": None if self.interrupt is None else _interrupt_json(self.interrupt),
-            "faults": [
-                {
-                    "scenario": run.scenario,
-                    "netem": run.netem,
-                    "passed": not fault_findings(run),
-                    "findings": fault_findings(run),
-                    "edges_ms": [_finite(edge.ms) for edge in run.edges],
-                    "events": run.events,
-                    "offline": run.offline,
-                    "reconnects": run.reconnects,
-                    "speaker": run.speaker,
-                    "speaker_ms": run.speaker_ms,
-                    "mic": run.mic,
-                    "mic_ms": run.mic_ms,
-                    "after": run.after,
-                    "after_ms": run.after_ms,
-                }
-                for run in self.faults
-            ],
             "soak": None
             if self.soak is None
             else {
                 "minutes": self.soak.minutes,
                 "cycles": self.soak.cycles,
-                "forced": self.soak.forced,
                 "passed": self.soak.passed,
                 "findings": self.soak.findings,
                 "diags": [asdict(diag) for diag in self.soak.diags],
@@ -178,24 +144,16 @@ class HilReport:
                 f"| Interrupt: injected `btn` edge → agent socket | p{gate.p} ≤ {gate.ms:g} ms, "
                 f"2 of 3 runs | {runs}: {_verdict(interrupt.passed)} |"
             )
-        for scenario, runs in _scenarios(self.faults).items():
-            passes = sum(not fault_findings(run) for run in runs)
-            lines.append(
-                f"| Faults: {scenario} | its expected behaviour | {passes} of {len(runs)} "
-                f"runs: {_verdict(_passed(runs))} |"
-            )
         if (soak := self.soak) is not None:
             lines.append(
                 f"| Soak: {soak.minutes:g} min | heap_min flat and ≥40 KB, no resets, "
-                f"stack_hwm >512 B, reconnects = forced | {_verdict(soak.passed)} |"
+                f"stack_hwm >512 B, no reconnects | {_verdict(soak.passed)} |"
             )
         lines.append("")
         if self.errors:
             lines += ["Broke off:", "", *(f"- **{error}**" for error in self.errors), ""]
         if interrupt is not None:
             lines += _interrupt_md(interrupt)
-        if self.faults:
-            lines += _faults_md(self.faults)
         if soak is not None:
             lines += _soak_md(soak)
         lines += ["## Rig", "", *(f"- {key}: {value}" for key, value in rig.items()), ""]
@@ -208,18 +166,6 @@ class HilReport:
             f"- Python: {m['python']}",
         ]
         return "\n".join(lines) + "\n"
-
-
-def _scenarios(faults: Sequence[FaultRun]) -> dict[str, list[FaultRun]]:
-    """Each scenario's runs, in the order they ran."""
-    scenarios: dict[str, list[FaultRun]] = {}
-    for run in faults:
-        scenarios.setdefault(run.scenario, []).append(run)
-    return scenarios
-
-
-def _passed(runs: Sequence[FaultRun]) -> bool:
-    return sum(bool(fault_findings(run)) for run in runs) < MISSES
 
 
 def _interrupt_json(interrupt: Interrupt) -> JsonObject:
@@ -280,33 +226,6 @@ def _interrupt_md(interrupt: Interrupt) -> list[str]:
     return lines
 
 
-def _faults_md(faults: Sequence[FaultRun]) -> list[str]:
-    lines = [
-        "## Faults",
-        "",
-        "netem on the hub PC, both ways, on the Echo's traffic only. Presses: injected edges "
-        "to the agent. Speaker: a stream played through, or cut by a press in the blackout. "
-        "Mic: a raw stream's timeline. A scenario runs until 2 runs pass or 2 miss.",
-        "",
-        "| Scenario | Run | Presses p50 / p99 | Speaker | Mic | Result |",
-        "|---|---|---|---|---|---|",
-    ]
-    for scenario, runs in _scenarios(faults).items():
-        for i, run in enumerate(runs, 1):
-            samples = [edge.ms for edge in run.edges]
-            lines.append(
-                f"| {scenario} | {i} | {_ms(percentile(samples, 50))} / "
-                f"{_ms(percentile(samples, 99))} | {_speaker(run.speaker)} | {_mic(run.mic)} | "
-                f"{_verdict(not fault_findings(run))} |"
-            )
-    lines.append("")
-    for scenario, runs in _scenarios(faults).items():
-        for i, run in enumerate(runs, 1):
-            if findings := fault_findings(run):
-                lines += [f"{scenario}, run {i}:", "", *(f"- {f}" for f in findings), ""]
-    return lines
-
-
 def _soak_md(soak: Soak) -> list[str]:
     if not soak.diags:
         return ["## Soak", "", *_findings(soak.findings, "")]
@@ -317,9 +236,7 @@ def _soak_md(soak: Soak) -> list[str]:
     return [
         "## Soak",
         "",
-        f"{soak.minutes:g} min, {soak.cycles} rounds of speaker, mic and presses, under each "
-        f"fault scenario in turn, with {soak.forced} reconnects forced by a blackout past the "
-        f"6 s dead time.",
+        f"{soak.minutes:g} min, {soak.cycles} rounds of speaker, mic and presses.",
         "",
         f"- heap_min: {first.heap_min} B at the start, {last.heap_min} B at the end, lowest "
         f"{lowest.heap_min} B",
@@ -330,21 +247,6 @@ def _soak_md(soak: Soak) -> list[str]:
         "",
         *_findings(soak.findings, "Every invariant held."),
     ]
-
-
-def _speaker(ended: JsonObject) -> str:
-    stats = cast(JsonObject, ended["stats"])
-    return (
-        f"{ended['reason']}, {stats.get('played_ms')} ms, lost {stats.get('lost')}, "
-        f"{stats.get('underruns', 0)} underruns"
-    )
-
-
-def _mic(ended: JsonObject | None) -> str:
-    if ended is None:
-        return "-"
-    stats = cast(JsonObject, ended["stats"])
-    return f"{ended['reason']}, {stats.get('frames')} frames, lost {stats.get('lost')}"
 
 
 def _findings(findings: list[str], none: str) -> list[str]:

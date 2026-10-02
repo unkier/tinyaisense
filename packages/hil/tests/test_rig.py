@@ -3,7 +3,7 @@
 from pathlib import Path
 
 import pytest
-from tinyaisense_hil.rig import NETEM, Rig, RigError, find_rig, load_rig
+from tinyaisense_hil.rig import Rig, RigError, find_rig, load_rig
 
 
 def write(path: Path, text: str) -> Path:
@@ -16,10 +16,8 @@ def test_a_rig_needs_only_the_echos_serial_port(tmp_path: Path) -> None:
 
     assert rig == Rig(port="/dev/ttyUSB0")
     assert rig.echo_ip is None
-    assert rig.iface is None
     assert rig.hub_ip is None
     assert rig.state is None
-    assert rig.netem == NETEM == ("sudo", "-n", "/usr/local/sbin/tinyaisense-netem")
     assert rig.pio == "pio"
     assert rig.soak_minutes == 60
 
@@ -31,10 +29,8 @@ def test_a_rig_takes_every_setting(tmp_path: Path) -> None:
             """
             port = "/dev/ttyUSB1"
             echo_ip = "192.168.0.103"
-            iface = "enp5s0"
             hub_ip = "192.168.0.106"
             state = "~/hub/state.json"
-            netem = ["sudo", "-n", "/opt/netem"]
             pio = "~/.platformio/penv/bin/pio"
             soak_minutes = 5
             """,
@@ -44,10 +40,8 @@ def test_a_rig_takes_every_setting(tmp_path: Path) -> None:
     assert rig == Rig(
         port="/dev/ttyUSB1",
         echo_ip="192.168.0.103",
-        iface="enp5s0",
         hub_ip="192.168.0.106",
         state=str(Path.home() / "hub/state.json"),
-        netem=("sudo", "-n", "/opt/netem"),
         pio=str(Path.home() / ".platformio/penv/bin/pio"),
         soak_minutes=5,
     )
@@ -62,8 +56,6 @@ def test_a_rig_takes_every_setting(tmp_path: Path) -> None:
         ('port = "/dev/ttyUSB0"\necho_ip = "192.168.0.300"', "echo_ip"),
         ('port = "/dev/ttyUSB0"\nhub_ip = "hub.local"', "hub_ip"),
         ('port = "/dev/ttyUSB0"\nstate = ""', "state"),
-        ('port = "/dev/ttyUSB0"\nnetem = []', "netem"),
-        ('port = "/dev/ttyUSB0"\nnetem = "sudo netem"', "netem"),
         ('port = "/dev/ttyUSB0"\nsoak_minutes = 0', "soak_minutes"),
         ('port = "/dev/ttyUSB0"\nsoak_minutes = true', "soak_minutes"),
         ("port = ", "hil.toml"),

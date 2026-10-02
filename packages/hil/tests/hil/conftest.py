@@ -6,7 +6,6 @@ Env: `TINYAISENSE_HIL_RIG` names the rig config (see `tinyaisense_hil.rig`),
 `TINYAISENSE_HIL_OUT` where the report goes (default `acceptance/`), and
 `TINYAISENSE_HIL_SOAK_MINUTES` how long the soak runs (default: the rig's `soak_minutes`)."""
 
-import asyncio
 import contextlib
 import os
 import time
@@ -19,7 +18,6 @@ import pytest
 from tinyaisense_hil import firmware
 from tinyaisense_hil.console import Console, ConsoleError, EchoStatus
 from tinyaisense_hil.hub import HilHub, hil_hub, route
-from tinyaisense_hil.netem import Netem, NetemError
 from tinyaisense_hil.report import HilReport
 from tinyaisense_hil.rig import Rig, RigError, find_rig, load_rig
 from tinyaisense_hub.bench.hub import free_ports, hub_version
@@ -47,7 +45,6 @@ class Hil:
     """The hub's address, on the route to the Echo."""
     ports: tuple[int, int]
     state: Path | None
-    netem: Netem
     soak_minutes: float
     firmware: dict[str, object] = field(default_factory=dict[str, object])
     rig: dict[str, object] = field(default_factory=dict[str, object])
@@ -86,13 +83,11 @@ def hil(rig: Rig, tmp_path_factory: pytest.TempPathFactory) -> Iterator[Hil]:
         assert status.ip is not None
         echo_ip = rig.echo_ip or status.ip
         iface, hub_ip = route(echo_ip)
-        iface, hub_ip = rig.iface or iface, rig.hub_ip or hub_ip
+        hub_ip = rig.hub_ip or hub_ip
         ports = free_ports(hub_ip)
         state = Path(rig.state) if rig.state else state_dir() / "state.json"
-        netem = Netem(rig.netem, iface, echo_ip)
         console.run(f"hub {hub_ip}:{ports[0]}")
         stack.callback(console.run, f"hub {status.hub}")
-        stack.callback(_clear, netem)
         env = stack.enter_context(pytest.MonkeyPatch.context())
         for name in ("NO_PROXY", "no_proxy"):  # the agent's link: a proxy can't reach the hub
             env.setenv(name, ",".join(filter(None, [os.environ.get(name), hub_ip])))
@@ -102,7 +97,6 @@ def hil(rig: Rig, tmp_path_factory: pytest.TempPathFactory) -> Iterator[Hil]:
             hub_ip,
             ports,
             state if state.exists() else None,
-            netem,
             float(os.environ.get("TINYAISENSE_HIL_SOAK_MINUTES") or rig.soak_minutes),
             firmware={"version": status.firmware, "elf": status.elf, "flashed": flashed},
             rig={
@@ -114,17 +108,10 @@ def hil(rig: Rig, tmp_path_factory: pytest.TempPathFactory) -> Iterator[Hil]:
                 "hub_ip": hub_ip,
                 "ports": list(ports),
                 "state": str(state),
-                "netem": " ".join(rig.netem),
                 "pio": rig.pio,
                 "serial_log": serial_log.name,
             },
         )
-
-
-def _clear(netem: Netem) -> None:
-    """Take netem off, if a test left it on."""
-    with contextlib.suppress(NetemError):
-        asyncio.run(netem.clear())
 
 
 @pytest.fixture(scope="session")

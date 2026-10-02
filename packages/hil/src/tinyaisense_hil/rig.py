@@ -3,10 +3,8 @@ Echo by. Only `port` is needed: the rest is found from the Echo's console and th
 
     port = "/dev/ttyUSB0"           # the Echo's serial console
     echo_ip = "192.168.0.103"       # default: what the console's `status` says
-    iface = "enp5s0"                # default: the route's, to the Echo
     hub_ip = "192.168.0.106"        # default: the route's source address
     state = "~/.local/state/tinyaisense/state.json"  # the hub state the Echo is paired in
-    netem = ["sudo", "-n", "/usr/local/sbin/tinyaisense-netem"]  # packages/hil/netem
     pio = "pio"                     # PlatformIO, to build and flash the debug build
     soak_minutes = 60
 """
@@ -18,9 +16,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-NETEM = ("sudo", "-n", "/usr/local/sbin/tinyaisense-netem")
-"""The netem wrapper, as `packages/hil/netem/install.sh` installs it: through a sudo rule for it
-alone."""
 FILE = "hil.toml"
 
 
@@ -32,12 +27,10 @@ class RigError(Exception):
 class Rig:
     port: str
     echo_ip: str | None = None
-    iface: str | None = None
     hub_ip: str | None = None
     state: str | None = None
     """The hub state the Echo is paired in, which the HIL hub starts from a copy of, so that
     the Echo keeps its token. Default: the owner's hub's."""
-    netem: tuple[str, ...] = NETEM
     pio: str = "pio"
     soak_minutes: float = 60
 
@@ -69,10 +62,8 @@ def load_rig(path: Path) -> Rig:
     rig = Rig(
         port=settings.string("port"),
         echo_ip=settings.ip("echo_ip"),
-        iface=settings.optional_string("iface"),
         hub_ip=settings.ip("hub_ip"),
         state=settings.path("state"),
-        netem=settings.command("netem", NETEM),
         pio=settings.path("pio") or "pio",
         soak_minutes=settings.positive("soak_minutes", 60),
     )
@@ -110,16 +101,6 @@ class _Settings:
             except ValueError:
                 raise RigError(f"{key} must be an IPv4 address, not {value!r}") from None
         return value
-
-    def command(self, key: str, default: tuple[str, ...]) -> tuple[str, ...]:
-        value = self._get(key)
-        if value is None:
-            return default
-        args: list[object] = value if isinstance(value, list) else []  # pyright: ignore[reportUnknownVariableType]
-        command = tuple(arg for arg in args if isinstance(arg, str) and arg)
-        if not command or len(command) != len(args):
-            raise RigError(f"{key} must be a command as a list of strings")
-        return command
 
     def positive(self, key: str, default: float) -> float:
         value = self._get(key)

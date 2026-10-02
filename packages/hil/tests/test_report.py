@@ -10,7 +10,7 @@ from tinyaisense_hil.checks import Edge
 from tinyaisense_hil.report import HilReport, Interrupt, Soak
 from tinyaisense_hub.bench.gates import Gate
 
-from .test_checks import EDGES, LOSS2, SOAK, ended
+from .test_checks import EDGES, SOAK, diag
 
 DATE = datetime(2026, 10, 2, 15, 30, tzinfo=UTC)
 LATENCY: dict[str, object] = {"count": 600, "p50_ms": 4.0, "p99_ms": 4.2, "max_ms": 4.4}
@@ -45,8 +45,7 @@ def report(**parts: object) -> HilReport:
 def test_a_report_of_everything_passing_is_green_and_says_what_ran() -> None:
     passing = report(
         interrupt=interrupt(EDGES, EDGES, EDGES),
-        faults=[LOSS2],
-        soak=Soak(minutes=60, cycles=60, forced=6, diags=SOAK),
+        soak=Soak(minutes=60, cycles=60, diags=SOAK),
     )
 
     md = passing.markdown()
@@ -56,28 +55,25 @@ def test_a_report_of_everything_passing_is_green_and_says_what_ran() -> None:
     for shown in ("83277b9", "2bc1ea9f43e7fce6", "flashed", "0.1.0", "/dev/ttyUSB0", "schedutil"):
         assert shown in md
     assert "## Interrupt" in md
-    assert "## Faults" in md
     assert "## Soak" in md
 
 
 def test_a_report_fails_if_any_part_does_and_says_why() -> None:
     lost = [*EDGES[:-1], Edge("up", sent=0.0, t=None, got=None)]
-    missed = replace(LOSS2, speaker=ended("stopped", played_ms=10, lost=0))
-    failing = report(faults=[missed, missed])
+    failing = report(soak=Soak(minutes=60, cycles=60, diags=[*SOAK[:-1], diag(60, reconnects=1)]))
 
     md = failing.markdown()
 
     assert not failing.passed
     assert ": FAIL" in md.splitlines()[0]
-    assert "ended stopped, having played 10 of 3000 ms" in md
+    assert "the Echo counted 1 reconnects" in md
     assert "## Interrupt" not in md  # it didn't run
-    assert "## Soak" not in md
     # The hub counted 600 edges, one the agent never got.
     assert not report(interrupt=interrupt(EDGES, lost, EDGES)).passed
 
 
 def test_a_report_fails_if_a_part_broke_off_and_says_how() -> None:
-    broke = report(faults=[LOSS2], errors=["test_soak: SessionEnded: taken_over"])
+    broke = report(soak=Soak(60, 60, SOAK), errors=["test_soak: SessionEnded: taken_over"])
 
     assert not broke.passed
     assert "test_soak: SessionEnded: taken_over" in broke.markdown()
@@ -85,26 +81,16 @@ def test_a_report_fails_if_a_part_broke_off_and_says_how() -> None:
 
 
 def test_a_soak_that_broke_off_before_its_first_diag_fails() -> None:
-    broke = report(soak=Soak(minutes=60, cycles=0, forced=0, diags=[], errors=["no hub"]))
+    broke = report(soak=Soak(minutes=60, cycles=0, diags=[], errors=["no hub"]))
 
     assert not broke.passed
     assert "no hub" in broke.markdown()
 
 
-def test_a_fault_scenario_fails_only_if_2_of_its_runs_miss() -> None:
-    missed = replace(LOSS2, speaker=ended("stopped", played_ms=10, lost=0))
-
-    assert report(faults=[missed, LOSS2, LOSS2]).passed
-    assert not report(faults=[missed, LOSS2, missed]).passed
-    assert "| Faults: loss2 | its expected behaviour | 2 of 3 runs: pass |" in (
-        report(faults=[missed, LOSS2, LOSS2]).markdown()
-    )
-
-
 def test_a_report_is_written_as_markdown_and_json_named_by_its_date_and_commit(
     tmp_path: Path,
 ) -> None:
-    written = report(interrupt=interrupt(EDGES, EDGES, EDGES), faults=[LOSS2]).write(tmp_path)
+    written = report(interrupt=interrupt(EDGES, EDGES, EDGES)).write(tmp_path)
 
     assert [path.name for path in written] == [
         "2026-10-02-1530-hil-83277b9.md",
@@ -116,6 +102,4 @@ def test_a_report_is_written_as_markdown_and_json_named_by_its_date_and_commit(
     assert data["rig"]["iface"] == "enp5s0"
     assert data["interrupt"]["gate"]["runs"][0]["value_ms"] == 4.5
     assert data["interrupt"]["hub_latency"]["p99_ms"] == 4.2
-    assert data["faults"][0]["scenario"] == "loss2"
-    assert data["faults"][0]["findings"] == []
     assert data["soak"] is None

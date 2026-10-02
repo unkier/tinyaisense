@@ -129,12 +129,11 @@ On every push to main, the model tier (`.github/workflows/model.yml`) runs `benc
 The HIL tier runs on a real Atom Echo, over its serial console and the LAN, as pytest's `hil` marker; a plain `pytest` leaves it out. It builds the debug build (`m5stack-atom-echo-debug`, with the console's test hooks) and flashes it only if the Echo's `status` shows another ELF sha256. It then points the Echo's `hub` at a hub it runs as `serve --auto-approve` runs it, in a process of its own, from a copy of the hub state the Echo is paired in, so that the Echo keeps its token, and sets `hub` back after.
 
 - Interrupt: 200 `btn` edges injected on the console, 3 runs, while a speaker stream plays. From the edge on the Echo to the SDK, p99 ≤20 ms, cross-checked against the hub's own `stats` and the serial write.
-- Faults: netem on the Echo's traffic only, both ways: 2% loss, 5% loss in bursts, 30 ms jitter, and a 3 s blackout. Each keeps the Connection and every press; its streams play through, or deliver their timeline, losing about what the network does; and a press in the blackout still cuts the speaker, on the Echo itself.
-- Soak: an hour from a power-on reset, a round of speaker, mic and presses a minute under each lossy scenario in turn, and a 10 s blackout every 10 minutes to force a reconnect. heap_min stays flat and ≥40 KB, nothing resets the Echo, every task keeps >512 B of stack, and the Echo counts as many reconnects as were forced.
+- Soak: an hour from a power-on reset, a round of speaker, mic and presses a minute. heap_min stays flat and ≥40 KB, nothing resets the Echo, every task keeps >512 B of stack, and the Echo never reconnects.
 
-The Interrupt gate fails if 2 of its 3 runs miss, and a fault scenario if 2 of its runs do. Each run writes a report into `./acceptance/` (`TINYAISENSE_HIL_OUT`), in Markdown and JSON, with the numbers, the firmware and hub versions, the rig, and the machine's CPU governor and load.
+Nothing in it needs root, so it injects no network faults on the real Echo: the simulated devices' faults cover those. The Interrupt gate fails if 2 of its 3 runs miss. Each run writes a report into `./acceptance/` (`TINYAISENSE_HIL_OUT`), in Markdown and JSON, with the numbers, the firmware and hub versions, the rig, and the machine's CPU governor and load.
 
-The rig config, `hil.toml` here or in `~/.config/tinyaisense/` (`TINYAISENSE_HIL_RIG`), needs only the Echo's serial port: the rest defaults to what the Echo's `status` and the route to it say. netem needs root, so it goes through a wrapper that only shapes one IPv4 address's traffic, with one of the four scenarios, installed with a sudo rule for it alone:
+The rig config, `hil.toml` here or in `~/.config/tinyaisense/` (`TINYAISENSE_HIL_RIG`), needs only the Echo's serial port: the rest defaults to what the Echo's `status` and the route to it say:
 
 ```toml
 port = "/dev/ttyUSB0"
@@ -144,7 +143,6 @@ soak_minutes = 60
 ```
 
 ```sh
-packages/hil/netem/install.sh                       # once: asks for sudo; --remove takes it out
 uv run pytest -m hil packages/hil/tests/hil         # everything, the soak included
 uv run pytest -m hil packages/hil/tests/hil -k interrupt
 TINYAISENSE_HIL_SOAK_MINUTES=7 uv run pytest -m hil packages/hil/tests/hil -k soak

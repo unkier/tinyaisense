@@ -91,7 +91,7 @@ async def hil_hub(
 
 class HilHub:
     """The hub `process`, and the agent's Session on it: it notes the raw button edges of the
-    Echo `device_id`, its `device.offline`s, and each stream's end."""
+    Echo `device_id`, and its `device.offline`s."""
 
     def __init__(self, process: HubProcess, session: tinyaisense.Session, device_id: str) -> None:
         self.process = process
@@ -100,13 +100,10 @@ class HilHub:
         self.device = ""
         """The Echo's name on the hub."""
         self.online = asyncio.Event()
-        self.events: list[str] = []
-        """The raw button events, `down` or `up`, in order."""
         self.offline = 0
         self._edges: list[tuple[str, int, float]] = []
         """Each raw button edge, `down` or `up`, its `t`, and when the agent got it."""
         self._taken = 0
-        self._ended: dict[int, JsonObject] = {}
         self._changed = asyncio.Event()
         self._reader = asyncio.create_task(self._read())
 
@@ -115,8 +112,7 @@ class HilHub:
         await asyncio.gather(self._reader, return_exceptions=True)
 
     def forget(self) -> None:
-        """Start the events and the `device.offline`s over."""
-        self.events.clear()
+        """Start the `device.offline`s over."""
         self.offline = 0
 
     async def presses(self, console: Console, count: int, rng: random.Random) -> list[Edge]:
@@ -172,20 +168,6 @@ class HilHub:
             await asyncio.wait([reader], timeout=2)
             reader.cancel()
 
-    async def ended(self, handle: int, within: float) -> JsonObject:
-        """The stream's end, `{reason, stats}`, from its `stream.ended`. Raises `TimeoutError`
-        if it hasn't ended `within` s."""
-        async with asyncio.timeout(within):
-            while (end := self._ended.get(handle)) is None:
-                await self._change()
-            return end
-
-    async def back_online(self, within: float) -> None:
-        """Wait until the Echo has gone offline and come back. Raises `TimeoutError`."""
-        async with asyncio.timeout(within):
-            while not self.offline or not self.online.is_set():
-                await self._change()
-
     async def diag(self) -> JsonObject:
         async with self.process.owner() as owner:
             return await owner.diag(self.device)
@@ -200,7 +182,6 @@ class HilHub:
             match notification.method:
                 case "button.down" | "button.up":
                     edge = notification.method.removeprefix("button.")
-                    self.events.append(edge)
                     self._edges.append((edge, notification.t, got))
                 case "device.online" if (
                     cast(JsonObject, params["manifest"])["device_id"] == self._device_id
@@ -210,11 +191,6 @@ class HilHub:
                 case "device.offline" if params["device"] == self.device:
                     self.offline += 1
                     self.online.clear()
-                case "stream.ended":
-                    self._ended[cast(int, params["handle"])] = {
-                        "reason": params["reason"],
-                        "stats": params["stats"],
-                    }
                 case _:
                     pass
             self._changed.set()
