@@ -1,0 +1,5 @@
+.pio/
+sdkconfig.*
+!sdkconfig.defaults
+src/secrets.h
+out/
